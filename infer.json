@@ -32,5 +32,22 @@
         "dynamic_max_memory_frames": 8,
         "scene_mix_cutoff": 50,
         "dynamic_mix_cutoff": 20
+    },
+    "synthetic_sample": {
+        "tag": "synthetic_sample",
+        "data_dir": "YOUR_SYNTHETIC_DATA_DIR",
+        "transformer_dir": "/work/berke_gokmen/ckpts/com4d_final",
+        "num_tokens": 1024,
+        "first_frame_idx": 0,
+        "frames_start_idx": 0,
+        "frames_end_idx": 10,
+        "frame_stride": 1,
+        "scene_num_parts": 2,
+        "dynamic_num_parts": 1,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 4,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 25
     }
 }

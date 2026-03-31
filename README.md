@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/66c90267-2aac-4d40-bf9d-952a62511f45
 - [x] Release Dataset Preprocessing Code
 - [x] Release Inference Code
 - [x] Release Video Processing Code
-- [ ] Release Checkpoints (Soon)
+- [x] Release Checkpoints
 
 ## Training
 ### Environment setup
@@ -80,7 +80,15 @@ Please refer to [datasets/README_preprocess](./datasets/README_preprocess.md) fo
 Please refer to [datasets/README_synthetic](./datasets/README_synthetic.md) folder.
 
 ## Model Weights
-> Links will be updated soon.
+For this section, you'll need HuggingFace CLI.
+
+For training and inference, download the backbone model weights:
+
+```hf download VAST-AI/TripoSG --local-dir pretrained_weights/TripoSG```
+
+For COM4D weigths:
+
+```hf download INSAIT-Institute/COM4D --local-dir pretrained_weights/COM4D```
 
 ## Inference
 First clone [SAM2](https://github.com/facebookresearch/sam2) to the current directory.
