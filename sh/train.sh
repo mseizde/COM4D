@@ -26,7 +26,7 @@ micromamba activate com4d
 NUM_MACHINES=1
 NUM_LOCAL_GPUS=$(nvidia-smi --list-gpus | wc -l)
 MACHINE_RANK=0
-OUT_DIR=/work/berke_gokmen/ckpts/com4d_1_new
+OUT_DIR=/data/mseizde/com4d/outputs/ckpts
 RANDOM=$$$(date +%s)  # generate a random seed based on current time and process ID
 
 mkdir -p $OUT_DIR

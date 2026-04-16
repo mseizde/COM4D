@@ -13,6 +13,8 @@ python datasets/preprocess/render_fixed_cam.py \
     --auto-exposure
 """
 
+from __future__ import annotations # TODO: remove when Python 3.11+ only is supported
+
 import os
 import argparse
 import sys

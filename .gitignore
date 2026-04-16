@@ -9,7 +9,6 @@ results*/
 breathing_sphere*/
 *_frames_out/
 dog_test/
-inference/
 inference_vae/
 inference_vae_intp/
 mini_dataset/
@@ -26,7 +25,6 @@ PIPE/
 3d-4d-inference
 3d4d-ckpt
 PIPE_NEW/
-pretrained_weights/
 dummy*
 all_inferences_dome
 
@@ -35,3 +33,14 @@ inferences_teaser
 
 aligned_glb*/
 out_*/
+
+pretrained_weights/
+sam2/
+dataset_json/
+.understand-anything/
+
+
+# conda / micromamba envs
+env/
+.venv/
+*.egg-info/

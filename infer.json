@@ -2,7 +2,7 @@
     "teaser2048": {
         "tag": "teaser2048",
         "data_dir": "assets/teaser",
-        "transformer_dir": "/work/berke_gokmen/ckpts/com4d_final",
+        "transformer_dir": "/data/mseizde/com4d/COM4D/pretrained_weights/COM4D/transformer_ema", 
         "num_tokens": 2048,
         "first_frame_idx": 5,
         "frames_start_idx": 0,
@@ -19,7 +19,7 @@
     "teaser1024": {
         "tag": "teaser1024",
         "data_dir": "assets/teaser",
-        "transformer_dir": "/work/berke_gokmen/ckpts/com4d_final",
+        "transformer_dir": "/data/mseizde/com4d/COM4D/pretrained_weights/COM4D/transformer_ema",
         "num_tokens": 1024,
         "first_frame_idx": 5,
         "frames_start_idx": 0,
@@ -36,7 +36,7 @@
     "synthetic_sample": {
         "tag": "synthetic_sample",
         "data_dir": "YOUR_SYNTHETIC_DATA_DIR",
-        "transformer_dir": "/work/berke_gokmen/ckpts/com4d_final",
+        "transformer_dir": "/data/mseizde/com4d/COM4D/pretrained_weights/COM4D/transformer_ema",
         "num_tokens": 1024,
         "first_frame_idx": 0,
         "frames_start_idx": 0,

@@ -26,7 +26,7 @@ echo "Activated com4d"
 
 set -euo pipefail
 
-COMMON_OUT_DIR=/work/berke_gokmen/data-1/com4d-out/
+COMMON_OUT_DIR=/data/mseizde/com4d/outputs/inference
 mkdir -p "$COMMON_OUT_DIR"
 
 if [ $# -lt 1 ]; then

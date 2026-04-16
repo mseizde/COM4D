@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Update the following parameters
-SAM2_CHECKPOINT="/work/berke_gokmen/ckpts/sam2.1_hiera_large.pt"
-SAM2_CONFIG="//home/berke_gokmen/project/COM4D/sam2/sam2_hiera_l.yaml" # You might need to put // before the path, ex: //home/berke_gokmen/project/COM4D/sam2/sam2_hiera_l.yaml
+SAM2_CHECKPOINT="/data/mseizde/com4d/sam2_repo/checkpoints/sam2.1_hiera_large.pt"
+SAM2_CONFIG="//data/mseizde/com4d/COM4D/sam2/configs/sam2.1/sam2.1_hiera_l.yaml" # You might need to put // before the path, ex: //home/berke_gokmen/project/COM4D/sam2/sam2_hiera_l.yaml
 
 VIDEO_PATH=$1
 START=${2:-0}
