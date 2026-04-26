@@ -24,14 +24,55 @@ ensure_env
 micromamba activate com4d
 
 NUM_MACHINES=1
-NUM_LOCAL_GPUS=$(nvidia-smi --list-gpus | wc -l)
 MACHINE_RANK=0
-OUT_DIR=/data/mseizde/com4d/outputs/ckpts
+OUT_DIR=${OUT_DIR:-/data/mseizde/com4d/outputs/ckpts}
 RANDOM=$$$(date +%s)  # generate a random seed based on current time and process ID
+MAX_GPUS=${MAX_GPUS:-4}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
+TAG_ROOT=${TAG_ROOT:-}
+TAG=${TAG:-}
+NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
+BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-}
+PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
+detected_gpus=$(nvidia-smi --list-gpus | wc -l)
+
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    IFS=',' read -r -a gpu_ids <<< "$CUDA_VISIBLE_DEVICES"
+    if [ "${#gpu_ids[@]}" -gt "$MAX_GPUS" ]; then
+        gpu_ids=("${gpu_ids[@]:0:$MAX_GPUS}")
+    fi
+    CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${gpu_ids[*]}")
+    NUM_LOCAL_GPUS=${#gpu_ids[@]}
+else
+    if [ "$detected_gpus" -lt "$MAX_GPUS" ]; then
+        NUM_LOCAL_GPUS=$detected_gpus
+    else
+        NUM_LOCAL_GPUS=$MAX_GPUS
+    fi
+
+    gpu_ids=()
+    for ((i=0; i<NUM_LOCAL_GPUS; i++)); do
+        gpu_ids+=("$i")
+    done
+    CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${gpu_ids[*]}")
+fi
+
+if [ "$NUM_LOCAL_GPUS" -lt 1 ]; then
+    echo "Error: No GPUs selected for training."
+    exit 1
+fi
+
+if [ -z "$BATCH_SIZE_PER_GPU" ]; then
+    BATCH_SIZE_PER_GPU=24
+fi
 
 mkdir -p $OUT_DIR
 
-export WANDB_API_KEY="" # Modify this if you use wandb
+export WANDB_API_KEY="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" # Modify this if you use wandb
+export CUDA_VISIBLE_DEVICES
+export NCCL_P2P_DISABLE
+export PYTORCH_CUDA_ALLOC_CONF
 
 configs=(
     sdemb/mf8_mp8_nt512 # 0
@@ -64,12 +105,31 @@ fi
 config_index=${1}  # Use first argument as config index, default to 0 if not provided
 
 config_name=${configs[$config_index]}
-pretrained_model_path=${pretrained_model_paths[$config_index]}
-pretrained_model_ckpt=${pretrained_model_ckpts[$config_index]}
+config_tag=${config_name//\//_}
+pretrained_model_path=${PRETRAINED_MODEL_PATH:-${pretrained_model_paths[$config_index]}}
+pretrained_model_ckpt=${PRETRAINED_MODEL_CKPT:-${pretrained_model_ckpts[$config_index]}}
+
+if [ -n "$TAG" ]; then
+    run_tag=$TAG
+elif [ -n "$TAG_ROOT" ]; then
+    run_tag="${TAG_ROOT}/${config_tag}"
+else
+    run_tag="com4d_${config_tag}_${RANDOM}"
+fi
 
 echo "Using configuration index: $config_index, config name: $config_name"
+echo "Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES ($NUM_LOCAL_GPUS local GPUs, MAX_GPUS=$MAX_GPUS)"
+echo "Using OUT_DIR=$OUT_DIR"
+echo "Using run_tag=$run_tag"
+echo "Using gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
+echo "Using pretrained_model_path=$pretrained_model_path, pretrained_model_ckpt=$pretrained_model_ckpt"
+echo "Using NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
+echo "Using PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+if [ -n "$BATCH_SIZE_PER_GPU" ]; then
+    echo "Using train.batch_size_per_gpu=$BATCH_SIZE_PER_GPU"
+fi
 
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
+accelerate launch \
     --num_machines $NUM_MACHINES \
     --num_processes $(( $NUM_MACHINES * $NUM_LOCAL_GPUS )) \
     --machine_rank $MACHINE_RANK \
@@ -77,12 +137,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
         --pin_memory \
         --allow_tf32 \
         --config configs/${config_name}.yaml --use_ema \
-        --gradient_accumulation_steps 4 \
+        --gradient_accumulation_steps $GRADIENT_ACCUMULATION_STEPS \
         --output_dir $OUT_DIR \
-        --tag com4d_${config_name//\//_}_${RANDOM} \
+        --tag $run_tag \
         --val_only_rank0 \
         --load_pretrained_model $pretrained_model_path \
         --load_pretrained_model_ckpt $pretrained_model_ckpt \
+        ${BATCH_SIZE_PER_GPU:+train.batch_size_per_gpu=$BATCH_SIZE_PER_GPU} \
         # --offline_wandb
         
         

@@ -46,7 +46,7 @@ mkdir -p <humanoids-out-dir>
 bash datasets/preprocess/run_fbx_range.sh datasets/preprocess/fbx_jobs.txt \
     <humanoids-out-dir> \
     <blender-executable-path> \
-    0 201 \
+    0 199 \
     --start-frame 1 --end-frame 64
 ```
 
@@ -123,6 +123,25 @@ python datasets/preprocess/deformingthings_json.py \
 ```
 
 ## Objaverse
+
+Recommended raw GLB layout before scaling:
+```text
+<objaverse-dir>/
+├── <obj_uid>/
+│   └── mesh.glb
+├── <obj_uid>/
+│   └── mesh.glb
+└── ...
+```
+
+If your downloads are still in the default Objaverse cache layout
+`hf-objaverse-v1/glbs/<shard>/<uid>.glb`, first restructure them with:
+```sh
+python datasets/preprocess/objaverse/restructure_objaverse_glbs.py \
+    --input-root <download-dir>/hf-objaverse-v1/glbs \
+    --output-root <objaverse-dir> \
+    --mode symlink
+```
 
 ### Scale
 ```sh

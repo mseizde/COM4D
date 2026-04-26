@@ -178,6 +178,11 @@ def load_surface(data, num_pc=204800):
     normal = data["surface_normals"]  # Nx3
 
     rng = np.random.default_rng()
+    if surface.shape[0] < num_pc:
+        raise ValueError(
+            f"Surface has {surface.shape[0]} points, but {num_pc} were requested. "
+            "Regenerate preprocessing with a larger --num-points or lower train.surface_num_points."
+        )
     ind = rng.choice(surface.shape[0], num_pc, replace=False)
     surface = torch.FloatTensor(surface[ind])
     normal = torch.FloatTensor(normal[ind])

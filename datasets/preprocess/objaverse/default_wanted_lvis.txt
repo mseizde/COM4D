@@ -1,0 +1,166 @@
+# Furniture and larger fixtures
+armchair
+armoire
+bed
+bookcase
+bunk_bed
+cabinet
+chair
+coffee_table
+cupboard
+desk
+dining_table
+dresser
+file_cabinet
+folding_chair
+kitchen_sink
+kitchen_table
+lamp
+mattress
+radiator
+rocking_chair
+sofa
+sofa_bed
+step_stool
+stepladder
+stool
+stove
+table
+table_lamp
+wardrobe
+
+# Household fixtures, decor, and textiles
+bedspread
+bouquet
+chandelier
+coat_hanger
+coatrack
+crate
+curtain
+cushion
+cylinder
+doormat
+drawer
+flowerpot
+glass_(drink_container)
+heater
+hook
+painting
+pillow
+pitcher_(vessel_for_liquid)
+tablecloth
+trash_can
+vase
+wheel
+
+# Bathroom
+bath_mat
+bathtub
+faucet
+shower_curtain
+shower_head
+sink
+towel
+towel_rack
+water_faucet
+
+# Indoor electronics and appliances
+air_conditioner
+alarm_clock
+automatic_washer
+computer_keyboard
+dishwasher
+fan
+laptop_computer
+microwave_oven
+monitor_(computer_equipment) computer_monitor
+mouse_(computer_equipment)
+oven
+refrigerator
+remote_control
+television_set
+toaster
+wall_clock
+
+# Small rigid objects for physics-style interactions
+ball
+bottle
+bowl
+box
+bucket
+can
+cup
+plate
+toy
+
+# Clothing and soft wearables
+apron
+ballet_skirt
+bathrobe
+belt
+blouse
+bolo_tie
+bow-tie
+brassiere
+bridal_gown
+cape
+coat
+dress
+dress_suit
+jacket
+kimono
+lab_coat
+necktie
+nightshirt
+pajamas
+polo_shirt
+poncho
+raincoat
+robe
+scarf
+shirt
+short_pants
+skirt
+sock
+sweat_pants
+sweater
+sweatshirt
+trench_coat
+trousers
+underwear
+vest
+
+# Footwear
+arctic_(type_of_shoe)
+boot
+flip-flop_(sandal)
+sandal_(type_of_shoe)
+shoe
+ski_boot
+slipper_(footwear)
+
+# Headwear, gloves, and protective wear
+baseball_cap
+bulletproof_vest
+cap_(headwear)
+cowboy_hat
+dress_hat
+football_helmet
+glove
+hat
+headscarf
+helmet
+life_jacket
+mitten
+shower_cap
+skullcap
+sunhat
+
+# Excluded: living things (covered by DeformingThings4D)
+# person
+# pet
+# dog
+# bulldog
+# pug-dog
+# shepherd_dog
+# cat

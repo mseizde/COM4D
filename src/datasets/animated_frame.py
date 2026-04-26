@@ -43,7 +43,7 @@ def _load_rgb_image(image_path: str, size: tuple[int, int]) -> torch.Tensor:
     arr = np.asarray(im, dtype=np.uint8)
     return torch.from_numpy(arr)
 
-def _extract_single_surface_array(surface_data: dict) -> torch.Tensor:
+def _extract_single_surface_array(surface_data: dict, num_points: int) -> torch.Tensor:
     """Return a single [P,6] surface tensor from a loaded npy dict.
 
     Supports three shapes:
@@ -54,13 +54,13 @@ def _extract_single_surface_array(surface_data: dict) -> torch.Tensor:
     if surface_data is None:
         raise ValueError("surface_data is None")
     if 'surface_points' in surface_data and 'surface_normals' in surface_data:
-        return load_surface(surface_data)
+        return load_surface(surface_data, num_pc=num_points)
     if 'object' in surface_data:
-        return load_surface(surface_data['object'])
+        return load_surface(surface_data['object'], num_pc=num_points)
     if 'parts' in surface_data:
         parts = surface_data['parts']
         if isinstance(parts, list) and len(parts) > 0:
-            return load_surface(parts[0])
+            return load_surface(parts[0], num_pc=num_points)
     raise KeyError("Unrecognized surface data format: expected 'surface_points'+'surface_normals', or 'object', or non-empty 'parts'.")
 
 
@@ -201,6 +201,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.data_configs = data_configs
         image_load_size = int(configs["train"].get("image_load_size", 512))
         self.image_size = (image_load_size, image_load_size)
+        self.surface_num_points = int(configs["train"].get("surface_num_points", 204800))
 
     def __len__(self) -> int:
         return len(self.data_configs)
@@ -232,7 +233,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 surface_path = fr['surface_path']
                 image_path = fr['image_path']
                 surface_data = np.load(surface_path, allow_pickle=True).item()
-                part_surfaces.append(_extract_single_surface_array(surface_data))
+                part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
                 # Load image per frame
                 pil_image = Image.open(image_path)
                 if getattr(pil_image, "is_animated", False):
@@ -264,7 +265,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
             if self.shuffle_parts:
                 random.shuffle(part_surfaces)
-            part_surfaces = load_surfaces(part_surfaces) # [N, P, 6]
+            part_surfaces = load_surfaces(part_surfaces, num_pc=self.surface_num_points) # [N, P, 6]
             image_path = data_config['image_path']
             # Robustly load WebP/alpha images and resize
             pil_image = Image.open(image_path)
@@ -294,7 +295,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
                 surface_data = np.load(surface_path, allow_pickle=True).item()
-                part_surfaces.append(_extract_single_surface_array(surface_data))
+                part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
             image_path = data_config['image_path']
             # Robustly load WebP/alpha images and resize

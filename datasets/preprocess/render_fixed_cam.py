@@ -362,6 +362,82 @@ def _collect_groups(input_root: str, max_files_in_group: int = 64) -> List[Tuple
     return groups
 
 
+def _process_group_task(args) -> Tuple[str, int, int, List[str]]:
+    """Process a single group and return a compact summary.
+
+    Returns (group_name, rendered_count, skipped_existing_count, warnings).
+    """
+    (
+        group_name,
+        file_paths,
+        output_path,
+        group_idx,
+        key_light_intensity,
+        num_env_lights,
+        env_light_intensity,
+        auto_exposure,
+        post_brightness,
+        post_gamma,
+        user_solid_color,
+        use_palette_color,
+    ) = args
+
+    warnings: List[str] = []
+    meshes = []
+    for fp in file_paths:
+        try:
+            meshes.append(_load_mesh(fp))
+        except Exception as e:
+            warnings.append(f"[WARN] Failed to load {fp}: {e}")
+    if not meshes:
+        warnings.append(f"[WARN] Skipping empty group {group_name}")
+        return group_name, 0, 0, warnings
+
+    center, cam_radius, scene_radius, fov_deg = _prepare_group_camera(meshes)
+    group_color: Optional[Tuple[int, int, int]] = None
+    if user_solid_color is not None:
+        group_color = user_solid_color
+    elif use_palette_color:
+        group_color = _palette_color(group_idx)
+
+    rendered = 0
+    skipped_existing = 0
+    for fp in file_paths:
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        out_path = os.path.join(output_path, group_name, f"{stem}.png")
+        if os.path.isfile(out_path):
+            skipped_existing += 1
+            continue
+        ok, _, saved_path, err = _process_file_task(
+            (
+                fp,
+                output_path,
+                group_name,
+                stem,
+                center,
+                cam_radius,
+                scene_radius,
+                fov_deg,
+                key_light_intensity,
+                num_env_lights,
+                env_light_intensity,
+                group_color,
+                auto_exposure,
+                post_brightness,
+                post_gamma,
+            )
+        )
+        if err == "already_exists":
+            skipped_existing += 1
+            continue
+        if not ok:
+            warnings.append(f"[WARN] Skipping {fp} -> {saved_path} due to error: {err}")
+            continue
+        rendered += 1
+
+    return group_name, rendered, skipped_existing, warnings
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         "Render GLBs with a fixed camera per group (grouped by parent folder)."
@@ -439,83 +515,119 @@ if __name__ == "__main__":
             print(
                 f"No valid {input_path}/<group>/*.glb files found. Files ending with '_full' are ignored."
             )
-        # Iterate groups with progress
-        for group_idx, (group_name, file_paths) in enumerate(
-            tqdm(groups, total=len(groups), desc="Groups")
-        ):
-            print(f"Processing group: {group_name} with {len(file_paths)} GLBs")
-            # Load all meshes to compute global center and a camera distance
-            meshes = []
-            for fp in tqdm(file_paths, total=len(file_paths), desc=f"Loading {group_name}", leave=False):
-                try:
-                    meshes.append(_load_mesh(fp))
-                except Exception as e:
-                    print(f"[WARN] Failed to load {fp}: {e}")
-            if not meshes:
-                print(f"[WARN] Skipping empty group {group_name}")
-                continue
-            center, cam_radius, scene_radius, fov_deg = _prepare_group_camera(meshes)
-            group_color: Optional[Tuple[int, int, int]] = None
-            if user_solid_color is not None:
-                group_color = user_solid_color
-            elif use_palette_color:
-                group_color = _palette_color(group_idx)
+        worker_count = max(1, int(args.workers))
+        parallelize_groups = worker_count > 1 and all(len(file_paths) == 1 for _, file_paths in groups)
 
-            # Per-file tasks share a fixed camera; outputs go under <output>/<group>/<frame>.png
-            tasks = []
-            skipped_existing = 0
-            for fp in tqdm(file_paths, total=len(file_paths), desc=f"Queueing {group_name}", leave=False):
-                stem = os.path.splitext(os.path.basename(fp))[0]
-                out_path = os.path.join(output_path, group_name, f"{stem}.png")
-                if os.path.isfile(out_path):
-                    skipped_existing += 1
-                    continue
-                tasks.append(
-                    (
-                        fp,
-                        output_path,
-                        group_name,
-                        stem,
-                        center,
-                        cam_radius,
-                        scene_radius,
-                        fov_deg,
-                        key_light_intensity,
-                        num_env_lights,
-                        env_light_intensity,
-                        group_color,
-                        auto_exposure,
-                        post_brightness,
-                        post_gamma,
-                    )
+        if parallelize_groups:
+            print("[INFO] Detected single-object groups; parallelizing across groups.")
+            group_tasks = [
+                (
+                    group_name,
+                    file_paths,
+                    output_path,
+                    group_idx,
+                    key_light_intensity,
+                    num_env_lights,
+                    env_light_intensity,
+                    auto_exposure,
+                    post_brightness,
+                    post_gamma,
+                    user_solid_color,
+                    use_palette_color,
                 )
-            if skipped_existing:
-                print(f"[INFO] {group_name}: skipped {skipped_existing} existing renders.")
-            if not tasks:
-                print(f"[INFO] All renders already exist for {group_name}; skipping group.")
-                continue
+                for group_idx, (group_name, file_paths) in enumerate(groups)
+            ]
+            total_rendered = 0
+            total_skipped_existing = 0
+            with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as ex:
+                for group_name, rendered, skipped_existing, warnings in tqdm(
+                    ex.map(_process_group_task, group_tasks),
+                    total=len(group_tasks),
+                    desc="Groups",
+                ):
+                    total_rendered += rendered
+                    total_skipped_existing += skipped_existing
+                    for warning in warnings:
+                        print(warning)
+            print(f"[INFO] Rendered {total_rendered} images.")
+            print(f"[INFO] Skipped {total_skipped_existing} existing renders.")
+        else:
+            # Iterate groups with progress
+            for group_idx, (group_name, file_paths) in enumerate(
+                tqdm(groups, total=len(groups), desc="Groups")
+            ):
+                print(f"Processing group: {group_name} with {len(file_paths)} GLBs")
+                # Load all meshes to compute global center and a camera distance
+                meshes = []
+                for fp in tqdm(file_paths, total=len(file_paths), desc=f"Loading {group_name}", leave=False):
+                    try:
+                        meshes.append(_load_mesh(fp))
+                    except Exception as e:
+                        print(f"[WARN] Failed to load {fp}: {e}")
+                if not meshes:
+                    print(f"[WARN] Skipping empty group {group_name}")
+                    continue
+                center, cam_radius, scene_radius, fov_deg = _prepare_group_camera(meshes)
+                group_color: Optional[Tuple[int, int, int]] = None
+                if user_solid_color is not None:
+                    group_color = user_solid_color
+                elif use_palette_color:
+                    group_color = _palette_color(group_idx)
 
-            worker_count = max(1, int(args.workers))
-            if worker_count == 1:
-                for t in tqdm(tasks, total=len(tasks), desc=f"Rendering {group_name}"):
-                    ok, fpath, saved_path, err = _process_file_task(t)
-                    if err == "already_exists":
+                # Per-file tasks share a fixed camera; outputs go under <output>/<group>/<frame>.png
+                tasks = []
+                skipped_existing = 0
+                for fp in tqdm(file_paths, total=len(file_paths), desc=f"Queueing {group_name}", leave=False):
+                    stem = os.path.splitext(os.path.basename(fp))[0]
+                    out_path = os.path.join(output_path, group_name, f"{stem}.png")
+                    if os.path.isfile(out_path):
+                        skipped_existing += 1
                         continue
-                    if not ok:
-                        print(f"[WARN] Skipping {fpath} -> {saved_path} due to error: {err}")
-            else:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as ex:
-                    total = len(tasks)
-                    for ok, fpath, saved_path, err in tqdm(
-                        ex.map(_process_file_task, tasks),
-                        total=total,
-                        desc=f"Rendering {group_name}",
-                        leave=True,
-                    ):
+                    tasks.append(
+                        (
+                            fp,
+                            output_path,
+                            group_name,
+                            stem,
+                            center,
+                            cam_radius,
+                            scene_radius,
+                            fov_deg,
+                            key_light_intensity,
+                            num_env_lights,
+                            env_light_intensity,
+                            group_color,
+                            auto_exposure,
+                            post_brightness,
+                            post_gamma,
+                        )
+                    )
+                if skipped_existing:
+                    print(f"[INFO] {group_name}: skipped {skipped_existing} existing renders.")
+                if not tasks:
+                    print(f"[INFO] All renders already exist for {group_name}; skipping group.")
+                    continue
+
+                if worker_count == 1:
+                    for t in tqdm(tasks, total=len(tasks), desc=f"Rendering {group_name}"):
+                        ok, fpath, saved_path, err = _process_file_task(t)
                         if err == "already_exists":
                             continue
                         if not ok:
                             print(f"[WARN] Skipping {fpath} -> {saved_path} due to error: {err}")
+                else:
+                    with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as ex:
+                        total = len(tasks)
+                        for ok, fpath, saved_path, err in tqdm(
+                            ex.map(_process_file_task, tasks),
+                            total=total,
+                            desc=f"Rendering {group_name}",
+                            leave=True,
+                        ):
+                            if err == "already_exists":
+                                continue
+                            if not ok:
+                                print(f"[WARN] Skipping {fpath} -> {saved_path} due to error: {err}")
     else:
         # Single file path: treat as a group of one
         if not is_valid_glb(input_path):

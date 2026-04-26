@@ -21,7 +21,7 @@ model:
 # Default dataset (kept for backward compatibility)
 dataset:
   config: 
-    - 'dataset_local/animesh_scaled_local.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/deformingthings.json'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -35,7 +35,7 @@ dataset:
 # 3D dataset for parts (e.g., 3DFront)
 dataset_3d:
   config:
-    - 'dataset_local/3dfront_local_with_rerender.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/3dfront.json'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -49,7 +49,7 @@ dataset_3d:
 # 4D dataset for frames (animated)
 dataset_4d:
   config:
-    - 'dataset_local/animesh_scaled_local.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/deformingthings.json'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -60,9 +60,22 @@ dataset_4d:
   rotating_ratio: 0.2
   rotating_degree: 10
 
+dataset_physics:
+  config:
+    - '/data/mseizde/com4d/COM4D/dataset_json/physics.json'
+  training_ratio: 0.9
+  min_num_parts: 2
+  max_num_parts: 8
+  max_iou_mean: 0.5
+  max_iou_max: 0.5
+  shuffle_parts: false
+  object_ratio: 0
+  rotating_ratio: 0
+  rotating_degree: 10
+
 dataset_objaverse:
   config: 
-    - 'dataset_local/obbjaverse_local.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/objaverse.json'
   training_ratio: 1.0
   min_num_parts: 1
   max_num_parts: 1
@@ -89,7 +102,9 @@ lr_scheduler:
 
 train:
   image_load_size: 518
+  surface_num_points: 8192
   dino_preprocess_size: 518
+  physics_data_prob: 0.2
   advanced_image_masking:
     enabled: false
     3d:

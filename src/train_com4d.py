@@ -17,6 +17,7 @@ import signal
 import math
 import gc
 import random
+from datetime import timedelta
 from contextlib import nullcontext
 from packaging import version
 
@@ -31,7 +32,7 @@ import torch.nn.functional as tF
 import accelerate
 from accelerate import Accelerator
 from accelerate.logging import get_logger as get_accelerate_logger
-from accelerate import DataLoaderConfiguration, DeepSpeedPlugin
+from accelerate import DataLoaderConfiguration, DeepSpeedPlugin, InitProcessGroupKwargs
 from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3
@@ -288,6 +289,8 @@ def main():
         deepspeed_plugin = None
 
     # Initialize the accelerator
+    ddp_timeout_minutes = int(os.environ.get("COM4D_DDP_TIMEOUT_MINUTES", "180"))
+    process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=ddp_timeout_minutes))
     accelerator = Accelerator(
         project_dir=exp_dir,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -295,8 +298,12 @@ def main():
         split_batches=False,  # batch size per GPU
         dataloader_config=DataLoaderConfiguration(non_blocking=args.pin_memory),
         deepspeed_plugin=deepspeed_plugin,
+        kwargs_handlers=[process_group_kwargs],
     )
     logger.info(f"Accelerator state:\n{accelerator.state}\n")
+    logger.info(
+        f"Distributed process group timeout: [{ddp_timeout_minutes}] minutes\n"
+    )
 
     # Set the random seed
     if args.seed >= 0:
@@ -310,10 +317,14 @@ def main():
     # Build two dataset configs by overriding the 'dataset' key
     cfgs_3d = copy.deepcopy(configs)
     cfgs_4d = copy.deepcopy(configs)
+    cfgs_physics = None
     if 'dataset_3d' in configs:
         cfgs_3d['dataset'] = copy.deepcopy(configs['dataset_3d'])
     if 'dataset_4d' in configs:
         cfgs_4d['dataset'] = copy.deepcopy(configs['dataset_4d'])
+    if 'dataset_physics' in configs:
+        cfgs_physics = copy.deepcopy(configs)
+        cfgs_physics['dataset'] = copy.deepcopy(configs['dataset_physics'])
 
     # Train/Val: 3D
     train_dataset_3d = BatchedObjaversePartDataset3D(
@@ -387,6 +398,32 @@ def main():
         pin_memory=args.pin_memory,
     )
 
+    train_dataset_physics = None
+    train_loader_physics = None
+    physics_data_prob = float(configs["train"].get("physics_data_prob", 0.0))
+    if cfgs_physics is not None and physics_data_prob > 0.0:
+        train_dataset_physics = BatchedObjaversePartDataset4D(
+            configs=cfgs_physics,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            is_main_process=accelerator.is_main_process,
+            shuffle=True,
+            training=True,
+        )
+        train_loader_physics = MultiEpochsDataLoader(
+            train_dataset_physics,
+            batch_size=configs["train"]["batch_size_per_gpu"],
+            num_workers=args.num_workers,
+            drop_last=True,
+            pin_memory=args.pin_memory,
+            collate_fn=train_dataset_physics.collate_fn,
+        )
+        if len(train_dataset_physics) == 0 or len(train_loader_physics) == 0:
+            raise RuntimeError(
+                "Physics data mixing is enabled, but the batched physics dataset is empty. "
+                "Generate more physics sequences, lower train.batch_size_per_gpu, or lower "
+                "dataset_physics.min_num_parts/max_num_parts."
+            )
+
     objaverse_dataset_configs = copy.deepcopy(configs)
     objaverse_dataset_configs['dataset'] = configs['dataset_objaverse']
     objaverse_dataset = BatchedObjaversePartDatasetOriginal(
@@ -408,8 +445,14 @@ def main():
     logger.info(
         f"Loaded 3D [{len(train_dataset_3d)}] train / [{len(val_dataset_3d)}] val; "
         f"4D [{len(train_dataset_4d)}] train / [{len(val_dataset_4d)}] val; "
+        f"Physics [{len(train_dataset_physics) if train_dataset_physics is not None else 0}] train; "
         f"Objaverse [{len(objaverse_dataset)}] train\n"
     )
+    if accelerator.is_main_process:
+        logger.info(
+            f"Physics data mix: prob={physics_data_prob} "
+            f"enabled={train_loader_physics is not None}\n"
+        )
 
     single_object_reg_prob = float(configs["train"].get("single_object_regularizer_prob", 0.0))
     single_object_configs = [
@@ -428,6 +471,19 @@ def main():
     if args.scale_lr:
         configs["optimizer"]["lr"] *= (total_batch_size / 256)
         configs["lr_scheduler"]["max_lr"] = configs["optimizer"]["lr"]
+    if accelerator.is_main_process:
+        logger.info(
+            "Runtime memory settings: "
+            f"num_processes={accelerator.num_processes}, "
+            f"mixed_precision={accelerator.mixed_precision}, "
+            f"batch_size_per_gpu={configs['train']['batch_size_per_gpu']}, "
+            f"gradient_accumulation_steps={args.gradient_accumulation_steps}, "
+            f"total_batch_size={total_batch_size}, "
+            f"image_load_size={configs['train'].get('image_load_size', 'unset')}, "
+            f"dino_preprocess_size={configs['train'].get('dino_preprocess_size', 'unset')}, "
+            f"NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE', 'unset')}, "
+            f"PYTORCH_CUDA_ALLOC_CONF={os.environ.get('PYTORCH_CUDA_ALLOC_CONF', 'unset')}\n"
+        )
     
     # Initialize the model
     logger.info("Initializing the model...")
@@ -520,7 +576,12 @@ def main():
         spatial_global_attn_block_ids = fallback_global_ids or []
     if temporal_global_attn_block_ids is None:
         temporal_global_attn_block_ids = fallback_global_ids or []
+    transformer_init_source = "unknown"
     if args.from_scratch:
+        transformer_init_source = (
+            "from_scratch:"
+            f"{os.path.join(configs['model']['pretrained_model_name_or_path'], 'transformer')}"
+        )
         logger.info(f"Initialize PartFrameCrafterDiTModel from scratch\n")
         transformer = PartFrameCrafterDiTModel.from_config(
             os.path.join(
@@ -541,29 +602,69 @@ def main():
             global_attn_block_id_range=None,
         )
     elif args.load_pretrained_model is None or args.load_pretrained_model_ckpt is None:
-        if args.load_pretrained_model is not None and args.load_pretrained_model_ckpt is None:
+        direct_pretrained_dir = None
+        if args.load_pretrained_model is not None:
+            cand = os.path.join(args.load_pretrained_model, "transformer_ema")
+            if os.path.isdir(cand) and os.path.exists(os.path.join(cand, "diffusion_pytorch_model.safetensors")):
+                direct_pretrained_dir = cand
+            elif os.path.isdir(args.load_pretrained_model) and os.path.exists(
+                os.path.join(args.load_pretrained_model, "diffusion_pytorch_model.safetensors")
+            ):
+                direct_pretrained_dir = args.load_pretrained_model
+            elif os.path.isdir(os.path.join(args.load_pretrained_model, "transformer")):
+                direct_pretrained_dir = os.path.join(args.load_pretrained_model, "transformer")
+
+        if direct_pretrained_dir is not None:
+            transformer_init_source = f"direct_pretrained_dir:{direct_pretrained_dir}"
             logger.info(
-                "Ignoring `--load_pretrained_model` because `--load_pretrained_model_ckpt` < 0. "
-                "Falling back to config pretrained transformer initialization.\n"
+                f"Load PartFrameCrafterDiTModel weights directly from [{direct_pretrained_dir}] "
+                "without a stage checkpoint iteration.\n"
             )
-        logger.info(f"Load pretrained TripoSGDiTModel to initialize PartFrameCrafterDiTModel from [{configs['model']['pretrained_model_name_or_path']}]\n")
-        transformer, loading_info = PartFrameCrafterDiTModel.from_pretrained(
-            configs["model"]["pretrained_model_name_or_path"],
-            subfolder="transformer",
-            low_cpu_mem_usage=False, 
-            output_loading_info=True, 
-            enable_part_embedding=enable_part_embedding,
-            enable_frame_embedding=enable_frame_embedding,
-            enable_static_embedding=enable_static_embedding,
-            enable_dynamic_embedding=enable_dynamic_embedding,
-            enable_static_embedding_per_block=enable_static_embedding_per_block,
-            enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
-            enable_local_cross_attn=enable_local_cross_attn,
-            enable_global_cross_attn=enable_global_cross_attn,
-            global_attn_block_ids=spatial_global_attn_block_ids,
-            global_attn_block_id_range=None,
-        )
+            transformer, loading_info = PartFrameCrafterDiTModel.from_pretrained(
+                direct_pretrained_dir,
+                low_cpu_mem_usage=False,
+                output_loading_info=True,
+                enable_part_embedding=enable_part_embedding,
+                enable_frame_embedding=enable_frame_embedding,
+                enable_static_embedding=enable_static_embedding,
+                enable_dynamic_embedding=enable_dynamic_embedding,
+                enable_static_embedding_per_block=enable_static_embedding_per_block,
+                enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+                enable_local_cross_attn=enable_local_cross_attn,
+                enable_global_cross_attn=enable_global_cross_attn,
+                global_attn_block_ids=spatial_global_attn_block_ids,
+                global_attn_block_id_range=None,
+            )
+        else:
+            if args.load_pretrained_model is not None and args.load_pretrained_model_ckpt is None:
+                logger.info(
+                    "Ignoring `--load_pretrained_model` because `--load_pretrained_model_ckpt` < 0 "
+                    "and the path does not point to a loadable weights directory. "
+                    "Falling back to config pretrained transformer initialization.\n"
+                )
+            transformer_init_source = (
+                "config_pretrained:"
+                f"{configs['model']['pretrained_model_name_or_path']}/transformer"
+            )
+            logger.info(f"Load pretrained TripoSGDiTModel to initialize PartFrameCrafterDiTModel from [{configs['model']['pretrained_model_name_or_path']}]\n")
+            transformer, loading_info = PartFrameCrafterDiTModel.from_pretrained(
+                configs["model"]["pretrained_model_name_or_path"],
+                subfolder="transformer",
+                low_cpu_mem_usage=False, 
+                output_loading_info=True, 
+                enable_part_embedding=enable_part_embedding,
+                enable_frame_embedding=enable_frame_embedding,
+                enable_static_embedding=enable_static_embedding,
+                enable_dynamic_embedding=enable_dynamic_embedding,
+                enable_static_embedding_per_block=enable_static_embedding_per_block,
+                enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+                enable_local_cross_attn=enable_local_cross_attn,
+                enable_global_cross_attn=enable_global_cross_attn,
+                global_attn_block_ids=spatial_global_attn_block_ids,
+                global_attn_block_id_range=None,
+            )
     else:
+        transformer_init_source = f"checkpoint_ema:{args.load_pretrained_model}:{args.load_pretrained_model_ckpt:06d}"
         logger.info(f"Load PartFrameCrafterDiTModel EMA checkpoint from [{args.load_pretrained_model}] iteration [{args.load_pretrained_model_ckpt:06d}]\n")
         path = os.path.join(
             args.output_dir,
@@ -595,6 +696,10 @@ def main():
             if v and len(v) > 0:
                 logger.info(f"Loading info of PartFrameCrafterDiTModel: {loading_info}\n")
                 break
+    if accelerator.is_main_process:
+        logger.info(
+            f"Transformer initialization source: [{transformer_init_source}]\n"
+        )
 
     # Transformer parameters
     transformer.enable_part_embedding = enable_part_embedding
@@ -643,7 +748,7 @@ def main():
 
     # transformer.enable_xformers_memory_efficient_attention()  # use `tF.scaled_dot_product_attention` instead
 
-    logger.info(f"Model initialized.\n", transformer)
+    logger.info("Model initialized.\n%s", transformer)
 
     # Build processor maps and a switch for spatial (3D) vs temporal (4D) global attention
     def _build_attn_processor_map(active_ids: List[int]) -> Dict[str, Any]:
@@ -730,15 +835,27 @@ def main():
     lr_mult = configs["train"].get("lr_mult", 1.0)
     params, params_lr_mult, names_lr_mult = [], [], []
     for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            continue
         if name_lr_mult is not None:
+            matched_lr_mult = False
             for k in name_lr_mult.split(","):
                 if k in name:
                     params_lr_mult.append(param)
                     names_lr_mult.append(name)
-            if name not in names_lr_mult:
+                    matched_lr_mult = True
+                    break
+            if not matched_lr_mult:
                 params.append(param)
         else:
             params.append(param)
+
+    total_trainable_tensors = len(params) + len(params_lr_mult)
+    if total_trainable_tensors == 0:
+        raise RuntimeError(
+            "No trainable parameters were found before optimizer creation. "
+            "This would make DDP fail because one or more ranks present zero trainable tensors."
+        )
     optimizer = get_optimizer(
         params=[
             {"params": params, "lr": configs["optimizer"]["lr"]},
@@ -749,9 +866,73 @@ def main():
     if name_lr_mult is not None:
         logger.info(f"Learning rate x [{lr_mult}] parameter names: {names_lr_mult}\n")
 
+    def _summarize_model(module: torch.nn.Module) -> Dict[str, Any]:
+        param_tensors = 0
+        total_params = 0
+        trainable_tensors = 0
+        trainable_params = 0
+        first_trainable_names = []
+
+        for name, param in module.named_parameters():
+            param_tensors += 1
+            total_params += param.numel()
+            if param.requires_grad:
+                trainable_tensors += 1
+                trainable_params += param.numel()
+                if len(first_trainable_names) < 8:
+                    first_trainable_names.append(name)
+
+        return {
+            "rank": int(accelerator.process_index),
+            "type": type(module).__name__,
+            "param_tensors": int(param_tensors),
+            "total_params": int(total_params),
+            "trainable_tensors": int(trainable_tensors),
+            "trainable_params": int(trainable_params),
+            "first_trainable_names": first_trainable_names,
+        }
+
+    def _summarize_optimizer(optimizer_obj: torch.optim.Optimizer) -> Dict[str, int]:
+        opt_param_tensors = 0
+        opt_total_params = 0
+        for group in optimizer_obj.param_groups:
+            opt_param_tensors += len(group["params"])
+            opt_total_params += sum(param.numel() for param in group["params"])
+        return {
+            "opt_param_tensors": int(opt_param_tensors),
+            "opt_total_params": int(opt_total_params),
+        }
+
+    model_debug = _summarize_model(transformer)
+    optimizer_debug = _summarize_optimizer(optimizer)
+    print(
+        f"[DEBUG before prepare] rank={model_debug['rank']} "
+        f"type={model_debug['type']} "
+        f"param_tensors={model_debug['param_tensors']} "
+        f"total_params={model_debug['total_params']} "
+        f"trainable_tensors={model_debug['trainable_tensors']} "
+        f"trainable_params={model_debug['trainable_params']}",
+        flush=True,
+    )
+    print(
+        f"[DEBUG optimizer] rank={accelerator.process_index} "
+        f"opt_param_tensors={optimizer_debug['opt_param_tensors']} "
+        f"opt_total_params={optimizer_debug['opt_total_params']}",
+        flush=True,
+    )
+
+    if model_debug["trainable_tensors"] == 0 or optimizer_debug["opt_param_tensors"] == 0:
+        raise RuntimeError(
+            "Detected an empty trainable model or optimizer parameter list before accelerator.prepare(). "
+            f"Rank {accelerator.process_index} summary: model={model_debug}, optimizer={optimizer_debug}"
+        )
+
     # Derive total steps; prefer existing value in configs if provided
     if "total_steps" not in configs["lr_scheduler"] or int(configs["lr_scheduler"]["total_steps"]) <= 0:
-        approx_len = max(1, max(len(train_loader_3d), len(train_loader_4d)))
+        loader_lengths = [len(train_loader_3d), len(train_loader_4d)]
+        if train_loader_physics is not None:
+            loader_lengths.append(len(train_loader_physics))
+        approx_len = max(1, max(loader_lengths))
         configs["lr_scheduler"]["total_steps"] = configs["train"]["epochs"] * math.ceil(
             approx_len // max(1, accelerator.num_processes) / max(1, args.gradient_accumulation_steps)
         )  # only account updated steps
@@ -764,6 +945,25 @@ def main():
         configs["lr_scheduler"]["num_warmup_steps"] //= accelerator.num_processes  # reset for multi-gpu
 
     # Prepare everything with `accelerator`.
+    print(
+        f"[DEBUG entering prepare] rank={accelerator.process_index}",
+        flush=True,
+    )
+    prepare_start_time = time.perf_counter()
+    prepare_items = [
+        transformer,
+        optimizer,
+        lr_scheduler,
+        train_loader_3d,
+        train_loader_4d,
+        val_loader_3d,
+        val_loader_4d,
+        random_val_loader_3d,
+        random_val_loader_4d,
+    ]
+    if train_loader_physics is not None:
+        prepare_items.append(train_loader_physics)
+    prepared_items = accelerator.prepare(*prepare_items)
     (
         transformer,
         optimizer,
@@ -774,16 +974,14 @@ def main():
         val_loader_4d,
         random_val_loader_3d,
         random_val_loader_4d,
-    ) = accelerator.prepare(
-        transformer,
-        optimizer,
-        lr_scheduler,
-        train_loader_3d,
-        train_loader_4d,
-        val_loader_3d,
-        val_loader_4d,
-        random_val_loader_3d,
-        random_val_loader_4d,
+        *optional_prepared_loaders,
+    ) = prepared_items
+    if train_loader_physics is not None:
+        train_loader_physics = optional_prepared_loaders[0]
+    print(
+        f"[DEBUG prepare done] rank={accelerator.process_index} "
+        f"elapsed={time.perf_counter() - prepare_start_time:.2f}s",
+        flush=True,
     )
 
     if args.use_ema:
@@ -1000,6 +1198,7 @@ def main():
     # Mixed training iterators
     train_iter_3d = yield_forever(train_loader_3d)
     train_iter_4d = yield_forever(train_loader_4d)
+    train_iter_physics = yield_forever(train_loader_physics) if train_loader_physics is not None else None
     objaverse_train_iter = yield_forever(objaverse_train_loader)
     # Probability to pick 4D at each iter (default 0.5)
     p_4d = float(configs["train"].get("prob_4d", 0.5))
@@ -1008,8 +1207,10 @@ def main():
         if global_update_step == args.max_train_steps:
             progress_bar.close()
             logger.logger.propagate = True  # propagate to the root logger (console)
+            accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 wandb.finish()
+            accelerator.end_training()
             logger.info("Training finished!\n")
             return
 
@@ -1017,17 +1218,25 @@ def main():
 
         with accelerator.accumulate(transformer):
             # Randomly choose dataset for this iteration
-            is_single_object_step = random.random() < single_object_reg_prob and single_object_configs != []
-            if is_single_object_step:
-                batch = next(objaverse_train_iter)
-                use_4d = False
-                mode = "single"
-            else:
-                use_4d = random.random() < p_4d
-                batch = next(train_iter_4d) if use_4d else next(train_iter_3d)
-                mode = "4d" if use_4d else "3d"
-                # Switch attention mode
+            use_physics = train_iter_physics is not None and random.random() < physics_data_prob
+            if use_physics:
+                is_single_object_step = False
+                batch = next(train_iter_physics)
+                use_4d = True
+                mode = "4d"
                 switch_to_mode(mode)
+            else:
+                is_single_object_step = random.random() < single_object_reg_prob and single_object_configs != []
+                if is_single_object_step:
+                    batch = next(objaverse_train_iter)
+                    use_4d = False
+                    mode = "single"
+                else:
+                    use_4d = random.random() < p_4d
+                    batch = next(train_iter_4d) if use_4d else next(train_iter_3d)
+                    mode = "4d" if use_4d else "3d"
+                    # Switch attention mode
+                    switch_to_mode(mode)
 
             images_hw3 = batch["images"] # [N, H, W, 3]
             images_hw3 = apply_advanced_image_masking(images_hw3, batch["num_parts"], mode)

@@ -49,5 +49,59 @@
         "dynamic_max_memory_frames": 8,
         "scene_mix_cutoff": 50,
         "dynamic_mix_cutoff": 25
+    },
+
+    "my_ckpt_4000": {
+        "tag": "my_ckpt_4000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/com4d_sdemb_mf8_mp8_nt512_5761/checkpoints/004000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "full_ckpt_5000": {
+        "tag": "full_ckpt_5000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/com4d_sdemb_mf8_mp8_nt512_14455/checkpoints/005000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "physics_ckpt_3000": {
+        "tag": "physics_ckpt_3000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/com4d_sdemb_mf8_mp8_nt512_30400/checkpoints/003000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
     }
 }

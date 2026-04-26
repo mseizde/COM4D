@@ -54,6 +54,10 @@ def _output_path(output_root: str, glb_path: str, input_root: str) -> Tuple[str,
     rel_path = os.path.relpath(glb_path, input_root)
     rel_no_ext = os.path.splitext(rel_path)[0]
     parts = [p for p in rel_no_ext.replace("\\", "/").split("/") if p]
+    # Treat <object_id>/mesh.glb as a single object folder rather than
+    # propagating the literal "mesh" file stem into the output name.
+    if len(parts) >= 2 and parts[-1].lower() == "mesh":
+        parts = parts[:-1]
     name = "_".join(parts) if parts else os.path.splitext(os.path.basename(glb_path))[0]
     out_dir = os.path.join(output_root, name)
     out_file = os.path.join(out_dir, "mesh.glb")

@@ -14,6 +14,31 @@ from tqdm import tqdm
 from src.utils.data_utils import load_surface, load_surfaces
 
 
+def _load_rgb_image(
+    image_path: str,
+    image_size: tuple[int, int],
+    transform=None,
+    rotating_ratio: float = 0.0,
+) -> torch.Tensor:
+    pil_image = Image.open(image_path)
+    if getattr(pil_image, "is_animated", False):
+        try:
+            pil_image.seek(0)
+        except Exception:
+            pass
+    pil_image.load()
+    if pil_image.mode in ("RGBA", "LA"):
+        bg = Image.new("RGBA", pil_image.size, (255, 255, 255, 255))
+        pil_image = Image.alpha_composite(bg, pil_image.convert("RGBA")).convert("RGB")
+    else:
+        pil_image = pil_image.convert("RGB")
+    if transform is not None and random.random() < rotating_ratio:
+        pil_image = transform(pil_image)
+    pil_image = pil_image.resize(image_size, Image.Resampling.BILINEAR)
+    image = np.asarray(pil_image, dtype=np.uint8)
+    return torch.from_numpy(image).to(torch.uint8)
+
+
 class ObjaversePartDataset(torch.utils.data.Dataset):
     def __init__(
         self, 
@@ -69,6 +94,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.data_configs = data_configs
         image_load_size = int(configs["train"].get("image_load_size", 512))
         self.image_size = (image_load_size, image_load_size)
+        self.surface_num_points = int(configs["train"].get("surface_num_points", 204800))
 
     def __len__(self) -> int:
         return len(self.data_configs)
@@ -81,33 +107,20 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
             if self.shuffle_parts:
                 random.shuffle(part_surfaces)
-            part_surfaces = load_surfaces(part_surfaces) # [N, P, 6]
+            part_surfaces = load_surfaces(part_surfaces, num_pc=self.surface_num_points) # [N, P, 6]
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
                 surface_data = np.load(surface_path, allow_pickle=True).item()
-                part_surfaces.append(load_surface(surface_data))
+                part_surfaces.append(load_surface(surface_data, num_pc=self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
         image_path = data_config['image_path']
-        # Robustly load WebP/alpha images and resize
-        pil_image = Image.open(image_path)
-        # Apply optional rotation on the PIL image first (needs RGB mode)
-        if getattr(pil_image, "is_animated", False):
-            try:
-                pil_image.seek(0)
-            except Exception:
-                pass
-        pil_image.load()
-        if pil_image.mode in ("RGBA", "LA"):
-            bg = Image.new("RGBA", pil_image.size, (255, 255, 255, 255))
-            pil_image = Image.alpha_composite(bg, pil_image.convert("RGBA")).convert("RGB")
-        else:
-            pil_image = pil_image.convert("RGB")
-        if random.random() < self.rotating_ratio:
-            pil_image = self.transform(pil_image)
-        pil_image = pil_image.resize(self.image_size, Image.Resampling.BILINEAR)
-        image = np.asarray(pil_image, dtype=np.uint8)
-        image = torch.from_numpy(image).to(torch.uint8)  # [H, W, 3]
+        image = _load_rgb_image(
+            image_path=image_path,
+            image_size=self.image_size,
+            transform=self.transform,
+            rotating_ratio=self.rotating_ratio,
+        )  # [H, W, 3]
         images = torch.stack([image] * part_surfaces.shape[0], dim=0) # [N, H, W, 3]
         return {
             "images": images,
@@ -270,9 +283,52 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
         self.data_configs = data_configs
         image_load_size = int(configs["train"].get("image_load_size", 512))
         self.image_size = (image_load_size, image_load_size)
+        self.surface_num_points = int(configs["train"].get("surface_num_points", 204800))
 
     def __len__(self) -> int:
         return len(self.data_configs)
+
+    def _format_data_config(self, data_config: dict) -> str:
+        image_path = data_config.get("image_path", "<missing>")
+        if 'surface_path' in data_config:
+            surface_desc = data_config['surface_path']
+        else:
+            surface_desc = data_config.get('surface_paths', '<missing>')
+        return f"image_path={image_path}, surfaces={surface_desc}"
+
+    def _retry_index(self, failed_idx: int) -> int:
+        if len(self.data_configs) <= 1:
+            return failed_idx
+        new_idx = random.randrange(len(self.data_configs) - 1)
+        if new_idx >= failed_idx:
+            new_idx += 1
+        return new_idx
+
+    def _getitem_with_retry(self, idx: int):
+        max_attempts = min(8, max(1, len(self.data_configs)))
+        last_exc = None
+        last_desc = None
+        for attempt in range(max_attempts):
+            data_config = self.data_configs[idx]
+            try:
+                return self._get_data_by_config(data_config)
+            except (OSError, ValueError, EOFError) as exc:
+                sample_desc = self._format_data_config(data_config)
+                if not self.training:
+                    raise RuntimeError(
+                        f"Failed to load validation sample idx={idx}: {sample_desc}"
+                    ) from exc
+                print(
+                    f"[ObjaversePartDatasetOriginal] Skipping unreadable sample "
+                    f"(attempt {attempt + 1}/{max_attempts}) idx={idx}: {sample_desc}. "
+                    f"Original error: {exc}"
+                )
+                last_exc = exc
+                last_desc = sample_desc
+                idx = self._retry_index(idx)
+        raise RuntimeError(
+            f"Exceeded retry budget while loading training sample. Last failed sample: {last_desc}"
+        ) from last_exc
     
     def _get_data_by_config(self, data_config):
         if 'surface_path' in data_config:
@@ -282,19 +338,20 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
             if self.shuffle_parts:
                 random.shuffle(part_surfaces)
-            part_surfaces = load_surfaces(part_surfaces) # [N, P, 6]
+            part_surfaces = load_surfaces(part_surfaces, num_pc=self.surface_num_points) # [N, P, 6]
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
                 surface_data = np.load(surface_path, allow_pickle=True).item()
-                part_surfaces.append(load_surface(surface_data))
+                part_surfaces.append(load_surface(surface_data, num_pc=self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
         image_path = data_config['image_path']
-        image = Image.open(image_path).resize(self.image_size)
-        if random.random() < self.rotating_ratio:
-            image = self.transform(image)
-        image = np.array(image)
-        image = torch.from_numpy(image).to(torch.uint8) # [H, W, 3]
+        image = _load_rgb_image(
+            image_path=image_path,
+            image_size=self.image_size,
+            transform=self.transform,
+            rotating_ratio=self.rotating_ratio,
+        ) # [H, W, 3]
         images = torch.stack([image] * part_surfaces.shape[0], dim=0) # [N, H, W, 3]
         return {
             "images": images,
@@ -305,9 +362,7 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
         # The dataset can only support batchsize == 1 training. 
         # Because the number of parts is not fixed.
         # Please see BatchedObjaversePartDataset for batched training.
-        data_config = self.data_configs[idx]
-        data = self._get_data_by_config(data_config)
-        return data
+        return self._getitem_with_retry(idx)
         
 class BatchedObjaversePartDatasetOriginal(ObjaversePartDatasetOriginal):
     def __init__(
@@ -383,8 +438,7 @@ class BatchedObjaversePartDatasetOriginal(ObjaversePartDatasetOriginal):
         if len(data_config) == 0:
             # placeholder
             return {}
-        data = self._get_data_by_config(data_config)
-        return data
+        return self._getitem_with_retry(idx)
     
     def collate_fn(self, batch):
         batch = [data for data in batch if len(data) > 0]

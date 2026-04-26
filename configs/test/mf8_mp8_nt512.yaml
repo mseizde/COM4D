@@ -89,6 +89,7 @@ lr_scheduler:
 
 train:
   image_load_size: 518
+  surface_num_points: 8192
   dino_preprocess_size: 518
   advanced_image_masking:
     enabled: false
