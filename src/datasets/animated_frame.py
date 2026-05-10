@@ -12,6 +12,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from src.utils.data_utils import load_surface, load_surfaces
+from src.datasets.local_cache import prefetch_data_configs, resolve_path
 
 # --- Robust image loader for WebP/alpha ---
 def _load_rgb_image(image_path: str, size: tuple[int, int]) -> torch.Tensor:
@@ -230,8 +231,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             part_surfaces = []
             images_list = []
             for fr in chosen:
-                surface_path = fr['surface_path']
-                image_path = fr['image_path']
+                surface_path = resolve_path(fr['surface_path'])
+                image_path = resolve_path(fr['image_path'])
                 surface_data = np.load(surface_path, allow_pickle=True).item()
                 part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
                 # Load image per frame
@@ -259,14 +260,14 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 "part_surfaces": part_surfaces,
             }
         elif 'surface_path' in data_config:
-            surface_path = data_config['surface_path']
+            surface_path = resolve_path(data_config['surface_path'])
             surface_data = np.load(surface_path, allow_pickle=True).item()
             # If parts is empty, the object is the only part
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
             if self.shuffle_parts:
                 random.shuffle(part_surfaces)
             part_surfaces = load_surfaces(part_surfaces, num_pc=self.surface_num_points) # [N, P, 6]
-            image_path = data_config['image_path']
+            image_path = resolve_path(data_config['image_path'])
             # Robustly load WebP/alpha images and resize
             pil_image = Image.open(image_path)
             # Apply optional rotation on the PIL image first (needs RGB mode)
@@ -294,10 +295,11 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
+                surface_path = resolve_path(surface_path)
                 surface_data = np.load(surface_path, allow_pickle=True).item()
                 part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
-            image_path = data_config['image_path']
+            image_path = resolve_path(data_config['image_path'])
             # Robustly load WebP/alpha images and resize
             pil_image = Image.open(image_path)
             # Apply optional rotation on the PIL image first (needs RGB mode)
@@ -328,6 +330,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         # Because the number of parts is not fixed.
         # Please see BatchedObjaversePartDataset for batched training.
         data_config = self.data_configs[idx]
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         data = self._get_data_by_config(data_config)
         return data
         
@@ -406,6 +410,8 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
         if len(data_config) == 0:
             # placeholder
             return {}
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         data = self._get_data_by_config(data_config)
         return data
     

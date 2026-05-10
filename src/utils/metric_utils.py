@@ -1,8 +1,153 @@
-from src.utils.typing_utils import *
-
 import trimesh
 import numpy as np
+from pathlib import Path
 from sklearn.neighbors import NearestNeighbors
+from typing import Dict, List, Literal, Optional, Tuple, Union
+
+
+AXIS_TO_INDEX = {"x": 0, "y": 1, "z": 2}
+
+
+def axis_index(axis: Literal["x", "y", "z"]) -> int:
+    if axis not in AXIS_TO_INDEX:
+        raise ValueError(f"Unsupported axis {axis!r}; expected one of {sorted(AXIS_TO_INDEX)}.")
+    return AXIS_TO_INDEX[axis]
+
+
+def load_mesh_or_scene(path: Union[str, Path]) -> Union[trimesh.Trimesh, trimesh.Scene]:
+    loaded = trimesh.load(str(path), process=False)
+    if isinstance(loaded, (trimesh.Trimesh, trimesh.Scene)):
+        return loaded
+    raise TypeError(f"Unsupported geometry type loaded from {path}: {type(loaded)!r}")
+
+
+def scene_to_meshes(scene: Union[trimesh.Trimesh, trimesh.Scene, List[trimesh.Trimesh]]) -> List[trimesh.Trimesh]:
+    if isinstance(scene, trimesh.Trimesh):
+        return [scene]
+    if isinstance(scene, trimesh.Scene):
+        return [
+            mesh
+            for mesh in scene.dump(concatenate=False)
+            if isinstance(mesh, trimesh.Trimesh) and len(mesh.vertices) > 0
+        ]
+    if isinstance(scene, list) and all(isinstance(mesh, trimesh.Trimesh) for mesh in scene):
+        return [mesh for mesh in scene if len(mesh.vertices) > 0]
+    raise TypeError(f"Expected Trimesh, Scene, or list[Trimesh], got {type(scene)!r}.")
+
+
+def scene_to_single_mesh(scene: Union[trimesh.Trimesh, trimesh.Scene, List[trimesh.Trimesh]]) -> trimesh.Trimesh:
+    meshes = scene_to_meshes(scene)
+    if not meshes:
+        raise ValueError("Cannot concatenate an empty scene.")
+    if len(meshes) == 1:
+        return meshes[0]
+    return trimesh.util.concatenate(meshes)
+
+
+def bounds_from_mesh_or_scene(mesh_or_scene: Union[trimesh.Trimesh, trimesh.Scene, List[trimesh.Trimesh]]) -> np.ndarray:
+    if isinstance(mesh_or_scene, list):
+        meshes = scene_to_meshes(mesh_or_scene)
+        if not meshes:
+            raise ValueError("Cannot compute bounds for an empty mesh list.")
+        mins = np.stack([np.asarray(mesh.bounds[0], dtype=np.float64) for mesh in meshes], axis=0)
+        maxs = np.stack([np.asarray(mesh.bounds[1], dtype=np.float64) for mesh in meshes], axis=0)
+        bounds = np.stack([mins.min(axis=0), maxs.max(axis=0)], axis=0)
+    else:
+        bounds = np.asarray(mesh_or_scene.bounds, dtype=np.float64)
+    if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
+        raise ValueError("Geometry has invalid bounds.")
+    return bounds
+
+
+def center_from_bounds(bounds: np.ndarray) -> np.ndarray:
+    bounds = np.asarray(bounds, dtype=np.float64)
+    return 0.5 * (bounds[0] + bounds[1])
+
+
+def size_from_bounds(bounds: np.ndarray) -> np.ndarray:
+    bounds = np.asarray(bounds, dtype=np.float64)
+    return bounds[1] - bounds[0]
+
+
+def bbox_overlap_extents(bounds_a: np.ndarray, bounds_b: np.ndarray) -> np.ndarray:
+    a = np.asarray(bounds_a, dtype=np.float64)
+    b = np.asarray(bounds_b, dtype=np.float64)
+    return np.maximum(0.0, np.minimum(a[1], b[1]) - np.maximum(a[0], b[0]))
+
+
+def bbox_volume(bounds: np.ndarray) -> float:
+    size = np.maximum(size_from_bounds(bounds), 0.0)
+    return float(np.prod(size))
+
+
+def bbox_overlap_volume(bounds_a: np.ndarray, bounds_b: np.ndarray) -> float:
+    return float(np.prod(bbox_overlap_extents(bounds_a, bounds_b)))
+
+
+def bbox_iou_3d(bounds_a: np.ndarray, bounds_b: np.ndarray) -> float:
+    intersection = bbox_overlap_volume(bounds_a, bounds_b)
+    union = bbox_volume(bounds_a) + bbox_volume(bounds_b) - intersection
+    return float(intersection / union) if union > 0.0 else 0.0
+
+
+def bbox_overlap_area_xz(bounds_a: np.ndarray, bounds_b: np.ndarray) -> float:
+    overlap = bbox_overlap_extents(bounds_a, bounds_b)
+    return float(overlap[0] * overlap[2])
+
+
+def floor_support_error(
+    bounds: np.ndarray,
+    floor_height: float = 0.0,
+    up_axis: Literal["x", "y", "z"] = "y",
+) -> float:
+    up_idx = axis_index(up_axis)
+    return float(np.asarray(bounds, dtype=np.float64)[0, up_idx] - floor_height)
+
+
+def floor_penetration_depth(
+    bounds: np.ndarray,
+    floor_height: float = 0.0,
+    up_axis: Literal["x", "y", "z"] = "y",
+) -> float:
+    return float(max(0.0, -floor_support_error(bounds, floor_height, up_axis)))
+
+
+def is_floating(
+    bounds: np.ndarray,
+    floor_height: float = 0.0,
+    tolerance: float = 0.05,
+    up_axis: Literal["x", "y", "z"] = "y",
+) -> bool:
+    return bool(floor_support_error(bounds, floor_height, up_axis) > tolerance)
+
+
+def trajectory_speed_stats(centers: np.ndarray, fps: float) -> Dict[str, float]:
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("centers must have shape [num_frames, 3].")
+    if len(centers) < 2:
+        return {"mean": 0.0, "max": 0.0, "std": 0.0}
+    speeds = np.linalg.norm(np.diff(centers, axis=0), axis=1) * float(fps)
+    return {
+        "mean": float(np.mean(speeds)),
+        "max": float(np.max(speeds)),
+        "std": float(np.std(speeds)),
+    }
+
+
+def trajectory_acceleration_stats(centers: np.ndarray, fps: float) -> Dict[str, float]:
+    centers = np.asarray(centers, dtype=np.float64)
+    if centers.ndim != 2 or centers.shape[1] != 3:
+        raise ValueError("centers must have shape [num_frames, 3].")
+    if len(centers) < 3:
+        return {"mean": 0.0, "max": 0.0, "std": 0.0}
+    velocities = np.diff(centers, axis=0) * float(fps)
+    accelerations = np.linalg.norm(np.diff(velocities, axis=0), axis=1) * float(fps)
+    return {
+        "mean": float(np.mean(accelerations)),
+        "max": float(np.max(accelerations)),
+        "std": float(np.std(accelerations)),
+    }
 
 def sample_from_mesh(
     mesh: trimesh.Trimesh,

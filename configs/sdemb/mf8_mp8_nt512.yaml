@@ -35,7 +35,7 @@ dataset:
 # 3D dataset for parts (e.g., 3DFront)
 dataset_3d:
   config:
-    - '/data/mseizde/com4d/COM4D/dataset_json/3dfront.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/3dfront_augmented_geometry_shell.json'
   training_ratio: 0.9
   min_num_parts: 1
   max_num_parts: 8
@@ -104,7 +104,7 @@ train:
   image_load_size: 518
   surface_num_points: 8192
   dino_preprocess_size: 518
-  physics_data_prob: 0.2
+  physics_data_prob: 0.0
   advanced_image_masking:
     enabled: false
     3d:
@@ -118,6 +118,14 @@ train:
       prob: 0.25
       mask_size_ratio_range: [0.1, 0.25]
   single_object_regularizer_prob: 0.3
+  layout_pose_auxiliary:
+    enabled: true
+    weight: 0.05
+    hidden_dim: 256
+  room_layout_auxiliary:
+    enabled: true
+    weight: 0.02
+    hidden_dim: 256
   prob_4d: 0.5
   consistency_loss_weight: 0
   df_enabled: false

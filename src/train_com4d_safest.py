@@ -11,7 +11,6 @@ diffusion_logging.set_verbosity_error()  # ignore diffusers warnings
 from src.utils.typing_utils import *
 
 import argparse
-import json
 import logging
 import time
 import signal
@@ -29,7 +28,6 @@ import wandb
 from tqdm import tqdm
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as tF
 import accelerate
 from accelerate import Accelerator
@@ -64,7 +62,7 @@ from src.datasets import (
     MultiEpochsDataLoader,
     yield_forever,
 )
-from src.datasets.local_cache import configure_dataset_cache, prefetch_data_configs, resolve_path
+from src.datasets.local_cache import configure_dataset_cache, prefetch_data_configs
 from src.utils.data_utils import get_colored_mesh_composition
 from src.utils.train_utils import (
     MyEMAModel, 
@@ -91,295 +89,6 @@ from src.models.attention_processor import (
 
 class ValidationSampleTimeout(RuntimeError):
     pass
-
-
-class LayoutPoseAuxiliaryHead(nn.Module):
-    def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 6):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_channels),
-            nn.Linear(in_channels, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, latent_tokens: torch.Tensor) -> torch.Tensor:
-        pooled = latent_tokens.float().mean(dim=1)
-        return self.net(pooled)
-
-
-class RoomLayoutAuxiliaryHead(nn.Module):
-    def __init__(self, in_channels: int, hidden_dim: int = 256, out_dim: int = 12):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_channels),
-            nn.Linear(in_channels, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, latent_tokens: torch.Tensor, num_parts: torch.Tensor) -> torch.Tensor:
-        pooled_objects = []
-        ptr = 0
-        for count_tensor in num_parts.detach().cpu():
-            count = int(count_tensor.item())
-            if count <= 0:
-                continue
-            pooled_objects.append(latent_tokens[ptr:ptr + count].float().mean(dim=(0, 1)))
-            ptr += count
-        if not pooled_objects:
-            return latent_tokens.new_zeros((0, 12), dtype=torch.float32)
-        return self.net(torch.stack(pooled_objects, dim=0))
-
-
-def _checkpoint_aux_head_path(
-    pretrained_root: Optional[str],
-    pretrained_ckpt: Optional[int],
-    filename: str,
-) -> Optional[str]:
-    if pretrained_root is None or pretrained_ckpt is None:
-        return None
-    root = os.path.abspath(pretrained_root)
-    ckpt_name = f"{int(pretrained_ckpt):06d}"
-    candidates = [
-        os.path.join(root, "checkpoints", ckpt_name, filename),
-        os.path.join(root, ckpt_name, filename),
-        os.path.join(root, filename),
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            return path
-    return None
-
-
-def _load_aux_head_state_if_available(
-    head: Optional[nn.Module],
-    path: Optional[str],
-    name: str,
-    logger,
-) -> None:
-    if head is None or path is None:
-        return
-    if not os.path.isfile(path):
-        logger.info(f"{name} auxiliary init path does not exist, keeping random init: {path}\n")
-        return
-    state = torch.load(path, map_location="cpu")
-    head.load_state_dict(state)
-    logger.info(f"Initialized {name} auxiliary head from {path}\n")
-
-
-_ROOM_METADATA_CACHE: dict[str, Optional[dict]] = {}
-_ROOM_BOUNDS_CACHE: dict[tuple[str, ...], Optional[tuple[list[float], list[float]]]] = {}
-_ROOM_LAYOUT_DEBUG_COUNTS: dict[str, int] = {}
-
-
-def _note_room_layout_debug(reason: str, detail: str = "", limit: int = 8) -> None:
-    count = _ROOM_LAYOUT_DEBUG_COUNTS.get(reason, 0)
-    _ROOM_LAYOUT_DEBUG_COUNTS[reason] = count + 1
-    if count < limit:
-        suffix = f": {detail}" if detail else ""
-        print(f"[layout_pose_aux] {reason}{suffix}", flush=True)
-
-
-def _load_room_metadata(room_geometry: dict) -> Optional[dict]:
-    path = room_geometry.get("geometry_metadata_path") if isinstance(room_geometry, dict) else None
-    if not path:
-        _note_room_layout_debug("missing_geometry_metadata_path")
-        return None
-    if path in _ROOM_METADATA_CACHE:
-        return _ROOM_METADATA_CACHE[path]
-    try:
-        with open(resolve_path(path), "r") as f:
-            metadata = json.load(f)
-    except Exception as exc:
-        _note_room_layout_debug("metadata_load_failed", f"{path} ({type(exc).__name__}: {exc})")
-        metadata = None
-    _ROOM_METADATA_CACHE[path] = metadata
-    return metadata
-
-
-def _metadata_room_extent(metadata: Optional[dict]) -> Optional[list[float]]:
-    if not isinstance(metadata, dict):
-        return None
-    raw_size = metadata.get("room_size")
-    if isinstance(raw_size, (list, tuple)) and len(raw_size) >= 3:
-        try:
-            size = [abs(float(v)) for v in raw_size[:3]]
-        except (TypeError, ValueError):
-            return None
-        if min(size) > 1e-6:
-            return size
-    return None
-
-
-def _mesh_or_scene_bounds(path: str) -> Optional[np.ndarray]:
-    try:
-        geom = trimesh.load(resolve_path(path), process=False)
-        bounds = np.asarray(geom.bounds, dtype=np.float64)
-    except Exception as exc:
-        _note_room_layout_debug("shell_bounds_load_failed", f"{path} ({type(exc).__name__}: {exc})")
-        return None
-    if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
-        return None
-    extent = bounds[1] - bounds[0]
-    if np.max(extent) <= 1e-6:
-        return None
-    return bounds
-
-
-def _room_shell_center_extent(room_geometry: dict) -> Optional[tuple[list[float], list[float]]]:
-    paths = tuple(
-        str(room_geometry.get(key))
-        for key in ("floor_path", "wall_path", "ceiling_path")
-        if isinstance(room_geometry, dict) and room_geometry.get(key)
-    )
-    if not paths:
-        return None
-    if paths in _ROOM_BOUNDS_CACHE:
-        return _ROOM_BOUNDS_CACHE[paths]
-
-    bounds_list = []
-    for path in paths:
-        bounds = _mesh_or_scene_bounds(path)
-        if bounds is not None:
-            bounds_list.append(bounds)
-    if not bounds_list:
-        _ROOM_BOUNDS_CACHE[paths] = None
-        return None
-
-    mins = np.stack([b[0] for b in bounds_list], axis=0).min(axis=0)
-    maxs = np.stack([b[1] for b in bounds_list], axis=0).max(axis=0)
-    extent = np.maximum(maxs - mins, 1e-6)
-    center = 0.5 * (mins + maxs)
-    result = (center.astype(np.float32).tolist(), extent.astype(np.float32).tolist())
-    _ROOM_BOUNDS_CACHE[paths] = result
-    return result
-
-
-def _room_layout_reference(
-    room_geometry: dict,
-    metadata: Optional[dict],
-    obj_center: torch.Tensor,
-    obj_extent: torch.Tensor,
-) -> Optional[tuple[torch.Tensor, torch.Tensor, str]]:
-    shell = _room_shell_center_extent(room_geometry)
-    if shell is not None:
-        center, extent = shell
-        return (
-            torch.tensor(center, device=obj_center.device, dtype=torch.float32),
-            torch.tensor(extent, device=obj_center.device, dtype=torch.float32).clamp_min(1e-6),
-            "shell_bounds",
-        )
-
-    room_extent = _metadata_room_extent(metadata)
-    if room_extent is not None:
-        return (
-            obj_center,
-            torch.tensor(room_extent, device=obj_center.device, dtype=torch.float32).clamp_min(1e-6),
-            "metadata_extent",
-        )
-
-    raw_size = metadata.get("room_size") if isinstance(metadata, dict) else None
-    if raw_size is not None:
-        try:
-            area = abs(float(raw_size))
-        except (TypeError, ValueError):
-            area = 0.0
-        if area > 1e-6:
-            side = math.sqrt(area)
-            extent = torch.tensor([side, max(float(obj_extent[1].item()), 1.0), side], device=obj_center.device)
-            return (obj_center, extent.clamp_min(1e-6), "metadata_area")
-
-    return None
-
-
-def _build_layout_pose_targets(
-    part_surfaces: torch.Tensor,
-    num_parts: torch.Tensor,
-    room_geometries: list[dict],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    xyz = part_surfaces[..., :3].float()
-    part_min = xyz.amin(dim=1)
-    part_max = xyz.amax(dim=1)
-    part_center = 0.5 * (part_min + part_max)
-    part_size = (part_max - part_min).clamp_min(1e-6)
-
-    targets = torch.zeros((xyz.shape[0], 6), device=xyz.device, dtype=torch.float32)
-    valid = torch.zeros((xyz.shape[0],), device=xyz.device, dtype=torch.bool)
-
-    ptr = 0
-    for obj_idx, count_tensor in enumerate(num_parts.detach().cpu()):
-        count = int(count_tensor.item())
-        if count <= 0:
-            continue
-        obj_slice = slice(ptr, ptr + count)
-        obj_min = part_min[obj_slice].amin(dim=0)
-        obj_max = part_max[obj_slice].amax(dim=0)
-        obj_center = 0.5 * (obj_min + obj_max)
-        obj_extent = (obj_max - obj_min).clamp_min(1e-6)
-
-        room_geometry = room_geometries[obj_idx] if obj_idx < len(room_geometries) else {}
-        metadata = _load_room_metadata(room_geometry)
-        reference = _room_layout_reference(room_geometry, metadata, obj_center, obj_extent)
-        if reference is None:
-            _note_room_layout_debug(
-                "room_reference_unavailable",
-                str(room_geometry.get("geometry_metadata_path") if isinstance(room_geometry, dict) else ""),
-            )
-            ptr += count
-            continue
-        room_center, room_extent, _source = reference
-        room_extent = torch.maximum(room_extent, obj_extent)
-
-        targets[obj_slice, :3] = (part_center[obj_slice] - room_center) / room_extent
-        targets[obj_slice, 3:] = torch.log(part_size[obj_slice].clamp_min(1e-6))
-        valid[obj_slice] = True
-        ptr += count
-
-    return targets, valid
-
-
-def _build_room_layout_targets(
-    part_surfaces: torch.Tensor,
-    num_parts: torch.Tensor,
-    room_geometries: list[dict],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    xyz = part_surfaces[..., :3].float()
-    part_min = xyz.amin(dim=1)
-    part_max = xyz.amax(dim=1)
-
-    targets = torch.zeros((num_parts.shape[0], 12), device=xyz.device, dtype=torch.float32)
-    valid = torch.zeros((num_parts.shape[0],), device=xyz.device, dtype=torch.bool)
-
-    ptr = 0
-    for obj_idx, count_tensor in enumerate(num_parts.detach().cpu()):
-        count = int(count_tensor.item())
-        if count <= 0:
-            continue
-        obj_slice = slice(ptr, ptr + count)
-        obj_min = part_min[obj_slice].amin(dim=0)
-        obj_max = part_max[obj_slice].amax(dim=0)
-        obj_center = 0.5 * (obj_min + obj_max)
-        obj_extent = (obj_max - obj_min).clamp_min(1e-6)
-
-        room_geometry = room_geometries[obj_idx] if obj_idx < len(room_geometries) else {}
-        metadata = _load_room_metadata(room_geometry)
-        reference = _room_layout_reference(room_geometry, metadata, obj_center, obj_extent)
-        if reference is None:
-            ptr += count
-            continue
-
-        room_center, room_extent, _source = reference
-        room_extent = torch.maximum(room_extent, obj_extent).clamp_min(1e-6)
-        targets[obj_idx, :3] = (room_center - obj_center) / room_extent
-        targets[obj_idx, 3:6] = torch.log(room_extent)
-        targets[obj_idx, 6] = 1.0 if room_geometry.get("floor_path") else 0.0
-        targets[obj_idx, 7] = 1.0 if room_geometry.get("ceiling_path") else 0.0
-        targets[obj_idx, 8:12] = 1.0 if room_geometry.get("wall_path") else 0.0
-        valid[obj_idx] = True
-        ptr += count
-
-    return targets, valid
 
 
 def main():
@@ -567,18 +276,6 @@ def main():
         type=int,
         default=-1,
         help="Iteration of the pretrained PartFrameCrafterDiTModel checkpoint"
-    )
-    parser.add_argument(
-        "--load_layout_pose_aux_head",
-        type=str,
-        default=None,
-        help="Optional layout_pose_aux_head.pt used to initialize the layout/pose auxiliary head",
-    )
-    parser.add_argument(
-        "--load_room_layout_aux_head",
-        type=str,
-        default=None,
-        help="Optional room_layout_aux_head.pt used to initialize the room-layout auxiliary head",
     )
 
     # Parse the arguments
@@ -1123,76 +820,12 @@ def main():
     transformer.spatial_global_attn_block_ids = list(spatial_global_attn_block_ids)
     transformer.temporal_global_attn_block_ids = list(temporal_global_attn_block_ids)
 
-    layout_pose_cfg = configs["train"].get("layout_pose_auxiliary", {})
-    if not hasattr(layout_pose_cfg, "get"):
-        layout_pose_cfg = {}
-    layout_pose_aux_enabled = bool(layout_pose_cfg.get("enabled", False))
-    layout_pose_aux_weight = float(layout_pose_cfg.get("weight", 0.0))
-    layout_pose_aux_hidden_dim = int(layout_pose_cfg.get("hidden_dim", 256))
-    layout_pose_aux_head = None
-    if layout_pose_aux_enabled and layout_pose_aux_weight > 0.0:
-        layout_pose_aux_head = LayoutPoseAuxiliaryHead(
-            in_channels=int(transformer.config.in_channels),
-            hidden_dim=layout_pose_aux_hidden_dim,
-            out_dim=6,
-        )
-        logger.info(
-            "Layout/pose auxiliary supervision enabled: "
-            f"weight={layout_pose_aux_weight}, hidden_dim={layout_pose_aux_hidden_dim}, "
-            "target=[relative_part_center(3), log_part_size(3)]\n"
-        )
-    elif accelerator.is_main_process:
-        logger.info("Layout/pose auxiliary supervision disabled.\n")
-
-    room_layout_cfg = configs["train"].get("room_layout_auxiliary", {})
-    if not hasattr(room_layout_cfg, "get"):
-        room_layout_cfg = {}
-    room_layout_aux_enabled = bool(room_layout_cfg.get("enabled", False))
-    room_layout_aux_weight = float(room_layout_cfg.get("weight", 0.0))
-    room_layout_aux_hidden_dim = int(room_layout_cfg.get("hidden_dim", 256))
-    room_layout_aux_head = None
-    if room_layout_aux_enabled and room_layout_aux_weight > 0.0:
-        room_layout_aux_head = RoomLayoutAuxiliaryHead(
-            in_channels=int(transformer.config.in_channels),
-            hidden_dim=room_layout_aux_hidden_dim,
-            out_dim=12,
-        )
-        logger.info(
-            "Room-layout auxiliary supervision enabled: "
-            f"weight={room_layout_aux_weight}, hidden_dim={room_layout_aux_hidden_dim}, "
-            "target=[relative_room_center(3), log_room_extent(3), shell_presence(6)]\n"
-        )
-    elif accelerator.is_main_process:
-        logger.info("Room-layout auxiliary supervision disabled.\n")
-
-    layout_pose_aux_init_path = args.load_layout_pose_aux_head or _checkpoint_aux_head_path(
-        args.load_pretrained_model,
-        args.load_pretrained_model_ckpt,
-        "layout_pose_aux_head.pt",
-    )
-    room_layout_aux_init_path = args.load_room_layout_aux_head or _checkpoint_aux_head_path(
-        args.load_pretrained_model,
-        args.load_pretrained_model_ckpt,
-        "room_layout_aux_head.pt",
-    )
-    _load_aux_head_state_if_available(layout_pose_aux_head, layout_pose_aux_init_path, "layout/pose", logger)
-    _load_aux_head_state_if_available(room_layout_aux_head, room_layout_aux_init_path, "room-layout", logger)
-
-    freeze_transformer_value = configs["train"].get("freeze_transformer", False)
-    if isinstance(freeze_transformer_value, str):
-        freeze_transformer = freeze_transformer_value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    else:
-        freeze_transformer = bool(freeze_transformer_value)
-    use_ema_for_transformer = bool(args.use_ema and not freeze_transformer)
-    if args.use_ema and freeze_transformer and accelerator.is_main_process:
-        logger.info("Transformer EMA disabled because train.freeze_transformer=true.\n")
-
     noise_scheduler = RectifiedFlowScheduler.from_pretrained(
         configs["model"]["pretrained_model_name_or_path"],
         subfolder="scheduler"
     )
 
-    if use_ema_for_transformer:
+    if args.use_ema:
         ema_transformer = MyEMAModel(
             transformer.parameters(),
             model_cls=PartFrameCrafterDiTModel,
@@ -1207,11 +840,7 @@ def main():
     image_encoder_dinov2.eval()
 
     trainable_modules = configs["train"].get("trainable_modules", None)
-    if freeze_transformer:
-        transformer.requires_grad_(False)
-        transformer.eval()
-        logger.info("Transformer backbone frozen; training only enabled auxiliary heads/probes.\n")
-    elif trainable_modules is None:
+    if trainable_modules is None:
         transformer.requires_grad_(True)
     else:
         trainable_module_names = []
@@ -1265,36 +894,24 @@ def main():
         # Create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                if use_ema_for_transformer:
+                if args.use_ema:
                     ema_transformer.save_pretrained(os.path.join(output_dir, "transformer_ema"))
 
                 # Save models with explicit subfolders
                 for i, model in enumerate(models):
                     unwrapped = accelerator.unwrap_model(model)
                     if isinstance(unwrapped, PartFrameCrafterDiTModel):
-                        if not freeze_transformer:
-                            unwrapped.save_pretrained(os.path.join(output_dir, "transformer"))
-                    elif isinstance(unwrapped, LayoutPoseAuxiliaryHead):
-                        torch.save(
-                            unwrapped.state_dict(),
-                            os.path.join(output_dir, "layout_pose_aux_head.pt"),
-                        )
-                    elif isinstance(unwrapped, RoomLayoutAuxiliaryHead):
-                        torch.save(
-                            unwrapped.state_dict(),
-                            os.path.join(output_dir, "room_layout_aux_head.pt"),
-                        )
+                        unwrapped.save_pretrained(os.path.join(output_dir, "transformer"))
                     else:
-                        save_pretrained = getattr(unwrapped, "save_pretrained", None)
-                        if callable(save_pretrained):
-                            save_pretrained(os.path.join(output_dir, f"model_{i}"))
+                        # Fallback: save under a generic name with index to avoid collisions
+                        unwrapped.save_pretrained(os.path.join(output_dir, f"model_{i}"))
 
                     # Make sure to pop weight so that corresponding model is not saved again
                     if weights:
                         weights.pop()
 
         def load_model_hook(models, input_dir):
-            if use_ema_for_transformer:
+            if args.use_ema:
                 load_model = MyEMAModel.from_pretrained(os.path.join(input_dir, "transformer_ema"), PartFrameCrafterDiTModel)
                 ema_transformer.load_state_dict(load_model.state_dict())
                 ema_transformer.to(accelerator.device)
@@ -1305,20 +922,10 @@ def main():
                 model = models.pop()
                 unwrapped = accelerator.unwrap_model(model)
                 if isinstance(unwrapped, PartFrameCrafterDiTModel):
-                    transformer_dir = os.path.join(input_dir, "transformer")
-                    if os.path.isdir(transformer_dir):
-                        load_model = PartFrameCrafterDiTModel.from_pretrained(input_dir, subfolder="transformer")
-                        model.register_to_config(**load_model.config)
-                        model.load_state_dict(load_model.state_dict())
-                        del load_model
-                elif isinstance(unwrapped, LayoutPoseAuxiliaryHead):
-                    aux_path = os.path.join(input_dir, "layout_pose_aux_head.pt")
-                    if os.path.exists(aux_path):
-                        model.load_state_dict(torch.load(aux_path, map_location="cpu"))
-                elif isinstance(unwrapped, RoomLayoutAuxiliaryHead):
-                    aux_path = os.path.join(input_dir, "room_layout_aux_head.pt")
-                    if os.path.exists(aux_path):
-                        model.load_state_dict(torch.load(aux_path, map_location="cpu"))
+                    load_model = PartFrameCrafterDiTModel.from_pretrained(input_dir, subfolder="transformer")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
                 else:
                     # Unknown model; skip
                     pass
@@ -1326,7 +933,7 @@ def main():
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
-    if configs["train"]["grad_checkpoint"] and not freeze_transformer:
+    if configs["train"]["grad_checkpoint"]:
         transformer.enable_gradient_checkpointing()
 
     # Initialize the optimizer and learning rate scheduler
@@ -1349,15 +956,6 @@ def main():
                 params.append(param)
         else:
             params.append(param)
-
-    if layout_pose_aux_head is not None:
-        aux_params = [param for param in layout_pose_aux_head.parameters() if param.requires_grad]
-        if aux_params:
-            params.extend(aux_params)
-    if room_layout_aux_head is not None:
-        aux_params = [param for param in room_layout_aux_head.parameters() if param.requires_grad]
-        if aux_params:
-            params.extend(aux_params)
 
     total_trainable_tensors = len(params) + len(params_lr_mult)
     if total_trainable_tensors == 0:
@@ -1430,7 +1028,7 @@ def main():
         flush=True,
     )
 
-    if (model_debug["trainable_tensors"] == 0 and not freeze_transformer) or optimizer_debug["opt_param_tensors"] == 0:
+    if model_debug["trainable_tensors"] == 0 or optimizer_debug["opt_param_tensors"] == 0:
         raise RuntimeError(
             "Detected an empty trainable model or optimizer parameter list before accelerator.prepare(). "
             f"Rank {accelerator.process_index} summary: model={model_debug}, optimizer={optimizer_debug}"
@@ -1472,10 +1070,6 @@ def main():
     ]
     if train_loader_physics is not None:
         prepare_items.append(train_loader_physics)
-    if layout_pose_aux_head is not None:
-        prepare_items.append(layout_pose_aux_head)
-    if room_layout_aux_head is not None:
-        prepare_items.append(room_layout_aux_head)
     prepared_items = accelerator.prepare(*prepare_items)
     (
         transformer,
@@ -1491,19 +1085,13 @@ def main():
     ) = prepared_items
     if train_loader_physics is not None:
         train_loader_physics = optional_prepared_loaders[0]
-        optional_prepared_loaders = optional_prepared_loaders[1:]
-    if layout_pose_aux_head is not None:
-        layout_pose_aux_head = optional_prepared_loaders[0]
-        optional_prepared_loaders = optional_prepared_loaders[1:]
-    if room_layout_aux_head is not None:
-        room_layout_aux_head = optional_prepared_loaders[0]
     print(
         f"[DEBUG prepare done] rank={accelerator.process_index} "
         f"elapsed={time.perf_counter() - prepare_start_time:.2f}s",
         flush=True,
     )
 
-    if use_ema_for_transformer:
+    if args.use_ema:
         ema_transformer.to(accelerator.device)
 
     # For mixed precision training we cast all non-trainable weigths to half-precision
@@ -1733,10 +1321,7 @@ def main():
             logger.info("Training finished!\n")
             return
 
-        if freeze_transformer:
-            transformer.eval()
-        else:
-            transformer.train()
+        transformer.train()
 
         with accelerator.accumulate(transformer):
             # Randomly choose dataset for this iteration
@@ -1888,59 +1473,6 @@ def main():
             # Keep a copy of the raw model predictions for consistency loss
             raw_model_pred = model_pred
 
-            layout_pose_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
-            layout_pose_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
-            room_layout_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
-            room_layout_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
-            layout_latents = None
-            use_room_aux = mode == "3d"
-            if use_room_aux and (layout_pose_aux_head is not None or room_layout_aux_head is not None):
-                if configs["train"]["training_objective"] == "x0":
-                    layout_latents = raw_model_pred.float() * (-sigmas.float()) + noisy_latents.float()
-                elif configs["train"]["training_objective"] == "v":
-                    layout_latents = noisy_latents.float() - sigmas.float() * raw_model_pred.float()
-                elif configs["train"]["training_objective"] == "-v":
-                    layout_latents = noisy_latents.float() + sigmas.float() * raw_model_pred.float()
-                else:
-                    layout_latents = raw_model_pred.float()
-
-            if use_room_aux and layout_pose_aux_head is not None:
-                layout_pose_pred = layout_pose_aux_head(layout_latents)
-                layout_pose_target, layout_pose_mask = _build_layout_pose_targets(
-                    part_surfaces=part_surfaces,
-                    num_parts=num_parts,
-                    room_geometries=batch.get("room_geometry", []),
-                )
-                layout_pose_valid_count = layout_pose_mask.long().sum()
-                if layout_pose_mask.any():
-                    layout_pose_loss = tF.mse_loss(
-                        layout_pose_pred[layout_pose_mask].float(),
-                        layout_pose_target[layout_pose_mask].float(),
-                    )
-                else:
-                    layout_pose_loss = layout_pose_pred.sum() * 0.0
-
-            if use_room_aux and room_layout_aux_head is not None:
-                room_layout_pred = room_layout_aux_head(layout_latents, num_parts)
-                room_layout_target, room_layout_mask = _build_room_layout_targets(
-                    part_surfaces=part_surfaces,
-                    num_parts=num_parts,
-                    room_geometries=batch.get("room_geometry", []),
-                )
-                room_layout_valid_count = room_layout_mask.long().sum()
-                if room_layout_mask.any():
-                    room_layout_reg_loss = tF.mse_loss(
-                        room_layout_pred[room_layout_mask, :6].float(),
-                        room_layout_target[room_layout_mask, :6].float(),
-                    )
-                    room_layout_presence_loss = tF.binary_cross_entropy_with_logits(
-                        room_layout_pred[room_layout_mask, 6:].float(),
-                        room_layout_target[room_layout_mask, 6:].float(),
-                    )
-                    room_layout_loss = room_layout_reg_loss + room_layout_presence_loss
-                else:
-                    room_layout_loss = room_layout_pred.sum() * 0.0
-
             if configs["train"]["training_objective"] == "x0":  # Section 5 of https://arxiv.org/abs/2206.00364
                 model_pred = model_pred.float() * (-sigmas) + noisy_latents  # predicted x_0
                 target = latents
@@ -1994,10 +1526,6 @@ def main():
                 base_loss = diff_loss.mean()
 
             loss = base_loss + cons_weight * consistency_loss
-            if layout_pose_aux_head is not None:
-                loss = loss + layout_pose_aux_weight * layout_pose_loss
-            if room_layout_aux_head is not None:
-                loss = loss + room_layout_aux_weight * room_layout_loss
 
             # Ensure optional embedding parameters participate every step to keep DDP reductions consistent.
             base_transformer = _unwrap_transformer_for_attn()
@@ -2023,17 +1551,6 @@ def main():
                     zero_loss = zero_loss + ref.sum() * 0.0
                 loss = loss + zero_loss
 
-            aux_zero_refs = []
-            for aux_head in (layout_pose_aux_head, room_layout_aux_head):
-                if aux_head is None:
-                    continue
-                aux_zero_refs.extend(param for param in aux_head.parameters() if param.requires_grad)
-            if aux_zero_refs:
-                aux_zero_loss = torch.zeros((), device=loss.device, dtype=loss.dtype)
-                for ref in aux_zero_refs:
-                    aux_zero_loss = aux_zero_loss + ref.sum() * 0.0
-                loss = loss + aux_zero_loss
-
             # Skip this batch if loss is NaN/Inf on any rank.
             # We clear gradients to avoid carrying partial accumulation forward.
             finite_int = torch.isfinite(loss.detach()).to(device=accelerator.device, dtype=torch.int32)
@@ -2050,8 +1567,7 @@ def main():
             # Backpropagate
             accelerator.backward(loss)
             if accelerator.sync_gradients:
-                clip_params = [param for group in optimizer.param_groups for param in group["params"]]
-                accelerator.clip_grad_norm_(clip_params, args.max_grad_norm)
+                accelerator.clip_grad_norm_(transformer.parameters(), args.max_grad_norm)
 
             optimizer.step()
             lr_scheduler.step()
@@ -2086,19 +1602,7 @@ def main():
                     "loss_consistency": consistency_loss.item(),
                     "loss_total": (base_loss_log + configs["train"]["consistency_loss_weight"] * consistency_loss).item(),
                 })
-            if layout_pose_aux_head is not None:
-                valid_count = accelerator.gather(layout_pose_valid_count.detach()).sum()
-                logs.update({
-                    "loss_layout_pose": layout_pose_loss.item(),
-                    "layout_pose_valid": int(valid_count.item()),
-                })
-            if room_layout_aux_head is not None:
-                valid_count = accelerator.gather(room_layout_valid_count.detach()).sum()
-                logs.update({
-                    "loss_room_layout": room_layout_loss.item(),
-                    "room_layout_valid": int(valid_count.item()),
-                })
-            if use_ema_for_transformer:
+            if args.use_ema:
                 ema_transformer.step(transformer.parameters())
                 logs.update({"ema": ema_transformer.cur_decay_value})
 
@@ -2112,11 +1616,7 @@ def main():
             )
             if 'loss_consistency' in logs and 'loss_total' in logs:
                 msg += f", loss_consistency: {logs['loss_consistency']:.4f}, loss_total: {logs['loss_total']:.4f}"
-            if 'loss_layout_pose' in logs:
-                msg += f", loss_layout_pose: {logs['loss_layout_pose']:.4f}, layout_pose_valid: {logs['layout_pose_valid']}"
-            if 'loss_room_layout' in logs:
-                msg += f", loss_room_layout: {logs['loss_room_layout']:.4f}, room_layout_valid: {logs['room_layout_valid']}"
-            if use_ema_for_transformer and 'ema' in logs:
+            if args.use_ema and 'ema' in logs:
                 msg += f", ema: {logs['ema']:.4f}"
             logger.info(msg)
 
@@ -2137,20 +1637,8 @@ def main():
                             "training/loss_consistency": logs["loss_consistency"],
                             "training/loss_total": logs["loss_total"],
                         })
-                    if "loss_layout_pose" in logs:
-                        to_log.update({
-                            "training/loss_layout_pose": logs["loss_layout_pose"],
-                            "training/layout_pose_valid": logs["layout_pose_valid"],
-                            f"training_{mode}/loss_layout_pose": logs["loss_layout_pose"],
-                        })
-                    if "loss_room_layout" in logs:
-                        to_log.update({
-                            "training/loss_room_layout": logs["loss_room_layout"],
-                            "training/room_layout_valid": logs["room_layout_valid"],
-                            f"training_{mode}/loss_room_layout": logs["loss_room_layout"],
-                        })
                     wandb.log(to_log, step=global_update_step)
-                    if use_ema_for_transformer:
+                    if args.use_ema:
                         wandb.log({
                             "training/ema": logs["ema"]
                         }, step=global_update_step)
@@ -2182,7 +1670,7 @@ def main():
             ):  
 
                 # Use EMA parameters for evaluation
-                if use_ema_for_transformer:
+                if args.use_ema:
                     # Store the Transformer parameters temporarily and load the EMA parameters to perform inference
                     ema_transformer.store(transformer.parameters())
                     ema_transformer.copy_to(transformer.parameters())
@@ -2204,7 +1692,7 @@ def main():
                     logger.exception("Validation failed unexpectedly; skipping this validation cycle.")
                     accelerator.wait_for_everyone()
                 finally:
-                    if use_ema_for_transformer:
+                    if args.use_ema:
                         # Switch back to the original Transformer parameters
                         ema_transformer.restore(transformer.parameters())
                     torch.cuda.empty_cache()

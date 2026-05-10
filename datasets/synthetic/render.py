@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
 """
-python3 data_gen_pipe/render.py \
-  --input-root /work/berke_gokmen/data-1/4d_scenes_synthetic \
-  --output-root /work/berke_gokmen/data-1/4d_scenes_synthetic_render
+python3 COM4D/datasets/synthetic/render.py \
+  --input-root /data/mseizde/com4d/outputs/synthetic/4d_scenes_synthetic \
+  --output-root /data/mseizde/com4d/outputs/synthetic/4d_scenes_synthetic_render
 """
 
 from __future__ import annotations
@@ -120,7 +120,10 @@ ZNEAR = 0.01
 ZFAR = 10.0
 MASK_DEPTH_ATOL = 1e-3
 MASK_DEPTH_RTOL = 1e-3
-HDRI_ROOT = Path("/work/berke_gokmen/datasets/hdr/hdris")
+OUTPUT_ROOT = Path("/data/mseizde/com4d/outputs/synthetic")
+DEFAULT_INPUT_ROOT = OUTPUT_ROOT / "4d_scenes_synthetic"
+DEFAULT_OUTPUT_ROOT = OUTPUT_ROOT / "4d_scenes_synthetic_render"
+HDRI_ROOT: Optional[Path] = None
 HDRI_FOV_DEG = 62.0
 HDRI_BLUR_RADIUS = 2.5
 WHITE_BG = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
@@ -241,7 +244,7 @@ class RenderWorkerConfig:
     environment_style: str
     environment_variation: str
     environment_seed: int
-    hdri_root: Path
+    hdri_root: Optional[Path]
     hdri_fov_deg: float
     hdri_blur_radius: float
     mask_depth_atol: float
@@ -334,13 +337,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input-root",
         type=Path,
-        default=Path("/work/berke_gokmen/data-1/4d_scenes_synthetic"),
+        default=DEFAULT_INPUT_ROOT,
         help="Input directory containing per-scene GLB folders from gen.py.",
     )
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=Path("/work/berke_gokmen/data-1/4d_scenes_synthetic_render"),
+        default=DEFAULT_OUTPUT_ROOT,
         help="Output directory where rendered frames and masks will be written.",
     )
     parser.add_argument(
@@ -401,7 +404,7 @@ def parse_args() -> argparse.Namespace:
         "--environment-style",
         type=str,
         choices=ENVIRONMENT_STYLES,
-        default="outdoor-hdri",
+        default="studio",
         help="Background/environment style. 'studio' adds a floor and back wall, 'outdoor-hdri' uses an outdoor HDR backdrop plus a floor, and 'plain' keeps the old flat background.",
     )
     parser.add_argument(
@@ -471,8 +474,11 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--hdri-blur-radius must be non-negative.")
     if args.num_workers <= 0:
         raise ValueError("--num-workers must be positive.")
-    if args.environment_style == "outdoor-hdri" and not args.hdri_root.is_dir():
-        raise FileNotFoundError(f"HDRI root not found: {args.hdri_root}")
+    if args.environment_style == "outdoor-hdri":
+        if args.hdri_root is None:
+            raise ValueError("--hdri-root is required when --environment-style outdoor-hdri.")
+        if not args.hdri_root.is_dir():
+            raise FileNotFoundError(f"HDRI root not found: {args.hdri_root}")
     return args
 
 

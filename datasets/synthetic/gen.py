@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-python3 data_gen_pipe/gen.py \
-  --models-path /work/berke_gokmen/data-1/3dfront/3D-FUTURE-model \
-  --dynamic-objects-path /data/animesh/humanoids_scaled \
-  --output-path /work/berke_gokmen/data-1/4d_scenes/glb \
+python3 COM4D/datasets/synthetic/gen.py \
+  --models-path /mnt/mocap_b/work/com4d/datasets/raw/3D-FRONT/original_subset/3D-FUTURE-model \
+  --dynamic-objects-path /mnt/mocap_b/work/com4d/datasets/processed/deformingthings/humanoids_scaled \
+  --output-path /data/mseizde/com4d/outputs/synthetic/4d_scenes_synthetic \
   --total-scenes 250 \
   --num-frames 8 \
   --frame-stride 2 \
@@ -217,6 +217,12 @@ class PlacedStaticObject:
 WORKER_STATIC_ASSETS: Tuple[StaticAsset, ...] = ()
 WORKER_CONFIG: Optional[GenerationConfig] = None
 
+DATA_ROOT = Path("/mnt/mocap_b/work/com4d/datasets")
+OUTPUT_ROOT = Path("/data/mseizde/com4d/outputs/synthetic")
+DEFAULT_DYNAMIC_OBJECTS_PATH = DATA_ROOT / "processed" / "deformingthings" / "humanoids_scaled"
+DEFAULT_MODELS_PATH = DATA_ROOT / "raw" / "3D-FRONT" / "original_subset" / "3D-FUTURE-model"
+DEFAULT_OUTPUT_PATH = OUTPUT_ROOT / "4d_scenes_synthetic"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -225,7 +231,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--models-path",
         type=Path,
-        default=Path("/work/berke_gokmen/data-1/3dfront/3D-FUTURE-model"),
+        default=DEFAULT_MODELS_PATH,
         help="Directory containing 3D-FUTURE subfolders with normalized_model.obj files.",
     )
     parser.add_argument(
@@ -237,13 +243,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dynamic-objects-path",
         type=Path,
-        default=Path("/data/animesh/humanoids_scaled"),
+        default=DEFAULT_DYNAMIC_OBJECTS_PATH,
         help="Directory containing one subfolder per dynamic object sequence.",
     )
     parser.add_argument(
         "--output-path",
         type=Path,
-        default=Path("/work/berke_gokmen/data-1/4d_scenes_synthetic"),
+        default=DEFAULT_OUTPUT_PATH,
         help="Where generated scene folders are written.",
     )
     parser.add_argument(

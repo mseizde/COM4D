@@ -12,6 +12,22 @@ from PIL import Image
 from tqdm import tqdm
 
 from src.utils.data_utils import load_surface, load_surfaces
+from src.datasets.local_cache import prefetch_data_configs, resolve_path
+
+ROOM_GEOMETRY_KEYS = (
+    "house_id",
+    "room_id",
+    "room_scene_dir",
+    "floor_path",
+    "wall_path",
+    "ceiling_path",
+    "depth_path",
+    "normal_path",
+    "semantic_path",
+    "render_meta_path",
+    "geometry_metadata_path",
+    "num_object_glbs",
+)
 
 
 def _load_rgb_image(
@@ -35,8 +51,16 @@ def _load_rgb_image(
     if transform is not None and random.random() < rotating_ratio:
         pil_image = transform(pil_image)
     pil_image = pil_image.resize(image_size, Image.Resampling.BILINEAR)
-    image = np.asarray(pil_image, dtype=np.uint8)
+    image = np.array(pil_image, dtype=np.uint8, copy=True)
     return torch.from_numpy(image).to(torch.uint8)
+
+
+def _extract_room_geometry(data_config: dict) -> dict:
+    geometry = {}
+    for key in ROOM_GEOMETRY_KEYS:
+        if key in data_config:
+            geometry[key] = data_config[key]
+    return geometry
 
 
 class ObjaversePartDataset(torch.utils.data.Dataset):
@@ -101,7 +125,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
     
     def _get_data_by_config(self, data_config):
         if 'surface_path' in data_config:
-            surface_path = data_config['surface_path']
+            surface_path = resolve_path(data_config['surface_path'])
             surface_data = np.load(surface_path, allow_pickle=True).item()
             # If parts is empty, the object is the only part
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
@@ -111,10 +135,11 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
+                surface_path = resolve_path(surface_path)
                 surface_data = np.load(surface_path, allow_pickle=True).item()
                 part_surfaces.append(load_surface(surface_data, num_pc=self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
-        image_path = data_config['image_path']
+        image_path = resolve_path(data_config['image_path'])
         image = _load_rgb_image(
             image_path=image_path,
             image_size=self.image_size,
@@ -125,6 +150,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         return {
             "images": images,
             "part_surfaces": part_surfaces,
+            "room_geometry": _extract_room_geometry(data_config),
         }
     
     def __getitem__(self, idx: int):
@@ -132,6 +158,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         # Because the number of parts is not fixed.
         # Please see BatchedObjaversePartDataset for batched training.
         data_config = self.data_configs[idx]
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         data = self._get_data_by_config(data_config)
         return data
         
@@ -209,6 +237,8 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
         if len(data_config) == 0:
             # placeholder
             return {}
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         data = self._get_data_by_config(data_config)
         return data
     
@@ -224,6 +254,7 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
             "images": images,
             "part_surfaces": surfaces,
             "num_parts": num_parts,
+            "room_geometry": [data.get("room_geometry", {}) for data in batch],
         }
         return batch
 
@@ -332,7 +363,7 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
     
     def _get_data_by_config(self, data_config):
         if 'surface_path' in data_config:
-            surface_path = data_config['surface_path']
+            surface_path = resolve_path(data_config['surface_path'])
             surface_data = np.load(surface_path, allow_pickle=True).item()
             # If parts is empty, the object is the only part
             part_surfaces = surface_data['parts'] if len(surface_data['parts']) > 0 else [surface_data['object']]
@@ -342,10 +373,11 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
+                surface_path = resolve_path(surface_path)
                 surface_data = np.load(surface_path, allow_pickle=True).item()
                 part_surfaces.append(load_surface(surface_data, num_pc=self.surface_num_points))
             part_surfaces = torch.stack(part_surfaces, dim=0) # [N, P, 6]
-        image_path = data_config['image_path']
+        image_path = resolve_path(data_config['image_path'])
         image = _load_rgb_image(
             image_path=image_path,
             image_size=self.image_size,
@@ -362,6 +394,8 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
         # The dataset can only support batchsize == 1 training. 
         # Because the number of parts is not fixed.
         # Please see BatchedObjaversePartDataset for batched training.
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         return self._getitem_with_retry(idx)
         
 class BatchedObjaversePartDatasetOriginal(ObjaversePartDatasetOriginal):
@@ -438,6 +472,8 @@ class BatchedObjaversePartDatasetOriginal(ObjaversePartDatasetOriginal):
         if len(data_config) == 0:
             # placeholder
             return {}
+        cache = getattr(self, "configs", {}).get("dataset_cache", {})
+        prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
         return self._getitem_with_retry(idx)
     
     def collate_fn(self, batch):

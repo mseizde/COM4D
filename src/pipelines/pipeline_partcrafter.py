@@ -4146,6 +4146,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
             static_meshes_per_frame=static_meshes_per_frame,
             dynamic_meshes=dynamic_meshes_per_frame,
             animation_path=animation_file,
+            scene_latents=static_latents,
+            dynamic_latents=dynamic_latents,
         )
         if not return_dict:
             return output.scene_meshes, output.dynamic_meshes

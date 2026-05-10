@@ -104,7 +104,7 @@ train:
   image_load_size: 518
   surface_num_points: 8192
   dino_preprocess_size: 518
-  physics_data_prob: 0.2
+  physics_data_prob: 0.0
   advanced_image_masking:
     enabled: true
     3d:

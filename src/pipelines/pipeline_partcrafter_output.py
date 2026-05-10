@@ -27,6 +27,8 @@ class PartCrafter3D4DOutput(BaseOutput):
     static_meshes_per_frame: List[List[trimesh.Trimesh]]
     dynamic_meshes: List[List[trimesh.Trimesh]]
     animation_path: Optional[str] = None
+    scene_latents: Optional[torch.Tensor] = None
+    dynamic_latents: Optional[torch.Tensor] = None
     scene_renders: Optional[List[Image.Image]] = None
     time: Optional[float] = None
     

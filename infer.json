@@ -103,5 +103,79 @@
         "dynamic_max_memory_frames": 8,
         "scene_mix_cutoff": 50,
         "dynamic_mix_cutoff": 20
+    },
+
+    "full_data_ckpt": {
+        "tag": "full_data_ckpt",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/com4d_sdemb_mf8_mp8_nt512_1621/checkpoints/002000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "furniture_layout_ckpt": {
+        "tag": "furniture_layout_ckpt",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/com4d_sdemb_mf8_mp8_nt512_23310/checkpoints/002000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "broken_layout_ckpt": {
+        "tag": "broken_layout_ckpt",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/room_aux_b/checkpoints/004000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "frozen_probe_both_heads_1000": {
+        "tag": "frozen_probe_both_heads_1000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/frozen_probe_both_heads_nocache/checkpoints/001000",
+        "room_layout_aux_path": "/data/mseizde/com4d/outputs/ckpts/frozen_probe_both_heads_nocache/checkpoints/001000/room_layout_aux_head.pt",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
     }
+
 }
