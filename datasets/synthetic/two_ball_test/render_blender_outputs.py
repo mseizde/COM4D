@@ -142,6 +142,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--light-energy-jitter", type=float, default=0.0)
     parser.add_argument("--light-size-jitter", type=float, default=0.0)
     parser.add_argument("--skip-masks", action="store_true")
+    parser.add_argument("--save-depth", action="store_true", help="Save ground-truth Z depth pass as OpenEXR files.")
+    parser.add_argument("--save-normals", action="store_true", help="Save ground-truth normal pass as OpenEXR files.")
     parser.add_argument("--skip-transforms", action="store_true")
     parser.add_argument("--skip-canonical-meshes", action="store_true")
     parser.add_argument(
@@ -460,39 +462,64 @@ def configure_lighting(args: argparse.Namespace) -> None:
     )
 
 
-def configure_mask_outputs(mask0_dir: Path, mask1_dir: Path) -> None:
+def configure_compositor_outputs(
+    mask0_dir: Path | None,
+    mask1_dir: Path | None,
+    depth_dir: Path | None,
+    normal_dir: Path | None,
+) -> None:
     scene = bpy.context.scene
     scene.use_nodes = True
 
     view_layer = bpy.context.view_layer
-    view_layer.use_pass_object_index = True
+    view_layer.use_pass_object_index = mask0_dir is not None or mask1_dir is not None
+    view_layer.use_pass_z = depth_dir is not None
+    view_layer.use_pass_normal = normal_dir is not None
 
     tree = scene.node_tree
     tree.nodes.clear()
 
     render_layers = tree.nodes.new(type="CompositorNodeRLayers")
 
-    id_mask_0 = tree.nodes.new(type="CompositorNodeIDMask")
-    id_mask_0.index = 1
-    id_mask_1 = tree.nodes.new(type="CompositorNodeIDMask")
-    id_mask_1.index = 2
+    if mask0_dir is not None:
+        id_mask_0 = tree.nodes.new(type="CompositorNodeIDMask")
+        id_mask_0.index = 1
+        mask0_output = tree.nodes.new(type="CompositorNodeOutputFile")
+        mask0_output.base_path = str(mask0_dir)
+        mask0_output.file_slots[0].path = "frame_####"
+        mask0_output.format.file_format = "PNG"
+        mask0_output.format.color_mode = "BW"
+        tree.links.new(render_layers.outputs["IndexOB"], id_mask_0.inputs["ID value"])
+        tree.links.new(id_mask_0.outputs["Alpha"], mask0_output.inputs[0])
 
-    mask0_output = tree.nodes.new(type="CompositorNodeOutputFile")
-    mask0_output.base_path = str(mask0_dir)
-    mask0_output.file_slots[0].path = "frame_####"
-    mask0_output.format.file_format = "PNG"
-    mask0_output.format.color_mode = "BW"
+    if mask1_dir is not None:
+        id_mask_1 = tree.nodes.new(type="CompositorNodeIDMask")
+        id_mask_1.index = 2
+        mask1_output = tree.nodes.new(type="CompositorNodeOutputFile")
+        mask1_output.base_path = str(mask1_dir)
+        mask1_output.file_slots[0].path = "frame_####"
+        mask1_output.format.file_format = "PNG"
+        mask1_output.format.color_mode = "BW"
+        tree.links.new(render_layers.outputs["IndexOB"], id_mask_1.inputs["ID value"])
+        tree.links.new(id_mask_1.outputs["Alpha"], mask1_output.inputs[0])
 
-    mask1_output = tree.nodes.new(type="CompositorNodeOutputFile")
-    mask1_output.base_path = str(mask1_dir)
-    mask1_output.file_slots[0].path = "frame_####"
-    mask1_output.format.file_format = "PNG"
-    mask1_output.format.color_mode = "BW"
+    if depth_dir is not None:
+        depth_output = tree.nodes.new(type="CompositorNodeOutputFile")
+        depth_output.base_path = str(depth_dir)
+        depth_output.file_slots[0].path = "frame_####"
+        depth_output.format.file_format = "OPEN_EXR"
+        depth_output.format.color_mode = "RGB"
+        depth_output.format.color_depth = "32"
+        tree.links.new(render_layers.outputs["Depth"], depth_output.inputs[0])
 
-    tree.links.new(render_layers.outputs["IndexOB"], id_mask_0.inputs["ID value"])
-    tree.links.new(id_mask_0.outputs["Alpha"], mask0_output.inputs[0])
-    tree.links.new(render_layers.outputs["IndexOB"], id_mask_1.inputs["ID value"])
-    tree.links.new(id_mask_1.outputs["Alpha"], mask1_output.inputs[0])
+    if normal_dir is not None:
+        normal_output = tree.nodes.new(type="CompositorNodeOutputFile")
+        normal_output.base_path = str(normal_dir)
+        normal_output.file_slots[0].path = "frame_####"
+        normal_output.format.file_format = "OPEN_EXR"
+        normal_output.format.color_mode = "RGB"
+        normal_output.format.color_depth = "32"
+        tree.links.new(render_layers.outputs["Normal"], normal_output.inputs[0])
 
 
 def disable_compositor_outputs() -> None:
@@ -511,12 +538,18 @@ def main() -> None:
     rgb_dir = base_dir / "render_rgb"
     mask0_dir = base_dir / "masks" / "ball_0"
     mask1_dir = base_dir / "masks" / "ball_1"
+    depth_dir = base_dir / "depth"
+    normal_dir = base_dir / "normals"
     transform_dir = base_dir / "transforms"
     mesh_dir = base_dir / "meshes"
 
     output_dirs = [rgb_dir]
     if not args.skip_masks:
         output_dirs.extend([mask0_dir, mask1_dir])
+    if args.save_depth:
+        output_dirs.append(depth_dir)
+    if args.save_normals:
+        output_dirs.append(normal_dir)
     if not args.skip_transforms:
         output_dirs.append(transform_dir)
     if not args.skip_canonical_meshes:
@@ -552,8 +585,13 @@ def main() -> None:
     if not args.skip_canonical_meshes:
         export_selected_glb(ball_0, mesh_dir / "ball_0.glb")
         export_selected_glb(ball_1, mesh_dir / "ball_1.glb")
-    if not args.skip_masks:
-        configure_mask_outputs(mask0_dir, mask1_dir)
+    if not args.skip_masks or args.save_depth or args.save_normals:
+        configure_compositor_outputs(
+            mask0_dir=None if args.skip_masks else mask0_dir,
+            mask1_dir=None if args.skip_masks else mask1_dir,
+            depth_dir=depth_dir if args.save_depth else None,
+            normal_dir=normal_dir if args.save_normals else None,
+        )
     else:
         disable_compositor_outputs()
 

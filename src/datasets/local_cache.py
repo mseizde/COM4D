@@ -12,6 +12,9 @@ from typing import Iterable
 _CACHE: "LocalDatasetCache | None" = None
 _CACHE_LOCK = threading.Lock()
 _RECENT_FILE_GRACE_SECONDS = 600
+# Interrupted training runs can leave cache copy lock directories behind.
+# Without a timeout, DataLoader workers wait here indefinitely on later runs.
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 60.0
 
 
 def configure_dataset_cache(
@@ -78,7 +81,7 @@ def extract_data_paths(data_config: dict, *, max_frame_paths: int = 8) -> list[s
         image_path = data_config.get("image_path")
         if image_path:
             paths.append(image_path)
-        for aux_key in ("depth_path", "normal_path", "semantic_path", "geometry_metadata_path"):
+        for aux_key in ("depth_path", "normal_path", "semantic_path", "render_meta_path", "geometry_metadata_path"):
             aux_path = data_config.get(aux_key)
             if aux_path:
                 paths.append(aux_path)
@@ -172,6 +175,8 @@ class LocalDatasetCache:
     def _copy_with_lock(self, source: Path, cached: Path) -> None:
         cached.parent.mkdir(parents=True, exist_ok=True)
         lock_dir = cached.with_name(cached.name + ".lock")
+        lock_wait_start = time.monotonic()
+        lock_timeout = float(os.environ.get("DATASET_CACHE_LOCK_TIMEOUT_SECONDS", _DEFAULT_LOCK_TIMEOUT_SECONDS))
         while True:
             try:
                 lock_dir.mkdir()
@@ -182,6 +187,12 @@ class LocalDatasetCache:
                 if self._is_valid_cached_file(source, cached):
                     self._touch(cached)
                     return
+                # Treat old lock directories as abandoned. This preserves the
+                # lock protocol for active copies while avoiding silent training
+                # stalls when a previous process died mid-copy.
+                if lock_timeout > 0.0 and time.monotonic() - lock_wait_start > lock_timeout:
+                    self._break_stale_lock(lock_dir, lock_timeout)
+                    lock_wait_start = time.monotonic()
                 time.sleep(0.1)
         if not have_lock:
             return
@@ -202,6 +213,18 @@ class LocalDatasetCache:
                 lock_dir.rmdir()
             except OSError:
                 pass
+
+    def _break_stale_lock(self, lock_dir: Path, lock_timeout: float) -> None:
+        try:
+            age = time.time() - lock_dir.stat().st_mtime
+        except OSError:
+            return
+        if age < lock_timeout:
+            return
+        try:
+            lock_dir.rmdir()
+        except OSError:
+            return
 
     def _cleanup_if_needed(self) -> None:
         if not self._cleanup_lock.acquire(blocking=False):

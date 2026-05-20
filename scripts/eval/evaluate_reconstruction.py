@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import trimesh
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,6 +53,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only compute full-scene metrics.",
     )
+    ap.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Write NaN summaries instead of failing when no GT/pred pairs are found.",
+    )
     return ap.parse_args()
 
 
@@ -59,6 +65,7 @@ def frame_index(path: Path) -> int | None:
     patterns = [
         r"dynamic_scene_frame_(\d+)\.glb$",
         r"frame_(\d+)\.glb$",
+        r"frame_(\d+)\.json$",
     ]
     for pattern in patterns:
         match = re.search(pattern, path.name)
@@ -85,6 +92,31 @@ def dynamic_object_paths(root: Path) -> dict[str, dict[int, Path]]:
     return tracks
 
 
+def two_ball_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]]]:
+    """Return GT object tracks from raw two-ball renderer outputs.
+
+    The raw two-ball GT stores canonical meshes as meshes/ball_*.glb and per-frame
+    poses as transforms/frame_*.json, not as one GLB per frame.
+    """
+    mesh_dir = root / "meshes"
+    transform_dir = root / "transforms"
+    object_map = {
+        "object_000": ("ball_0", mesh_dir / "ball_0.glb"),
+        "object_001": ("ball_1", mesh_dir / "ball_1.glb"),
+    }
+    if not transform_dir.is_dir() or not all(path.is_file() for _, path in object_map.values()):
+        return {}
+
+    tracks: dict[str, dict[int, tuple[Path, Path, str]]] = {object_id: {} for object_id in object_map}
+    for transform_path in sorted(transform_dir.glob("frame_*.json")):
+        idx = frame_index(transform_path)
+        if idx is None:
+            continue
+        for object_id, (ball_key, mesh_path) in object_map.items():
+            tracks[object_id][idx] = (mesh_path, transform_path, ball_key)
+    return {object_id: frames for object_id, frames in tracks.items() if frames}
+
+
 def frame_paths(root: Path, pattern: str) -> dict[int, Path]:
     paths = {}
     for path in sorted(root.glob(pattern)):
@@ -94,6 +126,35 @@ def frame_paths(root: Path, pattern: str) -> dict[int, Path]:
         if idx is not None and idx not in paths:
             paths[idx] = path
     return paths
+
+
+def two_ball_gt_scene_frames(root: Path) -> dict[int, list[tuple[Path, Path, str]]]:
+    tracks = two_ball_gt_tracks(root)
+    frames: dict[int, list[tuple[Path, Path, str]]] = {}
+    for frame_map in tracks.values():
+        for frame, spec in frame_map.items():
+            frames.setdefault(frame, []).append(spec)
+    return {frame: specs for frame, specs in frames.items() if specs}
+
+
+def transform_matrix_from_json(transform_path: Path, ball_key: str) -> np.ndarray:
+    with transform_path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    item = data[ball_key]
+    matrix = trimesh.transformations.quaternion_matrix(item["quaternion_blender_wxyz"])
+    matrix[:3, 3] = np.asarray(item["location"], dtype=np.float64)
+    return matrix
+
+
+def load_transformed_mesh(mesh_path: Path, transform_path: Path, ball_key: str) -> trimesh.Trimesh:
+    mesh = scene_to_single_mesh(load_mesh_or_scene(mesh_path)).copy()
+    mesh.apply_transform(transform_matrix_from_json(transform_path, ball_key))
+    return mesh
+
+
+def load_gt_scene(specs: list[tuple[Path, Path, str]]) -> trimesh.Trimesh:
+    meshes = [load_transformed_mesh(mesh_path, transform_path, ball_key) for mesh_path, transform_path, ball_key in specs]
+    return trimesh.util.concatenate(meshes)
 
 
 def mesh_metrics(pred_path: Path, gt_path: Path, num_samples: int, threshold: float, metric: str) -> dict[str, Any]:
@@ -111,6 +172,29 @@ def mesh_metrics(pred_path: Path, gt_path: Path, num_samples: int, threshold: fl
         "bbox_overlap_volume": bbox_overlap_volume(pred_bounds, gt_bounds),
         "pred_path": str(pred_path),
         "gt_path": str(gt_path),
+    }
+
+
+def mesh_metrics_for_gt_mesh(
+    pred_path: Path,
+    gt_mesh: trimesh.Trimesh,
+    gt_label: str,
+    num_samples: int,
+    threshold: float,
+    metric: str,
+) -> dict[str, Any]:
+    pred_geom = load_mesh_or_scene(pred_path)
+    pred_mesh = scene_to_single_mesh(pred_geom)
+    cd, f_score = compute_cd_and_f_score(pred_mesh, gt_mesh, num_samples=num_samples, threshold=threshold, metric=metric)
+    pred_bounds = bounds_from_mesh_or_scene(pred_geom)
+    gt_bounds = bounds_from_mesh_or_scene(gt_mesh)
+    return {
+        "chamfer_distance": float(cd),
+        "f_score": float(f_score),
+        "bbox_iou_3d": bbox_iou_3d(pred_bounds, gt_bounds),
+        "bbox_overlap_volume": bbox_overlap_volume(pred_bounds, gt_bounds),
+        "pred_path": str(pred_path),
+        "gt_path": gt_label,
     }
 
 
@@ -133,6 +217,8 @@ def mean_or_nan(values: list[float]) -> float:
 def add_prefixed_means(summary: dict[str, Any], prefix: str, rows: list[dict[str, Any]]) -> None:
     for key in ("chamfer_distance", "f_score", "bbox_iou_3d", "bbox_overlap_volume"):
         summary[f"{prefix}_{key}_mean"] = mean_or_nan([float(row[key]) for row in rows])
+    summary[f"{prefix}_per_frame_chamfer_distance_mean"] = summary[f"{prefix}_chamfer_distance_mean"]
+    summary[f"{prefix}_per_frame_iou_mean"] = summary[f"{prefix}_bbox_iou_3d_mean"]
 
 
 def main() -> None:
@@ -144,8 +230,21 @@ def main() -> None:
     scene_rows = []
     pred_scenes = frame_paths(pred_dir, args.pred_scene_glob)
     gt_scenes = frame_paths(gt_dir, args.gt_scene_glob)
+    gt_two_ball_scenes = {} if gt_scenes else two_ball_gt_scene_frames(gt_dir)
     for frame in sorted(set(pred_scenes).intersection(gt_scenes)):
         row = mesh_metrics(pred_scenes[frame], gt_scenes[frame], args.num_samples, args.threshold, args.metric)
+        row.update({"level": "scene", "frame": frame})
+        scene_rows.append(row)
+    for frame in sorted(set(pred_scenes).intersection(gt_two_ball_scenes)):
+        specs = gt_two_ball_scenes[frame]
+        row = mesh_metrics_for_gt_mesh(
+            pred_scenes[frame],
+            load_gt_scene(specs),
+            "+".join(f"{mesh_path}@{transform_path}:{ball_key}" for mesh_path, transform_path, ball_key in specs),
+            args.num_samples,
+            args.threshold,
+            args.metric,
+        )
         row.update({"level": "scene", "frame": frame})
         scene_rows.append(row)
 
@@ -153,6 +252,7 @@ def main() -> None:
     if not args.skip_object_level:
         pred_tracks = dynamic_object_paths(pred_dir)
         gt_tracks = dynamic_object_paths(gt_dir)
+        gt_two_ball_tracks = {} if gt_tracks else two_ball_gt_tracks(gt_dir)
         for object_id in sorted(set(pred_tracks).intersection(gt_tracks)):
             pred_frames = pred_tracks[object_id]
             gt_frames = gt_tracks[object_id]
@@ -160,6 +260,28 @@ def main() -> None:
                 row = mesh_metrics(pred_frames[frame], gt_frames[frame], args.num_samples, args.threshold, args.metric)
                 row.update({"level": "object", "object_id": object_id, "frame": frame})
                 object_rows.append(row)
+        for object_id in sorted(set(pred_tracks).intersection(gt_two_ball_tracks)):
+            pred_frames = pred_tracks[object_id]
+            gt_frames = gt_two_ball_tracks[object_id]
+            for frame in sorted(set(pred_frames).intersection(gt_frames)):
+                mesh_path, transform_path, ball_key = gt_frames[frame]
+                row = mesh_metrics_for_gt_mesh(
+                    pred_frames[frame],
+                    load_transformed_mesh(mesh_path, transform_path, ball_key),
+                    f"{mesh_path}@{transform_path}:{ball_key}",
+                    args.num_samples,
+                    args.threshold,
+                    args.metric,
+                )
+                row.update({"level": "object", "object_id": object_id, "frame": frame})
+                object_rows.append(row)
+
+    if not args.allow_empty and not scene_rows and not object_rows:
+        raise RuntimeError(
+            "No reconstruction GT/pred GLB pairs were found. For raw two-ball GT, expected "
+            f"{gt_dir / 'meshes' / 'ball_0.glb'}, {gt_dir / 'meshes' / 'ball_1.glb'}, and "
+            f"{gt_dir / 'transforms' / 'frame_0000.json'}. Pass --allow-empty to write NaN summaries."
+        )
 
     summary: dict[str, Any] = {
         "pred_dir": str(pred_dir),

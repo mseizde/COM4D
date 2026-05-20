@@ -114,6 +114,34 @@ train:
   epochs: 200
   grad_checkpoint: true
   weighting_scheme: "logit_normal"
+  geometry_field_auxiliary:
+    enabled: false
+    weight: 0.005
+    modes: ["3d", "single"]
+    num_surface_points: 32
+    decoder_num_chunks: 8192
+    sdf_weight: 1.0
+    normal_weight: 0.0
+    eikonal_weight: 0.0
+    second_order: false
+    eikonal_grad_norm_clip: 10.0
+  geometry_image_auxiliary:
+    enabled: false
+    weight: 0.002
+    modes: ["3d"]
+    num_surface_pixels: 32
+    num_empty_pixels: 32
+    decoder_num_chunks: 8192
+    depth_weight: 1.0
+    normal_weight: 0.0
+    mask_weight: 0.0
+    empty_weight: 0.0
+    surface_margin: 0.0
+    empty_margin: 0.05
+    max_empty_backprop_pixels: 8
+    sync_step_only: true
+    ray_sign_weight: 0.0
+    ray_sign_epsilon: 0.02
   logit_mean: 0.0
   logit_std: 1.0
   mode_scale: 1.29

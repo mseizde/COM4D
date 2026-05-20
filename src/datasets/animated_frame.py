@@ -65,6 +65,24 @@ def _extract_single_surface_array(surface_data: dict, num_points: int) -> torch.
     raise KeyError("Unrecognized surface data format: expected 'surface_points'+'surface_normals', or 'object', or non-empty 'parts'.")
 
 
+def _extract_part_surface_arrays(surface_data: dict, num_points: int, max_parts: Optional[int] = None) -> torch.Tensor:
+    """Return [num_parts, P, 6] surface tensors, preserving explicit parts when present."""
+    if surface_data is None:
+        raise ValueError("surface_data is None")
+    if 'parts' in surface_data and isinstance(surface_data['parts'], list) and len(surface_data['parts']) > 0:
+        parts = surface_data['parts'][:max_parts] if max_parts is not None else surface_data['parts']
+        return load_surfaces(parts, num_pc=num_points)
+    return _extract_single_surface_array(surface_data, num_points).unsqueeze(0)
+
+
+def _count_surface_parts(surface_path: str) -> int:
+    surface_data = np.load(resolve_path(surface_path), allow_pickle=True).item()
+    parts = surface_data.get('parts', None) if isinstance(surface_data, dict) else None
+    if isinstance(parts, list) and len(parts) > 0:
+        return len(parts)
+    return 1
+
+
 class ObjaversePartDataset(torch.utils.data.Dataset):
     def __init__(
         self, 
@@ -86,6 +104,9 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.shuffle_parts = configs['dataset']['shuffle_parts']
         self.training_ratio = configs['dataset']['training_ratio']
         self.balance_object_and_parts = configs['dataset'].get('balance_object_and_parts', False)
+        self.spatiotemporal_grid = bool(configs['dataset'].get('spatiotemporal_grid', False))
+        configured_num_spatial_parts = configs['dataset'].get('num_spatial_parts', None)
+        self.num_spatial_parts = int(configured_num_spatial_parts) if configured_num_spatial_parts is not None else None
 
         self.rotating_ratio = configs['dataset'].get('rotating_ratio', 0.0)
         self.rotating_degree = configs['dataset'].get('rotating_degree', 10.0)
@@ -168,11 +189,22 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 lower = min(max(1, self.min_num_parts), upper)
                 if lower <= 0:
                     continue
-                num_parts = random.randint(lower, upper)
+                num_frames_sample = random.randint(lower, upper)
+                if self.spatiotemporal_grid:
+                    if self.num_spatial_parts is None:
+                        spatial_parts = _count_surface_parts(obj['frames'][0]['surface_path'])
+                    else:
+                        spatial_parts = self.num_spatial_parts
+                    num_parts = num_frames_sample * spatial_parts
+                else:
+                    spatial_parts = 1
+                    num_parts = num_frames_sample
                 data_configs.append({
                     'object_key': obj['object_key'],
                     'frames': obj['frames'],
                     'num_frames': n_frames,
+                    'num_sampled_frames': num_frames_sample,
+                    'num_spatial_parts': spatial_parts,
                     'num_parts': num_parts,
                     'valid': True,
                     # Placeholders for compatibility
@@ -215,7 +247,7 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         if 'frames' in data_config:
             # New frame-based format
             frames = data_config['frames']
-            k = int(data_config['num_parts'])
+            k = int(data_config.get('num_sampled_frames', data_config['num_parts']))
             # Select k frames in even-step consecutive order: s, s+2, s+4, ... (no reordering)
             F = len(frames)
             max_start = (F - 1) - 2 * (k - 1)
@@ -234,7 +266,22 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 surface_path = resolve_path(fr['surface_path'])
                 image_path = resolve_path(fr['image_path'])
                 surface_data = np.load(surface_path, allow_pickle=True).item()
-                part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
+                if self.spatiotemporal_grid:
+                    expected_parts = int(data_config.get('num_spatial_parts', self.num_spatial_parts or 1))
+                    frame_surfaces = _extract_part_surface_arrays(
+                        surface_data,
+                        self.surface_num_points,
+                        max_parts=expected_parts,
+                    )
+                    if frame_surfaces.shape[0] != expected_parts:
+                        raise ValueError(
+                            f"Physics/spatio-temporal grid expected {expected_parts} explicit parts in {surface_path}, "
+                            f"but found {frame_surfaces.shape[0]}. Regenerate/preprocess physics data with --include-parts "
+                            "or set dataset_physics.num_spatial_parts to match the data."
+                        )
+                    part_surfaces.append(frame_surfaces)
+                else:
+                    part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
                 # Load image per frame
                 pil_image = Image.open(image_path)
                 if getattr(pil_image, "is_animated", False):
@@ -251,14 +298,25 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 if random.random() < self.rotating_ratio:
                     pil_image = self.transform(pil_image)
                 pil_image = pil_image.resize(self.image_size, Image.Resampling.BILINEAR)
-                img = np.asarray(pil_image, dtype=np.uint8)
-                images_list.append(torch.from_numpy(img).to(torch.uint8))
-            part_surfaces = torch.stack(part_surfaces, dim=0)  # [N, P, 6]
+                img = np.asarray(pil_image, dtype=np.uint8).copy()
+                image_tensor = torch.from_numpy(img).to(torch.uint8)
+                if self.spatiotemporal_grid:
+                    images_list.extend([image_tensor] * part_surfaces[-1].shape[0])
+                else:
+                    images_list.append(image_tensor)
+            if self.spatiotemporal_grid:
+                part_surfaces = torch.cat(part_surfaces, dim=0)  # frame-major [F*num_parts, P, 6]
+            else:
+                part_surfaces = torch.stack(part_surfaces, dim=0)  # [N, P, 6]
             images = torch.stack(images_list, dim=0)  # [N, H, W, 3]
-            return {
+            out = {
                 "images": images,
                 "part_surfaces": part_surfaces,
             }
+            if self.spatiotemporal_grid:
+                out["num_frames"] = torch.LongTensor([k])
+                out["num_spatial_parts"] = torch.LongTensor([int(data_config.get('num_spatial_parts', self.num_spatial_parts or 1))])
+            return out
         elif 'surface_path' in data_config:
             surface_path = resolve_path(data_config['surface_path'])
             surface_data = np.load(surface_path, allow_pickle=True).item()
@@ -423,9 +481,12 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
         assert images.shape[0] == surfaces.shape[0] == num_parts.sum() == self.batch_size, \
             f"Batch size mismatch: {images.shape[0]} != {surfaces.shape[0]} != {num_parts.sum()} != {self.batch_size}"
         
-        batch = {
+        out = {
             "images": images,
             "part_surfaces": surfaces,
             "num_parts": num_parts,
         }
-        return batch
+        if all("num_frames" in data and "num_spatial_parts" in data for data in batch):
+            out["num_frames"] = torch.cat([data["num_frames"] for data in batch], dim=0)
+            out["num_spatial_parts"] = torch.cat([data["num_spatial_parts"] for data in batch], dim=0)
+        return out

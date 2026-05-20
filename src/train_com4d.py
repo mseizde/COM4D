@@ -88,6 +88,8 @@ from src.models.attention_processor import (
     TripoSGAttnProcessor2_0,
 )
 
+HUMOTO_PHYSICS_DATASET_JSON = "/data/mseizde/com4d/COM4D/dataset_json/humoto.json"
+
 
 class ValidationSampleTimeout(RuntimeError):
     pass
@@ -380,6 +382,401 @@ def _build_room_layout_targets(
         ptr += count
 
     return targets, valid
+
+
+def _predict_clean_latents(
+    raw_model_pred: torch.Tensor,
+    noisy_latents: torch.Tensor,
+    sigmas: torch.Tensor,
+    objective: str,
+) -> torch.Tensor:
+    if objective == "x0":
+        return raw_model_pred.float() * (-sigmas.float()) + noisy_latents.float()
+    if objective == "v":
+        return noisy_latents.float() - sigmas.float() * raw_model_pred.float()
+    if objective == "-v":
+        return noisy_latents.float() + sigmas.float() * raw_model_pred.float()
+    return raw_model_pred.float()
+
+
+def _sample_surface_queries(
+    part_surfaces: torch.Tensor,
+    num_points: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if part_surfaces.ndim != 3 or part_surfaces.shape[-1] < 6:
+        raise ValueError("part_surfaces must have shape [N, P, >=6].")
+    total_points = part_surfaces.shape[1]
+    count = min(max(int(num_points), 1), total_points)
+    indices = torch.randint(
+        low=0,
+        high=total_points,
+        size=(part_surfaces.shape[0], count),
+        device=part_surfaces.device,
+    )
+    gather_idx = indices[..., None].expand(-1, -1, part_surfaces.shape[-1])
+    sampled = torch.gather(part_surfaces, dim=1, index=gather_idx)
+    points = sampled[..., :3].float().detach()
+    normals = tF.normalize(sampled[..., 3:6].float().detach(), dim=-1, eps=1e-6)
+    return points, normals
+
+
+def _compute_geometry_field_auxiliary_loss(
+    vae: TripoSGVAEModel,
+    clean_latents: torch.Tensor,
+    part_surfaces: torch.Tensor,
+    num_points: int,
+    sdf_weight: float,
+    normal_weight: float,
+    eikonal_weight: float,
+    second_order: bool,
+    eikonal_grad_norm_clip: float,
+    decoder_num_chunks: int,
+    decoder_dtype: torch.dtype,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    # Important: COM4D point-sampling files contain only surface points and
+    # surface normals. They do not contain off-surface signed-distance/TSDF
+    # samples. The "sdf" term below is therefore only a surface-zero
+    # implicit-field constraint D(x_surface)=0, not TripoSG's full SDF loss.
+    if sdf_weight <= 0.0 and normal_weight <= 0.0 and eikonal_weight <= 0.0:
+        zero = clean_latents.sum() * 0.0
+        return zero, {
+            "sdf": zero.detach(),
+            "normal": zero.detach(),
+            "eikonal": zero.detach(),
+        }
+
+    query_points, target_normals = _sample_surface_queries(part_surfaces, num_points)
+    query_points = query_points.to(device=clean_latents.device, dtype=torch.float32)
+    target_normals = target_normals.to(device=clean_latents.device, dtype=torch.float32)
+    use_second_order_terms = bool(second_order) and (normal_weight > 0.0 or eikonal_weight > 0.0)
+    query_points.requires_grad_(use_second_order_terms)
+
+    if use_second_order_terms:
+        # Surface normal/eikonal supervision needs second-order gradients through
+        # the decoder attention path. CUDA flash SDPA does not implement that
+        # derivative, so use math SDPA only for this small auxiliary decode.
+        sdp_context = (
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+            if clean_latents.is_cuda
+            else nullcontext()
+        )
+        with sdp_context:
+            field_values = vae.decode(
+                clean_latents.to(dtype=decoder_dtype),
+                sampled_points=query_points.to(dtype=decoder_dtype),
+                num_chunks=int(decoder_num_chunks),
+            ).sample.float()
+    else:
+        field_values = vae.decode(
+            clean_latents.to(dtype=decoder_dtype),
+            sampled_points=query_points.to(dtype=decoder_dtype),
+            num_chunks=int(decoder_num_chunks),
+        ).sample.float()
+
+    surface_zero_loss = field_values.abs().mean() + field_values.pow(2).mean()
+    normal_loss = field_values.sum() * 0.0
+    eikonal_loss = field_values.sum() * 0.0
+
+    if use_second_order_terms:
+        gradients = torch.autograd.grad(
+            outputs=field_values.sum(),
+            inputs=query_points,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+        grad_norm = gradients.norm(dim=-1).clamp_min(1e-6)
+        if normal_weight > 0.0:
+            pred_normals = gradients / grad_norm[..., None]
+            normal_loss = (1.0 - (pred_normals * target_normals).sum(dim=-1)).mean()
+        if eikonal_weight > 0.0:
+            if eikonal_grad_norm_clip > 0.0:
+                grad_norm = grad_norm.clamp(max=float(eikonal_grad_norm_clip))
+            eikonal_loss = (grad_norm - 1.0).pow(2).mean()
+
+    total = (
+        float(sdf_weight) * surface_zero_loss
+        + float(normal_weight) * normal_loss
+        + float(eikonal_weight) * eikonal_loss
+    )
+    return total, {
+        "sdf": surface_zero_loss.detach(),
+        "normal": normal_loss.detach(),
+        "eikonal": eikonal_loss.detach(),
+    }
+
+
+def _unproject_depth_samples(
+    pixels_yx: torch.Tensor,
+    depth: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    z = depth[pixels_yx[:, 0], pixels_yx[:, 1]].float()
+    return _unproject_pixels_with_depth_values(pixels_yx, z, intrinsics, camera_to_world)
+
+
+def _unproject_pixels_with_depth_values(
+    pixels_yx: torch.Tensor,
+    depth_values: torch.Tensor,
+    intrinsics: torch.Tensor,
+    camera_to_world: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    y = pixels_yx[:, 0].float()
+    x = pixels_yx[:, 1].float()
+    z = depth_values.float()
+    fx = intrinsics[0, 0].float().clamp_min(1e-6)
+    fy = intrinsics[1, 1].float().clamp_min(1e-6)
+    cx = intrinsics[0, 2].float()
+    cy = intrinsics[1, 2].float()
+    # 3D-FRONT render metadata uses the Blender/OpenGL camera convention:
+    # camera looks down -Z while EXR depth is stored as a positive distance.
+    camera_points = torch.stack(
+        [
+            (x - cx) / fx * z,
+            (y - cy) / fy * z,
+            -z,
+            torch.ones_like(z),
+        ],
+        dim=-1,
+    )
+    world_h = camera_points @ camera_to_world.float().T
+    origin = camera_to_world[:3, 3].float()
+    points = world_h[:, :3]
+    ray_dirs = tF.normalize(points - origin[None], dim=-1, eps=1e-6)
+    return points, ray_dirs
+
+
+def _decode_scene_sdf(
+    vae: TripoSGVAEModel,
+    object_latents: torch.Tensor,
+    query_points: torch.Tensor,
+    decoder_num_chunks: int,
+    decoder_dtype: torch.dtype,
+) -> torch.Tensor:
+    if object_latents.numel() == 0 or query_points.numel() == 0:
+        return query_points.new_zeros((object_latents.shape[0], query_points.shape[0]))
+    num_objects, num_points = object_latents.shape[0], query_points.shape[0]
+    points = query_points[None].expand(num_objects, num_points, 3)
+    values = vae.decode(
+        object_latents.to(dtype=decoder_dtype),
+        sampled_points=points.to(dtype=decoder_dtype),
+        num_chunks=int(decoder_num_chunks),
+    ).sample.float()
+    return values.reshape(num_objects, num_points)
+
+
+def _compute_geometry_image_auxiliary_loss(
+    vae: TripoSGVAEModel,
+    clean_latents: torch.Tensor,
+    geometry_image: Optional[dict[str, torch.Tensor]],
+    num_parts: torch.Tensor,
+    num_surface_pixels: int,
+    num_empty_pixels: int,
+    depth_weight: float,
+    normal_weight: float,
+    mask_weight: float,
+    empty_weight: float,
+    surface_margin: float,
+    empty_margin: float,
+    max_empty_backprop_pixels: int,
+    ray_sign_weight: float,
+    ray_sign_epsilon: float,
+    decoder_num_chunks: int,
+    decoder_dtype: torch.dtype,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    zero = clean_latents.sum() * 0.0
+    terms = {
+        "depth": zero.detach(),
+        "normal": zero.detach(),
+        "mask": zero.detach(),
+        "empty": zero.detach(),
+        "valid": torch.tensor(0, device=clean_latents.device, dtype=torch.long),
+    }
+    if geometry_image is None or depth_weight <= 0.0 and normal_weight <= 0.0 and mask_weight <= 0.0 and empty_weight <= 0.0:
+        return zero, terms
+    required = {"mask", "intrinsics", "camera_to_world", "world_to_sdf_center", "world_to_sdf_scale"}
+    if not required.issubset(geometry_image.keys()):
+        return zero, terms
+
+    masks = geometry_image["mask"].to(device=clean_latents.device, dtype=torch.bool)
+    depth_maps = geometry_image.get("depth")
+    normal_maps = geometry_image.get("normal")
+    intrinsics = geometry_image["intrinsics"].to(device=clean_latents.device, dtype=torch.float32)
+    camera_to_world = geometry_image["camera_to_world"].to(device=clean_latents.device, dtype=torch.float32)
+    world_to_sdf_center = geometry_image["world_to_sdf_center"].to(device=clean_latents.device, dtype=torch.float32)
+    world_to_sdf_scale = geometry_image["world_to_sdf_scale"].to(device=clean_latents.device, dtype=torch.float32)
+    if depth_maps is None:
+        return zero, terms
+    depth_maps = depth_maps.to(device=clean_latents.device, dtype=torch.float32)
+    if normal_maps is not None:
+        normal_maps = normal_maps.to(device=clean_latents.device, dtype=torch.float32)
+
+    depth_losses = []
+    normal_losses = []
+    mask_losses = []
+    empty_losses = []
+    ptr = 0
+    for obj_idx, count_tensor in enumerate(num_parts.detach().cpu()):
+        count = int(count_tensor.item())
+        object_latents = clean_latents[ptr:ptr + count]
+        ptr += count
+        if count <= 0 or obj_idx >= masks.shape[0]:
+            continue
+        valid_yx = masks[obj_idx].nonzero(as_tuple=False)
+        if valid_yx.numel() == 0:
+            continue
+        sample_count = min(int(num_surface_pixels), valid_yx.shape[0])
+        perm = torch.randperm(valid_yx.shape[0], device=valid_yx.device)[:sample_count]
+        surface_yx = valid_yx[perm]
+        query_points, ray_dirs = _unproject_depth_samples(
+            surface_yx,
+            depth_maps[obj_idx],
+            intrinsics[obj_idx],
+            camera_to_world[obj_idx],
+        )
+        query_points = (query_points - world_to_sdf_center[obj_idx][None]) * world_to_sdf_scale[obj_idx].reshape(1, 1)
+        point_valid = torch.isfinite(query_points).all(dim=-1) & (query_points.norm(dim=-1) <= 4.0)
+        if not bool(point_valid.any()):
+            continue
+        surface_yx = surface_yx[point_valid]
+        query_points = query_points[point_valid].detach().float()
+        ray_dirs = ray_dirs[point_valid]
+        use_normals = normal_weight > 0.0 and normal_maps is not None
+        query_points.requires_grad_(use_normals)
+
+        sdp_context = (
+            torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            )
+            if clean_latents.is_cuda and use_normals
+            else nullcontext()
+        )
+        with sdp_context:
+            scene_fields = _decode_scene_sdf(
+                vae,
+                object_latents,
+                query_points,
+                decoder_num_chunks=decoder_num_chunks,
+                decoder_dtype=decoder_dtype,
+            )
+        abs_fields = scene_fields.abs()
+        min_abs, nearest_idx = abs_fields.min(dim=0)
+        selected_sdf = scene_fields.gather(0, nearest_idx[None]).squeeze(0)
+
+        if depth_weight > 0.0:
+            surface_loss = tF.relu(min_abs - float(surface_margin)).mean()
+            if ray_sign_weight > 0.0:
+                eps = float(ray_sign_epsilon)
+                front = (query_points.detach() - ray_dirs * eps).float()
+                back = (query_points.detach() + ray_dirs * eps).float()
+                front_sdf = _decode_scene_sdf(vae, object_latents, front, decoder_num_chunks, decoder_dtype).min(dim=0).values
+                back_sdf = _decode_scene_sdf(vae, object_latents, back, decoder_num_chunks, decoder_dtype).min(dim=0).values
+                sign_loss = tF.softplus(-front_sdf).mean() + tF.softplus(back_sdf).mean()
+                surface_loss = surface_loss + float(ray_sign_weight) * sign_loss
+            depth_losses.append(surface_loss)
+
+        if mask_weight > 0.0:
+            mask_losses.append(tF.softplus(min_abs - float(surface_margin)).mean())
+
+        if use_normals:
+            gradients = torch.autograd.grad(
+                outputs=selected_sdf.sum(),
+                inputs=query_points,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True,
+            )[0]
+            pred_normals = tF.normalize(gradients, dim=-1, eps=1e-6)
+            target_normals = tF.normalize(normal_maps[obj_idx, surface_yx[:, 0], surface_yx[:, 1]], dim=-1, eps=1e-6)
+            normal_losses.append((1.0 - (pred_normals * target_normals).sum(dim=-1)).mean())
+
+        if empty_weight > 0.0 and int(num_empty_pixels) > 0:
+            empty_yx = (~masks[obj_idx]).nonzero(as_tuple=False)
+            if empty_yx.numel() > 0:
+                empty_count = min(int(num_empty_pixels), empty_yx.shape[0])
+                empty_perm = torch.randperm(empty_yx.shape[0], device=empty_yx.device)[:empty_count]
+                empty_sample_yx = empty_yx[empty_perm]
+                median_depth = depth_maps[obj_idx][masks[obj_idx]].median().clamp_min(1e-4)
+                empty_depth = torch.full(
+                    (empty_sample_yx.shape[0],),
+                    float(median_depth.item()),
+                    device=empty_sample_yx.device,
+                    dtype=torch.float32,
+                )
+                empty_points, _ = _unproject_pixels_with_depth_values(
+                    empty_sample_yx,
+                    empty_depth,
+                    intrinsics[obj_idx],
+                    camera_to_world[obj_idx],
+                )
+                empty_points = (empty_points - world_to_sdf_center[obj_idx][None]) * world_to_sdf_scale[obj_idx].reshape(1, 1)
+                empty_valid = torch.isfinite(empty_points).all(dim=-1) & (empty_points.norm(dim=-1) <= 4.0)
+                if not bool(empty_valid.any()):
+                    continue
+                empty_points = empty_points[empty_valid]
+
+                # Empty-space supervision is a sparse collision-style penalty:
+                # most sampled background points already have zero loss. Probe
+                # without building a graph, then backpropagate only through the
+                # hardest violating points to keep DDP ranks from diverging in
+                # backward cost on large mixed batches.
+                with torch.no_grad():
+                    empty_probe_fields = _decode_scene_sdf(
+                        vae,
+                        object_latents.detach(),
+                        empty_points.detach().float(),
+                        decoder_num_chunks=decoder_num_chunks,
+                        decoder_dtype=decoder_dtype,
+                    )
+                    empty_probe_min_abs = empty_probe_fields.abs().min(dim=0).values
+                    empty_violation = float(empty_margin) - empty_probe_min_abs
+                    violating = empty_violation > 0.0
+                    if not bool(violating.any()):
+                        continue
+                    hard_count = min(
+                        max(int(max_empty_backprop_pixels), 1),
+                        int(violating.long().sum().item()),
+                    )
+                    hard_local = torch.topk(empty_violation[violating], k=hard_count).indices
+                    hard_indices = violating.nonzero(as_tuple=False).squeeze(1)[hard_local]
+                empty_points = empty_points[hard_indices]
+                empty_fields = _decode_scene_sdf(
+                    vae,
+                    object_latents,
+                    empty_points.detach().float(),
+                    decoder_num_chunks=decoder_num_chunks,
+                    decoder_dtype=decoder_dtype,
+                )
+                empty_min_abs = empty_fields.abs().min(dim=0).values
+                empty_losses.append(tF.relu(float(empty_margin) - empty_min_abs).mean())
+
+    def _mean_or_zero(values: list[torch.Tensor]) -> torch.Tensor:
+        return torch.stack(values).mean() if values else zero
+
+    depth_loss = _mean_or_zero(depth_losses)
+    normal_loss = _mean_or_zero(normal_losses)
+    mask_loss = _mean_or_zero(mask_losses)
+    empty_loss = _mean_or_zero(empty_losses)
+    total = (
+        float(depth_weight) * depth_loss
+        + float(normal_weight) * normal_loss
+        + float(mask_weight) * mask_loss
+        + float(empty_weight) * empty_loss
+    )
+    return total, {
+        "depth": depth_loss.detach(),
+        "normal": normal_loss.detach(),
+        "mask": mask_loss.detach(),
+        "empty": empty_loss.detach(),
+        "valid": torch.tensor(len(depth_losses), device=clean_latents.device, dtype=torch.long),
+    }
 
 
 def main():
@@ -687,6 +1084,8 @@ def main():
     if 'dataset_physics' in configs:
         cfgs_physics = copy.deepcopy(configs)
         cfgs_physics['dataset'] = copy.deepcopy(configs['dataset_physics'])
+        cfgs_physics['dataset']['config'] = [HUMOTO_PHYSICS_DATASET_JSON]
+        cfgs_physics['dataset']['spatiotemporal_grid'] = False
 
     loader_kwargs = {}
     if args.num_workers > 0:
@@ -851,6 +1250,11 @@ def main():
             f"Physics data mix: prob={physics_data_prob} "
             f"enabled={train_loader_physics is not None}\n"
         )
+        if cfgs_physics is not None:
+            logger.info(
+                f"Physics dataset source: {cfgs_physics['dataset'].get('config')} "
+                f"spatiotemporal_grid={cfgs_physics['dataset'].get('spatiotemporal_grid', False)}\n"
+            )
         logger.info(
             f"Dataset cache: enabled={dataset_cache_enabled} "
             f"source_root={args.dataset_source_root} cache_root={args.dataset_cache_root} "
@@ -966,6 +1370,7 @@ def main():
     enable_dynamic_embedding = configs["model"]["transformer"].get("enable_dynamic_embedding", True)
     enable_static_embedding_per_block = configs["model"]["transformer"].get("enable_static_embedding_per_block", False)
     enable_dynamic_embedding_per_block = configs["model"]["transformer"].get("enable_dynamic_embedding_per_block", False)
+    mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "current"))
     # Separate spatial and temporal global-attn block ids; fallback to global_attn_block_ids
     spatial_global_attn_block_ids = configs["model"]["transformer"].get("spatial_global_attn_block_ids", None)
     if spatial_global_attn_block_ids is not None:
@@ -1010,6 +1415,7 @@ def main():
             spatial_global_attn_block_ids=spatial_global_attn_block_ids,
             temporal_global_attn_block_ids=temporal_global_attn_block_ids,
             global_attn_block_id_range=None,
+            mixing_mode=mixing_mode,
         )
     elif args.load_pretrained_model is None or args.load_pretrained_model_ckpt is None:
         direct_pretrained_dir = None
@@ -1044,6 +1450,7 @@ def main():
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
                 global_attn_block_id_range=None,
+                mixing_mode=mixing_mode,
             )
         else:
             if args.load_pretrained_model is not None and args.load_pretrained_model_ckpt is None:
@@ -1072,6 +1479,7 @@ def main():
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
                 global_attn_block_id_range=None,
+                mixing_mode=mixing_mode,
             )
     else:
         transformer_init_source = f"checkpoint_ema:{args.load_pretrained_model}:{args.load_pretrained_model_ckpt:06d}"
@@ -1100,6 +1508,7 @@ def main():
             enable_global_cross_attn=enable_global_cross_attn,
             global_attn_block_ids=spatial_global_attn_block_ids,
             global_attn_block_id_range=None,
+            mixing_mode=mixing_mode,
         )
     if not args.from_scratch:
         for v in loading_info.values():
@@ -1122,6 +1531,7 @@ def main():
     transformer.enable_global_cross_attn = enable_global_cross_attn
     transformer.spatial_global_attn_block_ids = list(spatial_global_attn_block_ids)
     transformer.temporal_global_attn_block_ids = list(temporal_global_attn_block_ids)
+    transformer.mixing_mode = mixing_mode
 
     layout_pose_cfg = configs["train"].get("layout_pose_auxiliary", {})
     if not hasattr(layout_pose_cfg, "get"):
@@ -1164,6 +1574,73 @@ def main():
         )
     elif accelerator.is_main_process:
         logger.info("Room-layout auxiliary supervision disabled.\n")
+
+    geometry_aux_cfg = configs["train"].get("geometry_field_auxiliary", {})
+    if not hasattr(geometry_aux_cfg, "get"):
+        geometry_aux_cfg = {}
+    geometry_aux_enabled = bool(geometry_aux_cfg.get("enabled", False))
+    geometry_aux_weight = float(geometry_aux_cfg.get("weight", 0.0))
+    geometry_aux_num_points = int(geometry_aux_cfg.get("num_surface_points", 128))
+    geometry_aux_sdf_weight = float(geometry_aux_cfg.get("sdf_weight", 1.0))
+    geometry_aux_normal_weight = float(geometry_aux_cfg.get("normal_weight", 10.0))
+    geometry_aux_eikonal_weight = float(geometry_aux_cfg.get("eikonal_weight", 0.1))
+    geometry_aux_second_order = bool(geometry_aux_cfg.get("second_order", False))
+    geometry_aux_eikonal_grad_norm_clip = float(geometry_aux_cfg.get("eikonal_grad_norm_clip", 10.0))
+    geometry_aux_decoder_num_chunks = int(geometry_aux_cfg.get("decoder_num_chunks", 8192))
+    geometry_aux_modes = set(str(mode) for mode in geometry_aux_cfg.get("modes", ["3d", "single"]))
+    geometry_aux_active = geometry_aux_enabled and geometry_aux_weight > 0.0
+    if geometry_aux_active:
+        logger.warning(
+            "Geometry-field auxiliary supervision enabled. This is surface-only supervision, "
+            "not true TripoSG-style SDF/TSDF supervision: the training .npy files provide "
+            "surface_points/surface_normals only, with no off-surface signed-distance targets. "
+            f"weight={geometry_aux_weight}, modes={sorted(geometry_aux_modes)}, "
+            f"num_surface_points={geometry_aux_num_points}, "
+            f"surface_zero(sdf_weight)={geometry_aux_sdf_weight}, normal={geometry_aux_normal_weight}, "
+            f"eikonal={geometry_aux_eikonal_weight}, second_order={geometry_aux_second_order}, "
+            f"eikonal_grad_norm_clip={geometry_aux_eikonal_grad_norm_clip}. "
+            "Recommended default: keep this auxiliary disabled while testing depth supervision; "
+            "if used, prefer surface_zero only, with normal/eikonal off. "
+            "Normal/eikonal require second-order decoder gradients and are only active when second_order=true.\n"
+        )
+    elif accelerator.is_main_process:
+        logger.info("Geometry-field auxiliary supervision disabled.\n")
+
+    geometry_image_cfg = configs["train"].get("geometry_image_auxiliary", {})
+    if not hasattr(geometry_image_cfg, "get"):
+        geometry_image_cfg = {}
+    geometry_image_aux_enabled = bool(geometry_image_cfg.get("enabled", False))
+    geometry_image_aux_weight = float(geometry_image_cfg.get("weight", 0.0))
+    geometry_image_aux_modes = set(str(mode) for mode in geometry_image_cfg.get("modes", ["3d"]))
+    geometry_image_aux_num_surface_pixels = int(geometry_image_cfg.get("num_surface_pixels", 32))
+    geometry_image_aux_num_empty_pixels = int(geometry_image_cfg.get("num_empty_pixels", 32))
+    geometry_image_aux_depth_weight = float(geometry_image_cfg.get("depth_weight", 1.0))
+    geometry_image_aux_normal_weight = float(geometry_image_cfg.get("normal_weight", 0.0))
+    geometry_image_aux_mask_weight = float(geometry_image_cfg.get("mask_weight", 0.0))
+    geometry_image_aux_empty_weight = float(geometry_image_cfg.get("empty_weight", 0.0))
+    geometry_image_aux_surface_margin = float(geometry_image_cfg.get("surface_margin", 0.0))
+    geometry_image_aux_empty_margin = float(geometry_image_cfg.get("empty_margin", 0.05))
+    geometry_image_aux_max_empty_backprop_pixels = int(geometry_image_cfg.get("max_empty_backprop_pixels", 8))
+    geometry_image_aux_sync_step_only = bool(geometry_image_cfg.get("sync_step_only", True))
+    geometry_image_aux_ray_sign_weight = float(geometry_image_cfg.get("ray_sign_weight", 0.0))
+    geometry_image_aux_ray_sign_epsilon = float(geometry_image_cfg.get("ray_sign_epsilon", 0.02))
+    geometry_image_aux_decoder_num_chunks = int(geometry_image_cfg.get("decoder_num_chunks", 8192))
+    geometry_image_aux_active = geometry_image_aux_enabled and geometry_image_aux_weight > 0.0
+    if geometry_image_aux_active:
+        logger.info(
+            "Geometry-image auxiliary supervision enabled: "
+            f"weight={geometry_image_aux_weight}, modes={sorted(geometry_image_aux_modes)}, "
+            f"surface_pixels={geometry_image_aux_num_surface_pixels}, empty_pixels={geometry_image_aux_num_empty_pixels}, "
+            f"depth={geometry_image_aux_depth_weight}, normal={geometry_image_aux_normal_weight}, "
+            f"mask={geometry_image_aux_mask_weight}, empty={geometry_image_aux_empty_weight}, "
+            f"surface_margin={geometry_image_aux_surface_margin}, empty_margin={geometry_image_aux_empty_margin}, "
+            f"max_empty_backprop_pixels={geometry_image_aux_max_empty_backprop_pixels}, "
+            f"sync_step_only={geometry_image_aux_sync_step_only}. "
+            "This uses 3D-FRONT depth/normal/semantic render targets as differentiable SDF queries; "
+            "the pyrender mesh renderer remains validation-only.\n"
+        )
+    elif accelerator.is_main_process:
+        logger.info("Geometry-image auxiliary supervision disabled.\n")
 
     layout_pose_aux_init_path = args.load_layout_pose_aux_head or _checkpoint_aux_head_path(
         args.load_pretrained_model,
@@ -1242,6 +1719,8 @@ def main():
 
     attn_map_spatial = _build_attn_processor_map(spatial_global_attn_block_ids)
     attn_map_temporal = _build_attn_processor_map(temporal_global_attn_block_ids)
+    mixed_global_attn_block_ids = sorted(set(spatial_global_attn_block_ids) | set(temporal_global_attn_block_ids))
+    attn_map_mixed = _build_attn_processor_map(mixed_global_attn_block_ids)
 
     def _unwrap_transformer_for_attn() -> PartFrameCrafterDiTModel:
         # Prefer accelerator.unwrap_model (handles DDP/FSDP); otherwise fall back to .module if present.
@@ -1256,6 +1735,9 @@ def main():
             # set_attn_processor mutates the dict (pops entries); pass a fresh copy
             base_transformer.set_attn_processor(attn_map_spatial.copy())
             base_transformer.global_attn_block_ids = list(spatial_global_attn_block_ids)
+        elif mode == "physics":
+            base_transformer.set_attn_processor(attn_map_mixed.copy())
+            base_transformer.global_attn_block_ids = list(mixed_global_attn_block_ids)
         else:
             base_transformer.set_attn_processor(attn_map_temporal.copy())
             base_transformer.global_attn_block_ids = list(temporal_global_attn_block_ids)
@@ -1523,6 +2005,7 @@ def main():
     total_updated_steps = configs["lr_scheduler"]["total_steps"]
     if args.max_train_steps is None:
         args.max_train_steps = total_updated_steps
+    display_total_steps = min(total_updated_steps, int(args.max_train_steps))
     # In mixed setup, allow non-exact divisibility between total steps and epochs
     if accelerator.num_processes > 1 and accelerator.is_main_process:
         print()
@@ -1694,7 +2177,7 @@ def main():
     logger.info(f"Start training into {exp_dir}\n")
     logger.logger.propagate = False  # not propagate to the root logger (console)
     progress_bar = tqdm(
-        range(total_updated_steps),
+        range(display_total_steps),
         initial=global_update_step,
         desc="Training",
         ncols=175,
@@ -1721,6 +2204,8 @@ def main():
     objaverse_train_iter = yield_forever(objaverse_train_loader)
     # Probability to pick 4D at each iter (default 0.5)
     p_4d = float(configs["train"].get("prob_4d", 0.5))
+    debug_step_timing = bool(configs["train"].get("debug_step_timing", False))
+    micro_step = 0
     for _ in range(10**12):  # effectively infinite, controlled by max_train_steps
 
         if global_update_step == args.max_train_steps:
@@ -1739,26 +2224,54 @@ def main():
             transformer.train()
 
         with accelerator.accumulate(transformer):
-            # Randomly choose dataset for this iteration
+            micro_step += 1
+            timing_start = time.perf_counter()
+            last_timing = timing_start
+
+            def _debug_timing(stage: str) -> None:
+                nonlocal last_timing
+                if not debug_step_timing or not accelerator.is_main_process:
+                    return
+                now = time.perf_counter()
+                try:
+                    current_mode = mode
+                except (NameError, UnboundLocalError):
+                    current_mode = "pending"
+                logger.info(
+                    f"[timing] update={global_update_step:06d} micro={micro_step:06d} "
+                    f"stage={stage} mode={current_mode} "
+                    f"dt={now - last_timing:.3f}s total={now - timing_start:.3f}s "
+                    f"sync={accelerator.sync_gradients}"
+                )
+                last_timing = now
+
+            # Randomly choose dataset for this iteration. Keep this behavior
+            # close to the original trainer; the cache-lock fix, not mode
+            # selection, was the cause of the observed dataloader stall.
+            _debug_timing("mode_rng")
             use_physics = train_iter_physics is not None and random.random() < physics_data_prob
             if use_physics:
                 is_single_object_step = False
+                mode = "physics"
+                _debug_timing("batch_wait:physics")
                 batch = next(train_iter_physics)
-                use_4d = True
-                mode = "4d"
+                use_4d = False
                 switch_to_mode(mode)
             else:
                 is_single_object_step = random.random() < single_object_reg_prob and single_object_configs != []
                 if is_single_object_step:
+                    mode = "single"
+                    _debug_timing("batch_wait:single")
                     batch = next(objaverse_train_iter)
                     use_4d = False
-                    mode = "single"
                 else:
                     use_4d = random.random() < p_4d
-                    batch = next(train_iter_4d) if use_4d else next(train_iter_3d)
                     mode = "4d" if use_4d else "3d"
+                    _debug_timing(f"batch_wait:{mode}")
+                    batch = next(train_iter_4d) if use_4d else next(train_iter_3d)
                     # Switch attention mode
                     switch_to_mode(mode)
+            _debug_timing("batch")
 
             images_hw3 = batch["images"] # [N, H, W, 3]
             images_hw3 = apply_advanced_image_masking(images_hw3, batch["num_parts"], mode)
@@ -1775,9 +2288,11 @@ def main():
                     preprocess_kwargs["do_center_crop"] = False
                 pixel_values = feature_extractor_dinov2(**preprocess_kwargs).pixel_values
             pixel_values = pixel_values.to(device=accelerator.device, dtype=weight_dtype) # [N, 3, Hf, Wf]
+            _debug_timing("preprocess")
             # Original single-image tokens (frozen DINO)
             with torch.no_grad():
                 single_tokens = image_encoder_dinov2(pixel_values).last_hidden_state  # [N, T, D]
+            _debug_timing("dino")
 
             # Group indices by objects using num_parts
             num_parts = batch["num_parts"].to(accelerator.device) # [M]
@@ -1806,6 +2321,7 @@ def main():
                     part_surfaces, 
                     **configs["model"]["vae"]
                 ).latent_dist.sample()
+            _debug_timing("vae_encode")
 
             noise = torch.randn_like(latents)
             # For weighting schemes where we sample timesteps non-uniformly
@@ -1873,7 +2389,14 @@ def main():
             ones = torch.ones_like(num_parts).to(device=accelerator.device)
             
             attn_kwargs = {"num_parts": num_parts, "num_frames": ones}
-            if use_4d:
+            if mode == "physics" and "num_frames" in batch and "num_spatial_parts" in batch:
+                attn_kwargs = {
+                    "num_frames": batch["num_frames"].to(accelerator.device),
+                    "num_parts": batch["num_spatial_parts"].to(accelerator.device),
+                    "layout": "frame_major",
+                    "mixing_mode": mixing_mode,
+                }
+            elif use_4d:
                 attn_kwargs = {"num_frames": num_parts, "num_parts": ones}
             elif is_single_object_step:
                 attn_kwargs = {"num_parts": ones, "num_frames": ones}
@@ -1884,25 +2407,39 @@ def main():
                 encoder_hidden_states=image_embeds,
                 attention_kwargs=attn_kwargs,
             ).sample
+            _debug_timing("transformer")
 
             # Keep a copy of the raw model predictions for consistency loss
             raw_model_pred = model_pred
+            clean_latents_for_aux = None
 
             layout_pose_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
             layout_pose_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
             room_layout_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
             room_layout_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
+            geometry_field_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_field_sdf_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_field_normal_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_field_eikonal_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_depth_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_normal_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_mask_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_empty_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            geometry_image_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
             layout_latents = None
             use_room_aux = mode == "3d"
+            layout_pose_step_active = use_room_aux and layout_pose_aux_head is not None
+            room_layout_step_active = use_room_aux and room_layout_aux_head is not None
+            geometry_field_step_active = geometry_aux_active and mode in geometry_aux_modes
             if use_room_aux and (layout_pose_aux_head is not None or room_layout_aux_head is not None):
-                if configs["train"]["training_objective"] == "x0":
-                    layout_latents = raw_model_pred.float() * (-sigmas.float()) + noisy_latents.float()
-                elif configs["train"]["training_objective"] == "v":
-                    layout_latents = noisy_latents.float() - sigmas.float() * raw_model_pred.float()
-                elif configs["train"]["training_objective"] == "-v":
-                    layout_latents = noisy_latents.float() + sigmas.float() * raw_model_pred.float()
-                else:
-                    layout_latents = raw_model_pred.float()
+                clean_latents_for_aux = _predict_clean_latents(
+                    raw_model_pred=raw_model_pred,
+                    noisy_latents=noisy_latents,
+                    sigmas=sigmas,
+                    objective=configs["train"]["training_objective"],
+                )
+                layout_latents = clean_latents_for_aux
 
             if use_room_aux and layout_pose_aux_head is not None:
                 layout_pose_pred = layout_pose_aux_head(layout_latents)
@@ -1940,6 +2477,70 @@ def main():
                     room_layout_loss = room_layout_reg_loss + room_layout_presence_loss
                 else:
                     room_layout_loss = room_layout_pred.sum() * 0.0
+
+            if geometry_field_step_active:
+                if clean_latents_for_aux is None:
+                    clean_latents_for_aux = _predict_clean_latents(
+                        raw_model_pred=raw_model_pred,
+                        noisy_latents=noisy_latents,
+                        sigmas=sigmas,
+                        objective=configs["train"]["training_objective"],
+                    )
+                geometry_field_loss, geometry_field_terms = _compute_geometry_field_auxiliary_loss(
+                    vae=vae,
+                    clean_latents=clean_latents_for_aux,
+                    part_surfaces=part_surfaces,
+                    num_points=geometry_aux_num_points,
+                    sdf_weight=geometry_aux_sdf_weight,
+                    normal_weight=geometry_aux_normal_weight,
+                    eikonal_weight=geometry_aux_eikonal_weight,
+                    second_order=geometry_aux_second_order,
+                    eikonal_grad_norm_clip=geometry_aux_eikonal_grad_norm_clip,
+                    decoder_num_chunks=geometry_aux_decoder_num_chunks,
+                    decoder_dtype=weight_dtype,
+                )
+                geometry_field_sdf_loss = geometry_field_terms["sdf"]
+                geometry_field_normal_loss = geometry_field_terms["normal"]
+                geometry_field_eikonal_loss = geometry_field_terms["eikonal"]
+
+            geometry_image_aux_step_active = (
+                geometry_image_aux_active
+                and mode in geometry_image_aux_modes
+                and (not geometry_image_aux_sync_step_only or accelerator.sync_gradients)
+            )
+            if geometry_image_aux_step_active:
+                if clean_latents_for_aux is None:
+                    clean_latents_for_aux = _predict_clean_latents(
+                        raw_model_pred=raw_model_pred,
+                        noisy_latents=noisy_latents,
+                        sigmas=sigmas,
+                        objective=configs["train"]["training_objective"],
+                    )
+                geometry_image_loss, geometry_image_terms = _compute_geometry_image_auxiliary_loss(
+                    vae=vae,
+                    clean_latents=clean_latents_for_aux,
+                    geometry_image=batch.get("geometry_image"),
+                    num_parts=num_parts,
+                    num_surface_pixels=geometry_image_aux_num_surface_pixels,
+                    num_empty_pixels=geometry_image_aux_num_empty_pixels,
+                    depth_weight=geometry_image_aux_depth_weight,
+                    normal_weight=geometry_image_aux_normal_weight,
+                    mask_weight=geometry_image_aux_mask_weight,
+                    empty_weight=geometry_image_aux_empty_weight,
+                    surface_margin=geometry_image_aux_surface_margin,
+                    empty_margin=geometry_image_aux_empty_margin,
+                    max_empty_backprop_pixels=geometry_image_aux_max_empty_backprop_pixels,
+                    ray_sign_weight=geometry_image_aux_ray_sign_weight,
+                    ray_sign_epsilon=geometry_image_aux_ray_sign_epsilon,
+                    decoder_num_chunks=geometry_image_aux_decoder_num_chunks,
+                    decoder_dtype=weight_dtype,
+                )
+                geometry_image_depth_loss = geometry_image_terms["depth"]
+                geometry_image_normal_loss = geometry_image_terms["normal"]
+                geometry_image_mask_loss = geometry_image_terms["mask"]
+                geometry_image_empty_loss = geometry_image_terms["empty"]
+                geometry_image_valid_count = geometry_image_terms["valid"]
+            _debug_timing("aux")
 
             if configs["train"]["training_objective"] == "x0":  # Section 5 of https://arxiv.org/abs/2206.00364
                 model_pred = model_pred.float() * (-sigmas) + noisy_latents  # predicted x_0
@@ -1994,10 +2595,14 @@ def main():
                 base_loss = diff_loss.mean()
 
             loss = base_loss + cons_weight * consistency_loss
-            if layout_pose_aux_head is not None:
+            if layout_pose_step_active:
                 loss = loss + layout_pose_aux_weight * layout_pose_loss
-            if room_layout_aux_head is not None:
+            if room_layout_step_active:
                 loss = loss + room_layout_aux_weight * room_layout_loss
+            if geometry_field_step_active:
+                loss = loss + geometry_aux_weight * geometry_field_loss
+            if geometry_image_aux_step_active:
+                loss = loss + geometry_image_aux_weight * geometry_image_loss
 
             # Ensure optional embedding parameters participate every step to keep DDP reductions consistent.
             base_transformer = _unwrap_transformer_for_attn()
@@ -2049,23 +2654,30 @@ def main():
 
             # Backpropagate
             accelerator.backward(loss)
+            _debug_timing("backward")
             if accelerator.sync_gradients:
                 clip_params = [param for group in optimizer.param_groups for param in group["params"]]
                 accelerator.clip_grad_norm_(clip_params, args.max_grad_norm)
+                _debug_timing("clip")
 
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
+            _debug_timing("optim")
 
         # Checks if the accelerator has performed an optimization step behind the scenes
         if accelerator.sync_gradients:
             # Gather the losses across all processes for logging (if we use distributed training)
             loss = accelerator.gather(loss.detach()).mean()
+            base_loss_for_log = accelerator.gather(base_loss.detach()).mean()
+            consistency_loss_for_log = accelerator.gather(consistency_loss.detach()).mean()
 
             logs = {
                 "loss": loss.item(),
+                "loss_base": base_loss_for_log.item(),
                 "lr": lr_scheduler.get_last_lr()[0],
                 f"{mode}_loss": loss.item(),
+                f"{mode}_loss_base": base_loss_for_log.item(),
             }
             # Log DF stats if enabled
             if df_enabled and ("context_mask" in locals()) and (context_mask is not None):
@@ -2074,30 +2686,53 @@ def main():
                 logs.update({"df/target_ratio": tgt_ratio})
             # Log consistency and total loss if enabled
             if configs["train"].get("consistency_loss_weight", 0.0) > 0.0:
-                # Mirror the actual loss composition in logs
-                if df_enabled and ("context_mask" in locals()) and (context_mask is not None):
-                    with torch.no_grad():
-                        target_mask = (~context_mask).to(diff_loss.dtype)
-                        denom = target_mask.sum().clamp_min(1.0)
-                        base_loss_log = (diff_loss * target_mask).sum() / denom
-                else:
-                    base_loss_log = diff_loss.mean()
+                # Mirror the actual base + consistency loss composition in logs.
+                base_loss_log = base_loss_for_log
                 logs.update({
-                    "loss_consistency": consistency_loss.item(),
-                    "loss_total": (base_loss_log + configs["train"]["consistency_loss_weight"] * consistency_loss).item(),
+                    "loss_consistency": consistency_loss_for_log.item(),
+                    "loss_total": (base_loss_log + configs["train"]["consistency_loss_weight"] * consistency_loss_for_log).item(),
+                    f"{mode}_loss_consistency": consistency_loss_for_log.item(),
+                    f"{mode}_loss_total": (base_loss_log + configs["train"]["consistency_loss_weight"] * consistency_loss_for_log).item(),
                 })
-            if layout_pose_aux_head is not None:
+            if layout_pose_step_active:
                 valid_count = accelerator.gather(layout_pose_valid_count.detach()).sum()
-                logs.update({
-                    "loss_layout_pose": layout_pose_loss.item(),
-                    "layout_pose_valid": int(valid_count.item()),
-                })
-            if room_layout_aux_head is not None:
+                if int(valid_count.item()) > 0:
+                    logs.update({
+                        "loss_layout_pose": layout_pose_loss.item(),
+                        "layout_pose_valid": int(valid_count.item()),
+                    })
+            if room_layout_step_active:
                 valid_count = accelerator.gather(room_layout_valid_count.detach()).sum()
-                logs.update({
-                    "loss_room_layout": room_layout_loss.item(),
-                    "room_layout_valid": int(valid_count.item()),
-                })
+                if int(valid_count.item()) > 0:
+                    logs.update({
+                        "loss_room_layout": room_layout_loss.item(),
+                        "room_layout_valid": int(valid_count.item()),
+                    })
+            if geometry_field_step_active:
+                geometry_field_logs = {"loss_geometry_field": geometry_field_loss.item()}
+                if geometry_aux_sdf_weight > 0.0:
+                    geometry_field_logs["loss_geometry_sdf"] = geometry_field_sdf_loss.item()
+                if geometry_aux_normal_weight > 0.0 and geometry_aux_second_order:
+                    geometry_field_logs["loss_geometry_normal"] = geometry_field_normal_loss.item()
+                if geometry_aux_eikonal_weight > 0.0 and geometry_aux_second_order:
+                    geometry_field_logs["loss_geometry_eikonal"] = geometry_field_eikonal_loss.item()
+                logs.update(geometry_field_logs)
+            if geometry_image_aux_step_active:
+                valid_count = accelerator.gather(geometry_image_valid_count.detach()).sum()
+                if int(valid_count.item()) > 0:
+                    geometry_image_logs = {
+                        "loss_geometry_image": geometry_image_loss.item(),
+                        "geometry_image_valid": int(valid_count.item()),
+                    }
+                    if geometry_image_aux_depth_weight > 0.0:
+                        geometry_image_logs["loss_geometry_image_depth"] = geometry_image_depth_loss.item()
+                    if geometry_image_aux_normal_weight > 0.0:
+                        geometry_image_logs["loss_geometry_image_normal"] = geometry_image_normal_loss.item()
+                    if geometry_image_aux_mask_weight > 0.0:
+                        geometry_image_logs["loss_geometry_image_mask"] = geometry_image_mask_loss.item()
+                    if geometry_image_aux_empty_weight > 0.0:
+                        geometry_image_logs["loss_geometry_image_empty"] = geometry_image_empty_loss.item()
+                    logs.update(geometry_image_logs)
             if use_ema_for_transformer:
                 ema_transformer.step(transformer.parameters())
                 logs.update({"ema": ema_transformer.cur_decay_value})
@@ -2107,15 +2742,39 @@ def main():
             global_update_step += 1
 
             msg = (
-                f"[{global_update_step:06d} / {total_updated_steps:06d}] "
-                f"loss: {logs['loss']:.4f}, lr: {logs['lr']:.2e}, mode: {mode}"
+                f"[{global_update_step:06d} / {display_total_steps:06d}] "
+                f"loss: {logs['loss']:.4f}, loss_base: {logs['loss_base']:.4f}, lr: {logs['lr']:.2e}, mode: {mode}"
             )
+            if mode == "physics":
+                msg += f", physics_loss: {logs['physics_loss']:.4f}, physics_loss_base: {logs['physics_loss_base']:.4f}"
             if 'loss_consistency' in logs and 'loss_total' in logs:
                 msg += f", loss_consistency: {logs['loss_consistency']:.4f}, loss_total: {logs['loss_total']:.4f}"
             if 'loss_layout_pose' in logs:
                 msg += f", loss_layout_pose: {logs['loss_layout_pose']:.4f}, layout_pose_valid: {logs['layout_pose_valid']}"
             if 'loss_room_layout' in logs:
                 msg += f", loss_room_layout: {logs['loss_room_layout']:.4f}, room_layout_valid: {logs['room_layout_valid']}"
+            if 'loss_geometry_field' in logs:
+                field_parts = []
+                if "loss_geometry_sdf" in logs:
+                    field_parts.append(f"sdf: {logs['loss_geometry_sdf']:.4f}")
+                if "loss_geometry_normal" in logs:
+                    field_parts.append(f"normal: {logs['loss_geometry_normal']:.4f}")
+                if "loss_geometry_eikonal" in logs:
+                    field_parts.append(f"eik: {logs['loss_geometry_eikonal']:.4f}")
+                suffix = f" ({', '.join(field_parts)})" if field_parts else ""
+                msg += f", loss_geometry_field: {logs['loss_geometry_field']:.4f}{suffix}"
+            if 'loss_geometry_image' in logs:
+                image_parts = []
+                if "loss_geometry_image_depth" in logs:
+                    image_parts.append(f"depth: {logs['loss_geometry_image_depth']:.4f}")
+                if "loss_geometry_image_normal" in logs:
+                    image_parts.append(f"normal: {logs['loss_geometry_image_normal']:.4f}")
+                if "loss_geometry_image_mask" in logs:
+                    image_parts.append(f"mask: {logs['loss_geometry_image_mask']:.4f}")
+                if "loss_geometry_image_empty" in logs:
+                    image_parts.append(f"empty: {logs['loss_geometry_image_empty']:.4f}")
+                image_parts.append(f"valid: {logs['geometry_image_valid']}")
+                msg += f", loss_geometry_image: {logs['loss_geometry_image']:.4f} ({', '.join(image_parts)})"
             if use_ema_for_transformer and 'ema' in logs:
                 msg += f", ema: {logs['ema']:.4f}"
             logger.info(msg)
@@ -2129,13 +2788,24 @@ def main():
                 if accelerator.is_main_process:
                     to_log = {
                         "training/loss": logs["loss"],
+                        "training/loss_base": logs["loss_base"],
                         "training/lr": logs["lr"],
                         f"training_{mode}/loss": logs[f"{mode}_loss"],
+                        f"training_{mode}/loss_base": logs[f"{mode}_loss_base"],
                     }
+                    if mode == "physics":
+                        to_log.update({
+                            "training/physics_loss": logs["physics_loss"],
+                            "training/physics_loss_base": logs["physics_loss_base"],
+                            "training_physics/physics_loss": logs["physics_loss"],
+                            "training_physics/physics_loss_base": logs["physics_loss_base"],
+                        })
                     if "loss_consistency" in logs:
                         to_log.update({
                             "training/loss_consistency": logs["loss_consistency"],
                             "training/loss_total": logs["loss_total"],
+                            f"training_{mode}/loss_consistency": logs[f"{mode}_loss_consistency"],
+                            f"training_{mode}/loss_total": logs[f"{mode}_loss_total"],
                         })
                     if "loss_layout_pose" in logs:
                         to_log.update({
@@ -2149,6 +2819,31 @@ def main():
                             "training/room_layout_valid": logs["room_layout_valid"],
                             f"training_{mode}/loss_room_layout": logs["loss_room_layout"],
                         })
+                    if "loss_geometry_field" in logs:
+                        to_log.update({
+                            "training/loss_geometry_field": logs["loss_geometry_field"],
+                            f"training_{mode}/loss_geometry_field": logs["loss_geometry_field"],
+                        })
+                        if "loss_geometry_sdf" in logs:
+                            to_log["training/loss_geometry_sdf"] = logs["loss_geometry_sdf"]
+                        if "loss_geometry_normal" in logs:
+                            to_log["training/loss_geometry_normal"] = logs["loss_geometry_normal"]
+                        if "loss_geometry_eikonal" in logs:
+                            to_log["training/loss_geometry_eikonal"] = logs["loss_geometry_eikonal"]
+                    if "loss_geometry_image" in logs:
+                        to_log.update({
+                            "training/loss_geometry_image": logs["loss_geometry_image"],
+                            "training/geometry_image_valid": logs["geometry_image_valid"],
+                            f"training_{mode}/loss_geometry_image": logs["loss_geometry_image"],
+                        })
+                        if "loss_geometry_image_depth" in logs:
+                            to_log["training/loss_geometry_image_depth"] = logs["loss_geometry_image_depth"]
+                        if "loss_geometry_image_normal" in logs:
+                            to_log["training/loss_geometry_image_normal"] = logs["loss_geometry_image_normal"]
+                        if "loss_geometry_image_mask" in logs:
+                            to_log["training/loss_geometry_image_mask"] = logs["loss_geometry_image_mask"]
+                        if "loss_geometry_image_empty" in logs:
+                            to_log["training/loss_geometry_image_empty"] = logs["loss_geometry_image_empty"]
                     wandb.log(to_log, step=global_update_step)
                     if use_ema_for_transformer:
                         wandb.log({

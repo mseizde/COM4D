@@ -121,6 +121,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--light-energy-jitter", type=float, default=0.0)
     parser.add_argument("--light-size-jitter", type=float, default=0.0)
     parser.add_argument("--skip-masks", action="store_true")
+    parser.add_argument("--save-depth", action="store_true")
+    parser.add_argument("--save-normals", action="store_true")
     parser.add_argument("--skip-transforms", action="store_true")
     parser.add_argument("--skip-canonical-meshes", action="store_true")
     return parser.parse_args()
@@ -266,6 +268,10 @@ def build_renderer_cmd(args: argparse.Namespace) -> list[str]:
         cmd.append("--random-light")
     if args.skip_masks:
         cmd.append("--skip-masks")
+    if args.save_depth:
+        cmd.append("--save-depth")
+    if args.save_normals:
+        cmd.append("--save-normals")
     if args.skip_transforms:
         cmd.append("--skip-transforms")
     if args.skip_canonical_meshes:

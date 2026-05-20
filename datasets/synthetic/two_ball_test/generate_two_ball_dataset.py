@@ -12,6 +12,10 @@ Then it converts all samples into COM4D training format:
   <processed-root>/render/<sample>/frame_0000.png
   <json-output>
 
+The generated points.npy files include explicit per-ball entries under the
+`parts` key. That is required for COM4D physics batches that use true
+spatio-temporal mixing over [frame x object] instances.
+
 Example:
   micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_two_ball_dataset.py \
     --num-samples 1000 \
@@ -370,6 +374,7 @@ def run_preprocess(args: argparse.Namespace) -> None:
         str(args.sphere_subdivisions),
         "--workers",
         str(args.preprocess_workers if args.preprocess_workers is not None else args.workers),
+        "--include-parts",
         "--overwrite",
     ]
     run_command(cmd)

@@ -32,7 +32,8 @@ DATASET_SOURCE_ROOT=${DATASET_SOURCE_ROOT:-/mnt/mocap_b/work/com4d/datasets}
 DATASET_CACHE_PREFETCH_WINDOW=${DATASET_CACHE_PREFETCH_WINDOW:-16}
 DATASET_CACHE_PREFETCH_WORKERS=${DATASET_CACHE_PREFETCH_WORKERS:-2}
 DATASET_CACHE_MAX_GB=${DATASET_CACHE_MAX_GB:-300}
-PREFETCH_FACTOR=${PREFETCH_FACTOR:-4}
+NUM_WORKERS=${NUM_WORKERS:-4}
+PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
 PERSISTENT_WORKERS=${PERSISTENT_WORKERS:-1}
 RANDOM=$$$(date +%s)  # generate a random seed based on current time and process ID
 MAX_GPUS=${MAX_GPUS:-4}
@@ -42,6 +43,7 @@ TAG=${TAG:-}
 NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 BATCH_SIZE_PER_GPU=${BATCH_SIZE_PER_GPU:-}
 PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+OPENCV_IO_ENABLE_OPENEXR=${OPENCV_IO_ENABLE_OPENEXR:-1}
 
 detected_gpus=$(nvidia-smi --list-gpus | wc -l)
 
@@ -84,6 +86,7 @@ export WANDB_API_KEY="wandb_v1_T2wNsDMf0t5XApPyFF5kQHBZoAr_U3UEQbNdTNILvZnUF7ino
 export CUDA_VISIBLE_DEVICES
 export NCCL_P2P_DISABLE
 export PYTORCH_CUDA_ALLOC_CONF
+export OPENCV_IO_ENABLE_OPENEXR
 
 configs=(
     sdemb/mf8_mp8_nt512 # 0
@@ -137,12 +140,14 @@ echo "Using gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
 echo "Using pretrained_model_path=$pretrained_model_path, pretrained_model_ckpt=$pretrained_model_ckpt"
 echo "Using NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
 echo "Using PYTORCH_CUDA_ALLOC_CONF=$PYTORCH_CUDA_ALLOC_CONF"
+echo "Using OPENCV_IO_ENABLE_OPENEXR=$OPENCV_IO_ENABLE_OPENEXR"
 echo "Using ENABLE_DATASET_CACHE=$ENABLE_DATASET_CACHE"
 echo "Using DATASET_SOURCE_ROOT=$DATASET_SOURCE_ROOT"
 echo "Using DATASET_CACHE_ROOT=$DATASET_CACHE_ROOT"
 echo "Using DATASET_CACHE_PREFETCH_WINDOW=$DATASET_CACHE_PREFETCH_WINDOW"
 echo "Using DATASET_CACHE_PREFETCH_WORKERS=$DATASET_CACHE_PREFETCH_WORKERS"
 echo "Using DATASET_CACHE_MAX_GB=$DATASET_CACHE_MAX_GB"
+echo "Using NUM_WORKERS=$NUM_WORKERS"
 echo "Using PREFETCH_FACTOR=$PREFETCH_FACTOR"
 echo "Using PERSISTENT_WORKERS=$PERSISTENT_WORKERS"
 if [ -n "$BATCH_SIZE_PER_GPU" ]; then
@@ -169,6 +174,7 @@ accelerate launch \
     --machine_rank $MACHINE_RANK \
     src/train_com4d.py \
         --pin_memory \
+        --num_workers $NUM_WORKERS \
         --prefetch_factor $PREFETCH_FACTOR \
         $([ "$PERSISTENT_WORKERS" = "1" ] && echo "--persistent_workers") \
         "${dataset_cache_args[@]}" \

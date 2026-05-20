@@ -450,6 +450,12 @@ def main():
         help="Directory containing ordered RGB frames of the scene/video",
     )
     parser.add_argument(
+        "--frames_original_dir",
+        type=str,
+        default=None,
+        help="Optional directory containing original RGB frames before background removal.",
+    )
+    parser.add_argument(
         "--load_frames_no_bg",
         type=int,
         default=0,
