@@ -21,6 +21,7 @@ import random
 from datetime import timedelta
 from contextlib import nullcontext
 from packaging import version
+from pathlib import Path
 
 import trimesh
 from PIL import Image
@@ -1084,8 +1085,15 @@ def main():
     if 'dataset_physics' in configs:
         cfgs_physics = copy.deepcopy(configs)
         cfgs_physics['dataset'] = copy.deepcopy(configs['dataset_physics'])
-        cfgs_physics['dataset']['config'] = [HUMOTO_PHYSICS_DATASET_JSON]
-        cfgs_physics['dataset']['spatiotemporal_grid'] = False
+        physics_dataset_json = configs["train"].get("physics_dataset_json", HUMOTO_PHYSICS_DATASET_JSON)
+        physics_dataset_path = Path(physics_dataset_json).expanduser()
+        if not physics_dataset_path.is_file():
+            raise FileNotFoundError(
+                f"Physics dataset JSON does not exist: {physics_dataset_path}. "
+                "Set train.physics_dataset_json to an existing dataset_json/*.json file."
+            )
+        cfgs_physics['dataset']['config'] = [str(physics_dataset_path)]
+        cfgs_physics['dataset']['spatiotemporal_grid'] = True
 
     loader_kwargs = {}
     if args.num_workers > 0:
@@ -1370,6 +1378,12 @@ def main():
     enable_dynamic_embedding = configs["model"]["transformer"].get("enable_dynamic_embedding", True)
     enable_static_embedding_per_block = configs["model"]["transformer"].get("enable_static_embedding_per_block", False)
     enable_dynamic_embedding_per_block = configs["model"]["transformer"].get("enable_dynamic_embedding_per_block", False)
+    enable_instance_type_embedding = configs["model"]["transformer"].get("enable_instance_type_embedding", False)
+    enable_object_id_embedding = configs["model"]["transformer"].get("enable_object_id_embedding", False)
+    max_object_ids = int(configs["model"]["transformer"].get("max_object_ids", 32))
+    enable_camera_time_conditioning = configs["model"]["transformer"].get("enable_camera_time_conditioning", False)
+    camera_condition_dim = int(configs["model"]["transformer"].get("camera_condition_dim", 25))
+    physics_condition_dim = int(configs["model"]["transformer"].get("physics_condition_dim", 8))
     mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "current"))
     # Separate spatial and temporal global-attn block ids; fallback to global_attn_block_ids
     spatial_global_attn_block_ids = configs["model"]["transformer"].get("spatial_global_attn_block_ids", None)
@@ -1409,6 +1423,12 @@ def main():
             enable_dynamic_embedding=enable_dynamic_embedding,
             enable_static_embedding_per_block=enable_static_embedding_per_block,
             enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+            enable_instance_type_embedding=enable_instance_type_embedding,
+            enable_object_id_embedding=enable_object_id_embedding,
+            max_object_ids=max_object_ids,
+            enable_camera_time_conditioning=enable_camera_time_conditioning,
+            camera_condition_dim=camera_condition_dim,
+            physics_condition_dim=physics_condition_dim,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
             global_attn_block_ids=spatial_global_attn_block_ids,
@@ -1446,6 +1466,12 @@ def main():
                 enable_dynamic_embedding=enable_dynamic_embedding,
                 enable_static_embedding_per_block=enable_static_embedding_per_block,
                 enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+                enable_instance_type_embedding=enable_instance_type_embedding,
+                enable_object_id_embedding=enable_object_id_embedding,
+                max_object_ids=max_object_ids,
+                enable_camera_time_conditioning=enable_camera_time_conditioning,
+                camera_condition_dim=camera_condition_dim,
+                physics_condition_dim=physics_condition_dim,
                 enable_local_cross_attn=enable_local_cross_attn,
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
@@ -1475,6 +1501,12 @@ def main():
                 enable_dynamic_embedding=enable_dynamic_embedding,
                 enable_static_embedding_per_block=enable_static_embedding_per_block,
                 enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+                enable_instance_type_embedding=enable_instance_type_embedding,
+                enable_object_id_embedding=enable_object_id_embedding,
+                max_object_ids=max_object_ids,
+                enable_camera_time_conditioning=enable_camera_time_conditioning,
+                camera_condition_dim=camera_condition_dim,
+                physics_condition_dim=physics_condition_dim,
                 enable_local_cross_attn=enable_local_cross_attn,
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
@@ -1504,6 +1536,12 @@ def main():
             enable_dynamic_embedding=enable_dynamic_embedding,
             enable_static_embedding_per_block=enable_static_embedding_per_block,
             enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+            enable_instance_type_embedding=enable_instance_type_embedding,
+            enable_object_id_embedding=enable_object_id_embedding,
+            max_object_ids=max_object_ids,
+            enable_camera_time_conditioning=enable_camera_time_conditioning,
+            camera_condition_dim=camera_condition_dim,
+            physics_condition_dim=physics_condition_dim,
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
             global_attn_block_ids=spatial_global_attn_block_ids,
@@ -1527,6 +1565,10 @@ def main():
     transformer.enable_dynamic_embedding = enable_dynamic_embedding
     transformer.enable_static_embedding_per_block = enable_static_embedding_per_block
     transformer.enable_dynamic_embedding_per_block = enable_dynamic_embedding_per_block
+    transformer.enable_instance_type_embedding = enable_instance_type_embedding
+    transformer.enable_object_id_embedding = enable_object_id_embedding
+    transformer.max_object_ids = max_object_ids
+    transformer.enable_camera_time_conditioning = enable_camera_time_conditioning
     transformer.enable_local_cross_attn = enable_local_cross_attn
     transformer.enable_global_cross_attn = enable_global_cross_attn
     transformer.spatial_global_attn_block_ids = list(spatial_global_attn_block_ids)
@@ -1789,7 +1831,27 @@ def main():
                 if isinstance(unwrapped, PartFrameCrafterDiTModel):
                     transformer_dir = os.path.join(input_dir, "transformer")
                     if os.path.isdir(transformer_dir):
-                        load_model = PartFrameCrafterDiTModel.from_pretrained(input_dir, subfolder="transformer")
+                        load_model = PartFrameCrafterDiTModel.from_pretrained(
+                            input_dir,
+                            subfolder="transformer",
+                            enable_part_embedding=enable_part_embedding,
+                            enable_frame_embedding=enable_frame_embedding,
+                            enable_static_embedding=enable_static_embedding,
+                            enable_dynamic_embedding=enable_dynamic_embedding,
+                            enable_static_embedding_per_block=enable_static_embedding_per_block,
+                            enable_dynamic_embedding_per_block=enable_dynamic_embedding_per_block,
+                            enable_instance_type_embedding=enable_instance_type_embedding,
+                            enable_object_id_embedding=enable_object_id_embedding,
+                            max_object_ids=max_object_ids,
+                            enable_camera_time_conditioning=enable_camera_time_conditioning,
+                            camera_condition_dim=camera_condition_dim,
+                            physics_condition_dim=physics_condition_dim,
+                            enable_local_cross_attn=enable_local_cross_attn,
+                            enable_global_cross_attn=enable_global_cross_attn,
+                            global_attn_block_ids=spatial_global_attn_block_ids,
+                            global_attn_block_id_range=None,
+                            mixing_mode=mixing_mode,
+                        )
                         model.register_to_config(**load_model.config)
                         model.load_state_dict(load_model.state_dict())
                         del load_model
@@ -2205,6 +2267,8 @@ def main():
     # Probability to pick 4D at each iter (default 0.5)
     p_4d = float(configs["train"].get("prob_4d", 0.5))
     debug_step_timing = bool(configs["train"].get("debug_step_timing", False))
+    max_nonfinite_retries = int(configs["train"].get("max_nonfinite_retries", 20))
+    nonfinite_retry_count = 0
     micro_step = 0
     for _ in range(10**12):  # effectively infinite, controlled by max_train_steps
 
@@ -2406,6 +2470,10 @@ def main():
                 timestep=timesteps,
                 encoder_hidden_states=image_embeds,
                 attention_kwargs=attn_kwargs,
+                camera_params=batch.get("camera_params", None),
+                frame_time=batch.get("frame_time", None),
+                has_camera=batch.get("has_camera", None),
+                physics_context=batch.get("physics_context", None),
             ).sample
             _debug_timing("transformer")
 
@@ -2614,11 +2682,18 @@ def main():
                 "static_embedding",
                 "static_embedding_per_block",
                 "part_embedding",
+                "instance_type_embedding",
+                "object_id_embedding",
+                "camera_condition_proj",
+                "frame_time_proj",
+                "physics_condition_proj",
             ):
                 module = getattr(base_transformer, attr, None)
                 if module is None:
                     continue
-                if hasattr(module, "weight") and getattr(module.weight, "requires_grad", False):
+                if hasattr(module, "parameters"):
+                    zero_refs.extend(param for param in module.parameters() if param.requires_grad)
+                elif hasattr(module, "weight") and getattr(module.weight, "requires_grad", False):
                     zero_refs.append(module.weight)
                 elif torch.is_tensor(module) and getattr(module, "requires_grad", False):
                     zero_refs.append(module)
@@ -2645,12 +2720,21 @@ def main():
             if accelerator.num_processes > 1:
                 finite_int = accelerator.reduce(finite_int, reduction="min")
             if finite_int.item() == 0:
+                nonfinite_retry_count += 1
                 _discard_pending_update()
+                if nonfinite_retry_count >= max_nonfinite_retries:
+                    raise RuntimeError(
+                        f"Non-finite loss persisted for {nonfinite_retry_count} consecutive micro-steps "
+                        f"at update [{global_update_step:06d}] in mode [{mode}]. "
+                        "Stopping instead of retrying forever. Disable newly added conditioning paths or lower precision-sensitive settings."
+                    )
                 logger.warning(
                     f"Non-finite loss detected at update [{global_update_step:06d}] in mode [{mode}]; "
                     "discarded accumulated gradients and restarting this optimizer step."
                 )
                 continue
+
+            nonfinite_retry_count = 0
 
             # Backpropagate
             accelerator.backward(loss)

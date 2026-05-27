@@ -403,6 +403,12 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         spatial_global_attn_block_ids: Optional[List[int]] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
         temporal_global_attn_block_ids: Optional[List[int]] = [0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21],
         mixing_mode: str = "current",
+        enable_instance_type_embedding: bool = False,
+        enable_object_id_embedding: bool = False,
+        max_object_ids: int = 32,
+        enable_camera_time_conditioning: bool = False,
+        camera_condition_dim: int = 25,
+        physics_condition_dim: int = 8,
     ):
         super().__init__()
 
@@ -432,6 +438,9 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
               "spatial_global_attn_block_ids=", spatial_global_attn_block_ids,
               "temporal_global_attn_block_ids=", temporal_global_attn_block_ids,
               "mixing_mode=", mixing_mode,
+              "enable_instance_type_embedding=", enable_instance_type_embedding,
+              "enable_object_id_embedding=", enable_object_id_embedding,
+              "enable_camera_time_conditioning=", enable_camera_time_conditioning,
         )
         self.out_channels = in_channels
         self.num_heads = num_attention_heads
@@ -485,7 +494,42 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             self.dynamic_embedding_per_block.weight.data.normal_(mean=0.0, std=0.02)
         self.enable_dynamic_embedding_per_block = enable_dynamic_embedding_per_block
 
+        self.enable_instance_type_embedding = enable_instance_type_embedding
+        if enable_instance_type_embedding:
+            print("Using instance type embedding")
+            self.instance_type_embedding = nn.Embedding(2, self.inner_dim)
+            self.instance_type_embedding.weight.data.normal_(mean=0.0, std=0.02)
+
+        self.enable_object_id_embedding = enable_object_id_embedding
+        self.max_object_ids = int(max_object_ids)
+        if enable_object_id_embedding:
+            print("Using object id embedding with max_object_ids =", max_object_ids)
+            self.object_id_embedding = nn.Embedding(self.max_object_ids, self.inner_dim)
+            self.object_id_embedding.weight.data.normal_(mean=0.0, std=0.02)
+
         self.proj_in = nn.Linear(self.config.in_channels, self.inner_dim, bias=True)
+
+        self.enable_camera_time_conditioning = enable_camera_time_conditioning
+        self.camera_condition_dim = int(camera_condition_dim)
+        self.physics_condition_dim = int(physics_condition_dim)
+        if enable_camera_time_conditioning:
+            self.camera_condition_proj = nn.Sequential(
+                nn.LayerNorm(self.camera_condition_dim),
+                nn.Linear(self.camera_condition_dim, self.inner_dim),
+                nn.SiLU(),
+                nn.Linear(self.inner_dim, self.inner_dim),
+            )
+            self.frame_time_proj = nn.Sequential(
+                nn.Linear(1, self.inner_dim),
+                nn.SiLU(),
+                nn.Linear(self.inner_dim, self.inner_dim),
+            )
+            self.physics_condition_proj = nn.Sequential(
+                nn.LayerNorm(self.physics_condition_dim),
+                nn.Linear(self.physics_condition_dim, self.inner_dim),
+                nn.SiLU(),
+                nn.Linear(self.inner_dim, self.inner_dim),
+            )
 
         self.blocks = nn.ModuleList(
             [
@@ -775,6 +819,59 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return None
         return torch.cat(embeddings, dim=0)
 
+    def _build_object_id_embedding(
+        self,
+        lengths: List[int],
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.enable_object_id_embedding or not lengths:
+            return None
+        ids = []
+        for object_idx, length in enumerate(lengths):
+            if length <= 0:
+                continue
+            object_id = object_idx % self.max_object_ids
+            ids.append(torch.full((length,), object_id, device=device, dtype=torch.long))
+        if not ids:
+            return None
+        return self.object_id_embedding(torch.cat(ids, dim=0))
+
+    def _build_instance_type_embedding(
+        self,
+        num_frames: Optional[Union[int, torch.Tensor]],
+        num_parts: Optional[Union[int, torch.Tensor]],
+        layout: str,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if not self.enable_instance_type_embedding:
+            return None
+        if layout != "frame_major":
+            raise NotImplementedError(f"Unsupported spatio-temporal layout: {layout}")
+
+        frame_counts = self._as_count_list(num_frames) if num_frames is not None else [1]
+        part_counts = self._as_count_list(num_parts, len(frame_counts)) if num_parts is not None else [1] * len(frame_counts)
+        if len(part_counts) == 1 and len(frame_counts) > 1:
+            part_counts = part_counts * len(frame_counts)
+        if len(frame_counts) != len(part_counts):
+            raise ValueError(
+                f"num_frames and num_parts must describe the same number of spatio-temporal objects, "
+                f"got {len(frame_counts)} and {len(part_counts)}"
+            )
+
+        role_ids = []
+        for frame_count, part_count in zip(frame_counts, part_counts):
+            if frame_count <= 0 or part_count <= 0:
+                continue
+            roles = torch.zeros((frame_count, part_count), device=device, dtype=torch.long)
+            if frame_count > 1 and part_count > 1:
+                roles[:, part_count - 1] = 1
+            elif frame_count > 1:
+                roles[:] = 1
+            role_ids.append(roles.reshape(-1))
+        if not role_ids:
+            return None
+        return self.instance_type_embedding(torch.cat(role_ids, dim=0))
+
     def _apply_spatial_temporal_mixing(
         self,
         block: DiTBlock,
@@ -866,6 +963,92 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return _spatial_pass(_temporal_pass(hidden_states))
         raise ValueError(f"Unsupported factorized mixing order: {order}")
 
+    def _apply_inference_emulation_mixing(
+        self,
+        block: DiTBlock,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor],
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        skip: Optional[torch.Tensor],
+        num_frames: Union[int, torch.Tensor],
+        num_parts: Union[int, torch.Tensor],
+        layout: str,
+        phase: str,
+    ) -> torch.Tensor:
+        frame_counts = self._as_count_list(num_frames)
+        part_counts = self._as_count_list(num_parts, len(frame_counts))
+        if len(part_counts) == 1 and len(frame_counts) > 1:
+            part_counts = part_counts * len(frame_counts)
+        if len(frame_counts) != len(part_counts):
+            raise ValueError(
+                f"num_frames and num_parts must describe the same number of spatio-temporal objects, "
+                f"got {len(frame_counts)} and {len(part_counts)}"
+            )
+        if layout != "frame_major":
+            raise NotImplementedError(f"Unsupported spatio-temporal layout: {layout}")
+
+        def _slice_optional(tensor: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
+            return None if tensor is None else tensor[start:end]
+
+        def _spatial_phase() -> torch.Tensor:
+            offset = 0
+            chunks = []
+            for frame_count, part_count in zip(frame_counts, part_counts):
+                total = frame_count * part_count
+                for frame_idx in range(frame_count):
+                    start = offset + frame_idx * part_count
+                    end = start + part_count
+                    chunks.append(block(
+                        hidden_states[start:end],
+                        encoder_hidden_states=_slice_optional(encoder_hidden_states, start, end),
+                        temb=temb[start:end],
+                        image_rotary_emb=image_rotary_emb,
+                        skip=_slice_optional(skip, start, end),
+                        attention_kwargs={"num_parts": part_count, "num_frames": 1},
+                    ))
+                offset += total
+            return torch.cat(chunks, dim=0)
+
+        def _temporal_phase() -> torch.Tensor:
+            offset = 0
+            chunks = []
+            for frame_count, part_count in zip(frame_counts, part_counts):
+                total = frame_count * part_count
+                obj_state = hidden_states[offset:offset + total].reshape(frame_count, part_count, *hidden_states.shape[1:])
+                obj_temb = temb[offset:offset + total].reshape(frame_count, part_count, *temb.shape[1:])
+                obj_enc = (
+                    None
+                    if encoder_hidden_states is None
+                    else encoder_hidden_states[offset:offset + total].reshape(
+                        frame_count, part_count, *encoder_hidden_states.shape[1:]
+                    )
+                )
+                obj_skip = (
+                    None
+                    if skip is None
+                    else skip[offset:offset + total].reshape(frame_count, part_count, *skip.shape[1:])
+                )
+                part_chunks = []
+                for part_idx in range(part_count):
+                    part_chunks.append(block(
+                        obj_state[:, part_idx].contiguous(),
+                        encoder_hidden_states=None if obj_enc is None else obj_enc[:, part_idx].contiguous(),
+                        temb=obj_temb[:, part_idx].contiguous(),
+                        image_rotary_emb=image_rotary_emb,
+                        skip=None if obj_skip is None else obj_skip[:, part_idx].contiguous(),
+                        attention_kwargs={"num_parts": 1, "num_frames": frame_count},
+                    ))
+                chunks.append(torch.stack(part_chunks, dim=1).reshape(total, *hidden_states.shape[1:]))
+                offset += total
+            return torch.cat(chunks, dim=0)
+
+        if phase == "spatial":
+            return _spatial_phase()
+        if phase == "temporal":
+            return _temporal_phase()
+        raise ValueError(f"Unsupported inference-emulation phase: {phase}")
+
     def forward(
         self,
         hidden_states: Optional[torch.Tensor],
@@ -873,6 +1056,10 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        camera_params: Optional[torch.Tensor] = None,
+        frame_time: Optional[torch.Tensor] = None,
+        has_camera: Optional[torch.Tensor] = None,
+        physics_context: Optional[torch.Tensor] = None,
         force_add_static_embedding: bool = False,
         force_add_dynamic_embedding: bool = False,
         return_dict: bool = True,
@@ -928,7 +1115,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         mixing_mode = attention_kwargs.get("mixing_mode", getattr(self, "mixing_mode", "current"))
         mixing_layout = attention_kwargs.get("layout", "frame_major")
         mixing_active = (
-            mixing_mode in {"spatial_temporal", "temporal_spatial", "joint"}
+            mixing_mode in {"spatial_temporal", "temporal_spatial", "joint", "inference_emulation"}
             and self._is_mixing_count(num_frames_kw)
             and self._is_mixing_count(num_parts_kw)
         )
@@ -968,6 +1155,69 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if used_embed is not None:
             hidden_states = hidden_states + used_embed.unsqueeze(dim=1)
+
+        if self.enable_instance_type_embedding:
+            type_embed = self._build_instance_type_embedding(
+                num_frames_kw,
+                num_parts_kw,
+                mixing_layout,
+                hidden_states.device,
+            )
+            if type_embed is not None and type_embed.shape[0] == hidden_states.shape[0]:
+                hidden_states = hidden_states + type_embed.unsqueeze(dim=1)
+
+        if self.enable_object_id_embedding:
+            object_lengths = None
+            if mixing_active:
+                frame_counts = self._as_count_list(num_frames_kw)
+                part_counts = self._as_count_list(num_parts_kw, len(frame_counts))
+                if len(part_counts) == 1 and len(frame_counts) > 1:
+                    part_counts = part_counts * len(frame_counts)
+                object_lengths = [f * p for f, p in zip(frame_counts, part_counts)]
+            elif num_frames_kw is not None and self._is_mixing_count(num_frames_kw):
+                object_lengths = self._as_count_list(num_frames_kw)
+            elif num_parts_kw is not None and self._is_mixing_count(num_parts_kw):
+                if isinstance(num_parts_kw, int):
+                    group_count = max(hidden_states.shape[0] // int(num_parts_kw), 1)
+                    object_lengths = [int(num_parts_kw)] * group_count
+                else:
+                    object_lengths = self._as_count_list(num_parts_kw)
+            if object_lengths is not None:
+                object_embed = self._build_object_id_embedding(object_lengths, hidden_states.device)
+                if object_embed is not None and object_embed.shape[0] == hidden_states.shape[0]:
+                    hidden_states = hidden_states + object_embed.unsqueeze(dim=1)
+
+        if self.enable_camera_time_conditioning:
+            cond = None
+            if camera_params is not None:
+                camera_params = camera_params.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                if camera_params.ndim == 1:
+                    camera_params = camera_params.unsqueeze(0)
+                if camera_params.shape[-1] != self.camera_condition_dim:
+                    raise ValueError(
+                        f"camera_params last dim must be {self.camera_condition_dim}, got {camera_params.shape[-1]}"
+                    )
+                cam_cond = self.camera_condition_proj(camera_params)
+                if has_camera is not None:
+                    cam_mask = has_camera.to(device=hidden_states.device, dtype=hidden_states.dtype).reshape(-1, 1)
+                    cam_cond = cam_cond * cam_mask
+                cond = cam_cond if cond is None else cond + cam_cond
+            if frame_time is not None:
+                frame_time = frame_time.to(device=hidden_states.device, dtype=hidden_states.dtype).reshape(-1, 1)
+                time_cond = self.frame_time_proj(frame_time)
+                cond = time_cond if cond is None else cond + time_cond
+            if physics_context is not None:
+                physics_context = physics_context.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                if physics_context.ndim == 1:
+                    physics_context = physics_context.unsqueeze(0)
+                if physics_context.shape[-1] != self.physics_condition_dim:
+                    raise ValueError(
+                        f"physics_context last dim must be {self.physics_condition_dim}, got {physics_context.shape[-1]}"
+                    )
+                phys_cond = self.physics_condition_proj(physics_context)
+                cond = phys_cond if cond is None else cond + phys_cond
+            if cond is not None:
+                hidden_states = hidden_states + cond.unsqueeze(1)
 
         # Add static or dynamic embedding depending on kwargs
         use_static_embed = (not mixing_active) and self.enable_static_embedding and (num_parts_kw is not None) and (
@@ -1037,7 +1287,79 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 dynamic_embed = self.dynamic_embedding_per_block(torch.tensor([layer] * hidden_states.shape[0], device=hidden_states.device))
                 hidden_states = hidden_states + dynamic_embed.unsqueeze(dim=1)
 
-            if mixing_active and mixing_mode in {"spatial_temporal", "temporal_spatial"} and (layer in self.global_attn_block_ids):
+            if mixing_active and mixing_mode == "inference_emulation" and (layer in self.global_attn_block_ids):
+                if layer in self.spatial_global_attn_block_ids:
+                    emulation_phase = "spatial"
+                elif layer in self.temporal_global_attn_block_ids:
+                    emulation_phase = "temporal"
+                else:
+                    emulation_phase = None
+
+                if emulation_phase is None:
+                    hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states=input_encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        skip=skip,
+                        attention_kwargs=input_attention_kwargs,
+                    )
+                elif self.training and self.gradient_checkpointing:
+                    skip_is_none = skip is None
+                    skip_input = hidden_states.new_empty(0) if skip_is_none else skip
+
+                    def custom_inference_emulation_mixing(
+                        local_hidden_states: torch.Tensor,
+                        local_temb: torch.Tensor,
+                        local_encoder_hidden_states: Optional[torch.Tensor],
+                        local_skip: torch.Tensor,
+                        *,
+                        local_block: DiTBlock = block,
+                        local_image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = image_rotary_emb,
+                        local_num_frames: Union[int, torch.Tensor] = num_frames_kw,
+                        local_num_parts: Union[int, torch.Tensor] = num_parts_kw,
+                        local_layout: str = mixing_layout,
+                        local_phase: str = emulation_phase,
+                        local_skip_is_none: bool = skip_is_none,
+                    ) -> torch.Tensor:
+                        return self._apply_inference_emulation_mixing(
+                            block=local_block,
+                            hidden_states=local_hidden_states,
+                            encoder_hidden_states=local_encoder_hidden_states,
+                            temb=local_temb,
+                            image_rotary_emb=local_image_rotary_emb,
+                            skip=None if local_skip_is_none else local_skip,
+                            num_frames=local_num_frames,
+                            num_parts=local_num_parts,
+                            layout=local_layout,
+                            phase=local_phase,
+                        )
+
+                    ckpt_kwargs: Dict[str, Any] = (
+                        {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    )
+                    hidden_states = torch.utils.checkpoint.checkpoint(
+                        custom_inference_emulation_mixing,
+                        hidden_states,
+                        temb,
+                        input_encoder_hidden_states,
+                        skip_input,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    hidden_states = self._apply_inference_emulation_mixing(
+                        block=block,
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=input_encoder_hidden_states,
+                        temb=temb,
+                        image_rotary_emb=image_rotary_emb,
+                        skip=skip,
+                        num_frames=num_frames_kw,
+                        num_parts=num_parts_kw,
+                        layout=mixing_layout,
+                        phase=emulation_phase,
+                    )
+            elif mixing_active and mixing_mode in {"spatial_temporal", "temporal_spatial"} and (layer in self.global_attn_block_ids):
                 if self.training and self.gradient_checkpointing:
                     skip_is_none = skip is None
                     skip_input = hidden_states.new_empty(0) if skip_is_none else skip
@@ -1149,6 +1471,10 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         encoder_hidden_states_masked: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
+        camera_params: Optional[torch.Tensor] = None,
+        frame_time: Optional[torch.Tensor] = None,
+        has_camera: Optional[torch.Tensor] = None,
+        physics_context: Optional[torch.Tensor] = None,
         force_add_static_embedding: bool = False,
         force_add_dynamic_embedding: bool = False,
         return_dict: bool = True,
@@ -1230,6 +1556,38 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         if used_embed is not None:
             hidden_states = hidden_states + used_embed.unsqueeze(dim=1)
+
+        if self.enable_camera_time_conditioning:
+            cond = None
+            if camera_params is not None:
+                camera_params = camera_params.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                if camera_params.ndim == 1:
+                    camera_params = camera_params.unsqueeze(0)
+                if camera_params.shape[-1] != self.camera_condition_dim:
+                    raise ValueError(
+                        f"camera_params last dim must be {self.camera_condition_dim}, got {camera_params.shape[-1]}"
+                    )
+                cam_cond = self.camera_condition_proj(camera_params)
+                if has_camera is not None:
+                    cam_mask = has_camera.to(device=hidden_states.device, dtype=hidden_states.dtype).reshape(-1, 1)
+                    cam_cond = cam_cond * cam_mask
+                cond = cam_cond if cond is None else cond + cam_cond
+            if frame_time is not None:
+                frame_time = frame_time.to(device=hidden_states.device, dtype=hidden_states.dtype).reshape(-1, 1)
+                time_cond = self.frame_time_proj(frame_time)
+                cond = time_cond if cond is None else cond + time_cond
+            if physics_context is not None:
+                physics_context = physics_context.to(device=hidden_states.device, dtype=hidden_states.dtype)
+                if physics_context.ndim == 1:
+                    physics_context = physics_context.unsqueeze(0)
+                if physics_context.shape[-1] != self.physics_condition_dim:
+                    raise ValueError(
+                        f"physics_context last dim must be {self.physics_condition_dim}, got {physics_context.shape[-1]}"
+                    )
+                phys_cond = self.physics_condition_proj(physics_context)
+                cond = phys_cond if cond is None else cond + phys_cond
+            if cond is not None:
+                hidden_states = hidden_states + cond.unsqueeze(1)
 
         # Add static or dynamic embedding depending on kwargs
         use_static_embed = self.enable_static_embedding and (num_parts_kw is not None) and (

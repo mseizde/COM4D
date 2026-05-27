@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--render-samples", type=int, default=32)
     ap.add_argument("--blender-bin", type=Path, default=DEFAULT_BLENDER)
     ap.add_argument("--blender-device", choices=("AUTO", "CPU", "GPU"), default="CPU")
+    ap.add_argument("--save-depth", action="store_true", help="Render GT depth EXR files for generated sequences.")
+    ap.add_argument("--save-normals", action="store_true", help="Render GT normal EXR files for generated sequences.")
+    ap.add_argument("--position-jitter", type=float, default=0.0)
+    ap.add_argument("--height-jitter", type=float, default=0.0)
+    ap.add_argument("--velocity-jitter", type=float, default=0.0)
+    ap.add_argument("--mass-jitter", type=float, default=0.0)
     ap.add_argument("--force-generate", action="store_true", help="Regenerate the raw GT sequence.")
     ap.add_argument("--skip-generation", action="store_true", help="Require an existing raw GT sequence.")
     ap.add_argument("--input-mode", choices=("symlink", "copy"), default="copy")
@@ -148,33 +154,43 @@ def generate_gt(args: argparse.Namespace, raw_dir: Path) -> None:
         raise FileNotFoundError(f"GT sequence does not exist: {raw_dir}")
 
     raw_dir.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        [
-            sys.executable,
-            TWO_BALL_PIPELINE,
-            "--output-dir",
-            raw_dir,
-            "--blender-bin",
-            args.blender_bin,
-            "--num-frames",
-            args.num_frames,
-            "--seed",
-            args.seed,
-            "--random-view",
-            "--view-seed",
-            args.seed,
-            "--random-light",
-            "--light-seed",
-            args.seed,
-            "--resolution",
-            args.resolution,
-            "--samples",
-            args.render_samples,
-            "--device",
-            args.blender_device,
-        ],
-        dry_run=args.dry_run,
-    )
+    cmd = [
+        sys.executable,
+        TWO_BALL_PIPELINE,
+        "--output-dir",
+        raw_dir,
+        "--blender-bin",
+        args.blender_bin,
+        "--num-frames",
+        args.num_frames,
+        "--seed",
+        args.seed,
+        "--random-view",
+        "--view-seed",
+        args.seed,
+        "--random-light",
+        "--light-seed",
+        args.seed,
+        "--resolution",
+        args.resolution,
+        "--samples",
+        args.render_samples,
+        "--device",
+        args.blender_device,
+        "--position-jitter",
+        args.position_jitter,
+        "--height-jitter",
+        args.height_jitter,
+        "--velocity-jitter",
+        args.velocity_jitter,
+        "--mass-jitter",
+        args.mass_jitter,
+    ]
+    if args.save_depth:
+        cmd.append("--save-depth")
+    if args.save_normals:
+        cmd.append("--save-normals")
+    run(cmd, dry_run=args.dry_run)
 
 
 def prepare_input(args: argparse.Namespace, raw_dir: Path, input_dir: Path) -> None:

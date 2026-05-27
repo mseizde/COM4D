@@ -9,23 +9,38 @@ START=${2:-0}
 END=${3:-100}
 MASK_PROMPT=${4:-"person."}
 MASK_STATIC_PROMPT=${5:-""} # e.g., "table., chair., tree."
+OUTPUT_PATH=${6:-}
 
 echo "Processing video: $VIDEO_PATH from frame $START to $END with mask prompt '$MASK_PROMPT' and static mask prompt '$MASK_STATIC_PROMPT'"
 
-VIDEO_NAME=$(basename "$VIDEO_PATH" | cut -d. -f1)
-OUTPUT_PATH=assets/${VIDEO_NAME}
+if [[ -z "$OUTPUT_PATH" ]]; then
+  VIDEO_DIR=$(dirname "$VIDEO_PATH")
+  VIDEO_NAME=$(basename "$VIDEO_PATH" | cut -d. -f1)
+  if [[ "$VIDEO_DIR" == "." ]]; then
+    OUTPUT_PATH=assets/${VIDEO_NAME}
+  else
+    OUTPUT_PATH=${VIDEO_DIR}
+  fi
+fi
+
 FRAMES_PATH=${OUTPUT_PATH}/frames
 FRAMES_NO_BG_PATH=${OUTPUT_PATH}/frames_no_bg
 MASKS_PATH=${OUTPUT_PATH}/masks
 MASKS_STATIC_PATH=${OUTPUT_PATH}/masks_static
 
-mkdir -p $FRAMES_PATH
-mkdir -p $FRAMES_NO_BG_PATH
-mkdir -p $MASKS_PATH
-mkdir -p $MASKS_STATIC_PATH
+PRESERVE_EXISTING=${PRESERVE_EXISTING:-0}
+if [[ "$PRESERVE_EXISTING" != "1" ]]; then
+  echo "Clearing generated output directories under $OUTPUT_PATH"
+  rm -rf "$FRAMES_PATH" "$FRAMES_NO_BG_PATH" "$MASKS_PATH" "$MASKS_STATIC_PATH"
+fi
+
+mkdir -p "$FRAMES_PATH"
+mkdir -p "$FRAMES_NO_BG_PATH"
+mkdir -p "$MASKS_PATH"
+mkdir -p "$MASKS_STATIC_PATH"
 
 echo "Extracting frames from video..."
-python scripts/inference/extract_frames.py $VIDEO_PATH $FRAMES_PATH --start $START --end $END
+python scripts/inference/extract_frames.py "$VIDEO_PATH" "$FRAMES_PATH" --start "$START" --end "$END"
 
 echo "Padding frames to square dimensions..."
 python scripts/inference/pad_to_square.py \
@@ -33,7 +48,7 @@ python scripts/inference/pad_to_square.py \
   --output_dir "$FRAMES_PATH"
 
 echo "Resizing frames to 768x768"
-python scripts/inference/resize_images.py $FRAMES_PATH $FRAMES_PATH \
+python scripts/inference/resize_images.py "$FRAMES_PATH" "$FRAMES_PATH" \
     --height 768 --width 768 --overwrite
 
 echo "Extracting masks using Grounded-SAM... Prompt: $MASK_PROMPT"

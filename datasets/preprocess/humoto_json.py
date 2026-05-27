@@ -38,6 +38,8 @@ import argparse
 import json
 import re
 import sys
+
+import numpy as np
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
@@ -137,12 +139,22 @@ def load_yaml_metadata(path: Path) -> Dict[str, Any]:
     return metadata
 
 
+def _count_explicit_parts(points_path: Path) -> int:
+    try:
+        data = np.load(points_path, allow_pickle=True).item()
+    except Exception:
+        return 0
+    parts = data.get("parts", None) if isinstance(data, dict) else None
+    return len(parts) if isinstance(parts, list) else 0
+
+
 def build_index(
     preprocessed_root: Path,
     render_root: Path,
     yaml_root: Path,
     strict: bool = False,
     verbose: bool = True,
+    min_explicit_parts: int = 0,
 ) -> Dict[str, list[dict[str, Any]]]:
     preproc_map = collect_preproc(preprocessed_root.resolve(), verbose=verbose)
     render_map = collect_render(render_root.resolve(), verbose=verbose)
@@ -173,9 +185,14 @@ def build_index(
     grouped: Dict[str, list[dict[str, Any]]] = {}
     metadata_cache: Dict[str, Dict[str, Any]] = {}
     missing_yaml: set[str] = set()
+    skipped_for_parts = 0
 
     for action_id, frame_int in common_keys:
         frame = f"{frame_int:04d}"
+        if min_explicit_parts > 0 and _count_explicit_parts(preproc_map[(action_id, frame)]) < min_explicit_parts:
+            skipped_for_parts += 1
+            continue
+
         metadata = metadata_cache.get(action_id)
         if metadata is None:
             yaml_path = yaml_files.get(action_id)
@@ -209,8 +226,13 @@ def build_index(
 
     if verbose and missing_yaml:
         print(f"[WARN] Missing YAML metadata for {len(missing_yaml)} actions", file=sys.stderr)
+    if verbose and min_explicit_parts > 0:
+        print(
+            f"[INFO] Skipped {skipped_for_parts} frame(s) with fewer than {min_explicit_parts} explicit parts.",
+            file=sys.stderr,
+        )
 
-    return {key: grouped[key] for key in sorted(grouped)}
+    return {key: grouped[key] for key in sorted(grouped) if grouped[key]}
 
 
 def positive_path(path: str) -> Path:
@@ -224,6 +246,12 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
     parser.add_argument("--yaml-root", type=positive_path, required=True)
     parser.add_argument("--output", "-o", type=positive_path, required=True)
     parser.add_argument("--strict", action="store_true", help="Error on missing frame counterparts or YAML metadata.")
+    parser.add_argument(
+        "--min-explicit-parts",
+        type=int,
+        default=0,
+        help="Only include frames whose points.npy has at least this many entries in data['parts'].",
+    )
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON.")
     parser.add_argument("--quiet", action="store_true", help="Reduce logging.")
     args = parser.parse_args(argv)
@@ -234,6 +262,7 @@ def main(argv: Optional[Iterable[str]] = None) -> None:
         yaml_root=args.yaml_root,
         strict=args.strict,
         verbose=not args.quiet,
+        min_explicit_parts=args.min_explicit_parts,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

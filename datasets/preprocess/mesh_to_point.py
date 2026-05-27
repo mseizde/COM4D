@@ -97,9 +97,78 @@ def output_already_processed(output_root: str, folder_name: str) -> bool:
     return os.path.isfile(points_path) and os.path.isfile(meta_path)
 
 
+def _copy_mesh(mesh_obj: trimesh.Trimesh) -> trimesh.Trimesh:
+    copied = mesh_obj.copy()
+    if not isinstance(copied, trimesh.Trimesh):
+        copied = copied.to_mesh()
+    return copied
+
+
+def _concat_meshes(meshes: list[trimesh.Trimesh]) -> trimesh.Trimesh | None:
+    meshes = [m for m in meshes if m is not None and len(getattr(m, "vertices", [])) > 0 and len(getattr(m, "faces", [])) > 0]
+    if not meshes:
+        return None
+    if len(meshes) == 1:
+        return _copy_mesh(meshes[0])
+    return trimesh.util.concatenate([_copy_mesh(m) for m in meshes])
+
+
+def _scene_named_meshes(scene: trimesh.Scene) -> list[tuple[str, trimesh.Trimesh]]:
+    items = []
+    if not hasattr(scene, "geometry"):
+        return items
+    for name, geom in scene.geometry.items():
+        if isinstance(geom, trimesh.Trimesh):
+            items.append((str(name), geom))
+    return items
+
+
+def _is_humoto_actor_name(name: str) -> bool:
+    lower = name.lower()
+    return (
+        lower.startswith("mixamorig")
+        or "mesh_template" in lower
+        or "mesh_eyes" in lower
+        or lower.startswith("body")
+        or lower.startswith("character")
+    )
+
+
+def humoto_actor_scene_parts(scene: trimesh.Scene, num_part_pc: int = 204800) -> list[dict]:
+    named_meshes = _scene_named_meshes(scene)
+    actor_meshes = [mesh for name, mesh in named_meshes if _is_humoto_actor_name(name)]
+    scene_meshes = [mesh for name, mesh in named_meshes if not _is_humoto_actor_name(name)]
+
+    grouped_meshes = []
+    actor = _concat_meshes(actor_meshes)
+    if actor is not None:
+        grouped_meshes.append(actor)
+    objects = _concat_meshes(scene_meshes)
+    if objects is not None:
+        grouped_meshes.append(objects)
+
+    if len(grouped_meshes) < 2:
+        return []
+    return [mesh_to_surface(mesh, num_pc=num_part_pc, return_dict=True) for mesh in grouped_meshes]
+
+
+def raw_scene_parts(scene: trimesh.Scene, max_saved_parts: int = 16) -> list[dict]:
+    if not hasattr(scene, "geometry"):
+        return []
+    num_parts = len(scene.geometry)
+    if num_parts <= 1 or (max_saved_parts > 0 and num_parts > max_saved_parts):
+        return []
+    parts = scene_to_parts(
+        scene,
+        return_type="point",
+        normalize=False,
+    )
+    return parts[:max_saved_parts] if max_saved_parts > 0 else parts
+
+
 def _process_task(args):
     """Wrapper for parallel execution. Returns (ok, path, out_dir_name, error_msg, action)."""
-    fpath, output_root, out_name, reuse_dir, normalize = args
+    fpath, output_root, out_name, reuse_dir, normalize, part_mode, max_saved_parts = args
     folder_name = out_name if out_name else os.path.splitext(os.path.basename(fpath))[0]
     try:
         if output_already_processed(output_root, folder_name):
@@ -113,6 +182,8 @@ def _process_task(args):
             output_root,
             out_dir_name=out_name,
             normalize=bool(normalize),
+            part_mode=part_mode,
+            max_saved_parts=int(max_saved_parts),
         )
         action = "processed" if processed else "skipped"
         return True, fpath, folder_name, None, action
@@ -125,6 +196,8 @@ def process_one(
     output_root: str,
     out_dir_name: str | None = None,
     normalize: bool = False,
+    part_mode: str = "raw",
+    max_saved_parts: int = 16,
 ) -> bool:
     """Process a single GLB mesh and write outputs into
     `<output_root>/<out_dir_name or mesh_name>/points.npy` and `num_parts.json`.
@@ -154,16 +227,20 @@ def process_one(
     num_parts = len(mesh.geometry) if hasattr(mesh, "geometry") else 1
     config["num_parts"] = num_parts
 
-    if num_parts > 1 and num_parts <= 16 and hasattr(mesh, "geometry"):
-        parts = scene_to_parts(
-            mesh,
-            return_type="point",
-            normalize=False,
-        )
+    if part_mode == "humoto_actor_scene" and hasattr(mesh, "geometry"):
+        parts = humoto_actor_scene_parts(mesh)
         scene_like = mesh
+        config["part_mode"] = part_mode
+        config["num_parts"] = len(parts) if parts else num_parts
+    elif part_mode == "raw" and hasattr(mesh, "geometry"):
+        parts = raw_scene_parts(mesh, max_saved_parts=max_saved_parts)
+        scene_like = mesh
+        config["part_mode"] = part_mode
+        config["max_saved_parts"] = max_saved_parts
     else:
         parts = []
         scene_like = mesh
+        config["part_mode"] = part_mode
 
     # Convert to geometry for surface sampling
     mesh_geom = scene_like.to_geometry() if hasattr(scene_like, "to_geometry") else scene_like
@@ -210,6 +287,22 @@ if __name__ == "__main__":
         default=0,
         help="Whether to normalize the mesh during processing.",
     )
+    parser.add_argument(
+        "--part-mode",
+        choices=["raw", "humoto_actor_scene"],
+        default="raw",
+        help=(
+            "How to save explicit parts. raw preserves per-geometry parts only when "
+            "the count is within --max-saved-parts. humoto_actor_scene saves two "
+            "stable parts: actor meshes and all non-actor scene/object meshes."
+        ),
+    )
+    parser.add_argument(
+        "--max-saved-parts",
+        type=int,
+        default=16,
+        help="Maximum raw scene geometries to save as explicit parts; <=0 means no limit.",
+    )
     args = parser.parse_args()
 
     input_path = args.input
@@ -254,7 +347,7 @@ if __name__ == "__main__":
                 # Sequential with progress bar
                 for fpath, out_name in tqdm(tasks, total=len(tasks), desc="Processing GLBs"):
                     ok, _, folder_name, err, action = _process_task(
-                        (fpath, output_path, out_name, args.reuse_dir, args.normalize)
+                        (fpath, output_path, out_name, args.reuse_dir, args.normalize, args.part_mode, args.max_saved_parts)
                     )
                     if not ok:
                         print(f"[WARN] Skipping {fpath} due to error: {err}")
@@ -264,7 +357,10 @@ if __name__ == "__main__":
                         print(f"[SKIP] {fpath} -> {folder_name} already processed.")
             else:
                 # Parallel with processes using map (lower overhead) and chunking
-                task_args = [(f, output_path, n, args.reuse_dir, args.normalize) for (f, n) in tasks]
+                task_args = [
+                    (f, output_path, n, args.reuse_dir, args.normalize, args.part_mode, args.max_saved_parts)
+                    for (f, n) in tasks
+                ]
                 total = len(task_args)
                 with concurrent.futures.ProcessPoolExecutor(max_workers=worker_count) as ex:
                     for ok, fpath, out_name, err, action in tqdm(
@@ -288,6 +384,8 @@ if __name__ == "__main__":
             output_path,
             out_dir_name=None,
             normalize=bool(args.normalize),
+            part_mode=args.part_mode,
+            max_saved_parts=args.max_saved_parts,
         )
         if not processed:
             print(f"[SKIP] {input_path} already processed.")

@@ -83,6 +83,79 @@ def _count_surface_parts(surface_path: str) -> int:
     return 1
 
 
+def _is_spatiotemporal_part_count_error(exc: Exception) -> bool:
+    return (
+        isinstance(exc, ValueError)
+        and "Physics/spatio-temporal grid expected" in str(exc)
+    )
+
+
+def _data_config_key(data_config: dict) -> str:
+    if not data_config:
+        return ""
+    if "object_key" in data_config:
+        return str(data_config["object_key"])
+    if "frames" in data_config and len(data_config["frames"]) > 0:
+        return str(data_config["frames"][0].get("surface_path", ""))
+    return str(data_config.get("surface_path", ""))
+
+
+def _as_float_tensor(value, shape: tuple[int, ...]) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.shape == shape:
+        return torch.from_numpy(arr)
+    flat = arr.reshape(-1)
+    expected = int(np.prod(shape))
+    if flat.size == expected:
+        return torch.from_numpy(flat.reshape(shape))
+    return None
+
+
+def _camera_condition_from_frame(frame: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    intr = _as_float_tensor(
+        frame.get("intrinsics", frame.get("K", frame.get("camera_intrinsics"))),
+        (3, 3),
+    )
+    c2w = _as_float_tensor(
+        frame.get(
+            "camera_to_world",
+            frame.get("c2w", frame.get("world_from_camera", frame.get("transform_matrix"))),
+        ),
+        (4, 4),
+    )
+    w2c = _as_float_tensor(
+        frame.get(
+            "world_to_camera",
+            frame.get("w2c", frame.get("camera_from_world", frame.get("extrinsics_camera_from_world"))),
+        ),
+        (4, 4),
+    )
+    if c2w is None and w2c is not None:
+        c2w = torch.linalg.inv(w2c.float())
+    if intr is None or c2w is None:
+        return torch.zeros(25, dtype=torch.float32), torch.tensor(False)
+    return torch.cat([intr.float().reshape(-1), c2w.float().reshape(-1)], dim=0), torch.tensor(True)
+
+
+def _frame_time_from_frame(frame: dict, fallback_index: int, sequence_len: int) -> torch.Tensor:
+    for key in ("tau", "frame_time", "time", "timestamp"):
+        if key in frame:
+            try:
+                return torch.tensor(float(frame[key]), dtype=torch.float32)
+            except (TypeError, ValueError):
+                pass
+    frame_idx = frame.get("frame_index", frame.get("frame", fallback_index))
+    try:
+        frame_idx = float(frame_idx)
+    except (TypeError, ValueError):
+        frame_idx = float(fallback_index)
+    denom = max(float(sequence_len - 1), 1.0)
+    return torch.tensor(frame_idx / denom, dtype=torch.float32)
+
+
+
 class ObjaversePartDataset(torch.utils.data.Dataset):
     def __init__(
         self, 
@@ -107,6 +180,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.spatiotemporal_grid = bool(configs['dataset'].get('spatiotemporal_grid', False))
         configured_num_spatial_parts = configs['dataset'].get('num_spatial_parts', None)
         self.num_spatial_parts = int(configured_num_spatial_parts) if configured_num_spatial_parts is not None else None
+        self.max_spatiotemporal_grid_retries = int(configs['dataset'].get('max_spatiotemporal_grid_retries', 64))
+        self._bad_spatiotemporal_configs = set()
 
         self.rotating_ratio = configs['dataset'].get('rotating_ratio', 0.0)
         self.rotating_degree = configs['dataset'].get('rotating_degree', 10.0)
@@ -149,10 +224,10 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                         ip = fr.get('image_path', None)
                         if sp is None or ip is None:
                             continue
-                        norm_frames.append({
-                            'surface_path': sp,
-                            'image_path': ip,
-                        })
+                        norm_frame = dict(fr)
+                        norm_frame['surface_path'] = sp
+                        norm_frame['image_path'] = ip
+                        norm_frames.append(norm_frame)
                     if len(norm_frames) == 0:
                         continue
                     new_format_objects.append({
@@ -257,15 +332,27 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             if len(valid_starts) == 0:
                 # Fallback: allow any start, still step by 2 to preserve no-jump guarantee
                 valid_starts = list(range(0, max_start + 1))
+            stride = int(self.configs['dataset'].get('temporal_stride', 2))
+            stride_choices = self.configs['dataset'].get('temporal_stride_choices', None)
+            if stride_choices:
+                stride = int(random.choice(list(stride_choices)))
+            stride = max(stride, 1)
+            max_start = max((F - 1) - stride * (k - 1), 0)
+            valid_starts = list(range(0, max_start + 1, stride)) or [0]
             s = random.choice(valid_starts)
-            chosen = [frames[s + 2 * i] for i in range(k)]
+            chosen = [frames[min(s + stride * i, F - 1)] for i in range(k)]
             # Load surfaces per chosen frame
             part_surfaces = []
             images_list = []
-            for fr in chosen:
+            camera_list = []
+            has_camera_list = []
+            frame_time_list = []
+            for local_idx, fr in enumerate(chosen):
                 surface_path = resolve_path(fr['surface_path'])
                 image_path = resolve_path(fr['image_path'])
                 surface_data = np.load(surface_path, allow_pickle=True).item()
+                camera_condition, has_camera = _camera_condition_from_frame(fr)
+                frame_time = _frame_time_from_frame(fr, s + stride * local_idx, F)
                 if self.spatiotemporal_grid:
                     expected_parts = int(data_config.get('num_spatial_parts', self.num_spatial_parts or 1))
                     frame_surfaces = _extract_part_surface_arrays(
@@ -280,8 +367,13 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                             "or set dataset_physics.num_spatial_parts to match the data."
                         )
                     part_surfaces.append(frame_surfaces)
+                    repeat_count = frame_surfaces.shape[0]
                 else:
                     part_surfaces.append(_extract_single_surface_array(surface_data, self.surface_num_points))
+                    repeat_count = 1
+                camera_list.extend([camera_condition] * repeat_count)
+                has_camera_list.extend([has_camera] * repeat_count)
+                frame_time_list.extend([frame_time] * repeat_count)
                 # Load image per frame
                 pil_image = Image.open(image_path)
                 if getattr(pil_image, "is_animated", False):
@@ -312,6 +404,9 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             out = {
                 "images": images,
                 "part_surfaces": part_surfaces,
+                "camera_params": torch.stack(camera_list, dim=0),
+                "has_camera": torch.stack(has_camera_list, dim=0).bool(),
+                "frame_time": torch.stack(frame_time_list, dim=0),
             }
             if self.spatiotemporal_grid:
                 out["num_frames"] = torch.LongTensor([k])
@@ -390,8 +485,32 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         data_config = self.data_configs[idx]
         cache = getattr(self, "configs", {}).get("dataset_cache", {})
         prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
-        data = self._get_data_by_config(data_config)
-        return data
+        try:
+            return self._get_data_by_config(data_config)
+        except Exception as exc:
+            if not (self.spatiotemporal_grid and _is_spatiotemporal_part_count_error(exc)):
+                raise
+
+            target_num_parts = data_config.get("num_parts", None)
+            self._bad_spatiotemporal_configs.add(_data_config_key(data_config))
+            for _ in range(max(self.max_spatiotemporal_grid_retries, 0)):
+                replacement = random.choice(self.data_configs)
+                if not replacement or replacement.get("num_parts", None) != target_num_parts:
+                    continue
+                if _data_config_key(replacement) in self._bad_spatiotemporal_configs:
+                    continue
+                try:
+                    return self._get_data_by_config(replacement)
+                except Exception as replacement_exc:
+                    if not _is_spatiotemporal_part_count_error(replacement_exc):
+                        raise
+                    self._bad_spatiotemporal_configs.add(_data_config_key(replacement))
+
+            raise RuntimeError(
+                f"Could not replace malformed spatio-temporal physics sample after "
+                f"{self.max_spatiotemporal_grid_retries} retries; num_parts={target_num_parts}. "
+                "The physics data likely needs preprocessing with explicit per-part surfaces."
+            ) from exc
         
 class BatchedObjaversePartDataset(ObjaversePartDataset):
     def __init__(
@@ -470,8 +589,32 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
             return {}
         cache = getattr(self, "configs", {}).get("dataset_cache", {})
         prefetch_data_configs(self.data_configs, idx + 1, int(cache.get("prefetch_window", 0)))
-        data = self._get_data_by_config(data_config)
-        return data
+        try:
+            return self._get_data_by_config(data_config)
+        except Exception as exc:
+            if not (self.spatiotemporal_grid and _is_spatiotemporal_part_count_error(exc)):
+                raise
+
+            target_num_parts = data_config.get("num_parts", None)
+            self._bad_spatiotemporal_configs.add(_data_config_key(data_config))
+            for _ in range(max(self.max_spatiotemporal_grid_retries, 0)):
+                replacement = random.choice(self.data_configs)
+                if not replacement or replacement.get("num_parts", None) != target_num_parts:
+                    continue
+                if _data_config_key(replacement) in self._bad_spatiotemporal_configs:
+                    continue
+                try:
+                    return self._get_data_by_config(replacement)
+                except Exception as replacement_exc:
+                    if not _is_spatiotemporal_part_count_error(replacement_exc):
+                        raise
+                    self._bad_spatiotemporal_configs.add(_data_config_key(replacement))
+
+            raise RuntimeError(
+                f"Could not replace malformed spatio-temporal physics sample after "
+                f"{self.max_spatiotemporal_grid_retries} retries; num_parts={target_num_parts}. "
+                "The physics data likely needs preprocessing with explicit per-part surfaces."
+            ) from exc
     
     def collate_fn(self, batch):
         batch = [data for data in batch if len(data) > 0]
@@ -486,6 +629,10 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
             "part_surfaces": surfaces,
             "num_parts": num_parts,
         }
+        if all("camera_params" in data for data in batch):
+            out["camera_params"] = torch.cat([data["camera_params"] for data in batch], dim=0)
+            out["has_camera"] = torch.cat([data["has_camera"] for data in batch], dim=0)
+            out["frame_time"] = torch.cat([data["frame_time"] for data in batch], dim=0)
         if all("num_frames" in data and "num_spatial_parts" in data for data in batch):
             out["num_frames"] = torch.cat([data["num_frames"] for data in batch], dim=0)
             out["num_spatial_parts"] = torch.cat([data["num_spatial_parts"] for data in batch], dim=0)
