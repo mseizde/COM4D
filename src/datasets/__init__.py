@@ -16,12 +16,14 @@ class MultiEpochsDataLoader(torch.utils.data.DataLoader):
         else:
             self.batch_sampler = _RepeatSampler(self.batch_sampler)
         self._DataLoader__initialized = True
-        self.iterator = super().__iter__()
+        self.iterator = None
 
     def __len__(self):
         return len(self.sampler) if self.batch_sampler is None else len(self.batch_sampler.sampler)
 
     def __iter__(self):
+        if self.iterator is None:
+            self.iterator = super().__iter__()
         for i in range(len(self)):
             yield next(self.iterator)
 

@@ -30,6 +30,7 @@ import wandb
 from tqdm import tqdm
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as tF
 import accelerate
@@ -84,6 +85,7 @@ from src.utils.render_utils import (
 from src.utils.metric_utils import compute_cd_and_f_score_in_training
 import copy
 from src.models.attention_processor import (
+    trace_sequence_parallel_event,
     PartCrafterAttnProcessor,
     PartFrameCrafterAttnProcessor,
     TripoSGAttnProcessor2_0,
@@ -419,6 +421,164 @@ def _sample_surface_queries(
     points = sampled[..., :3].float().detach()
     normals = tF.normalize(sampled[..., 3:6].float().detach(), dim=-1, eps=1e-6)
     return points, normals
+
+
+def _temporal_grid_pairs(
+    num_parts: torch.Tensor,
+    num_frames: torch.Tensor | None,
+    num_spatial_parts: torch.Tensor | None,
+    *,
+    fallback_consecutive: bool,
+    skip_first_spatial_parts: int = 0,
+) -> tuple[list[tuple[int, int]], list[tuple[int, int, int]], int]:
+    pairs: list[tuple[int, int]] = []
+    triples: list[tuple[int, int, int]] = []
+    valid_objects = 0
+    ptr = 0
+    counts = [int(v) for v in num_parts.detach().cpu().tolist()]
+    frame_counts = [int(v) for v in num_frames.detach().cpu().tolist()] if num_frames is not None else []
+    spatial_counts = [int(v) for v in num_spatial_parts.detach().cpu().tolist()] if num_spatial_parts is not None else []
+
+    for obj_idx, count in enumerate(counts):
+        if count <= 1:
+            ptr += count
+            continue
+        frames = frame_counts[obj_idx] if obj_idx < len(frame_counts) else 0
+        spatial = spatial_counts[obj_idx] if obj_idx < len(spatial_counts) else 0
+        if frames > 1 and spatial > 0 and frames * spatial == count:
+            first_spatial = min(max(int(skip_first_spatial_parts), 0), spatial)
+            if first_spatial < spatial:
+                valid_objects += 1
+            for spatial_idx in range(first_spatial, spatial):
+                seq = [ptr + frame_idx * spatial + spatial_idx for frame_idx in range(frames)]
+                pairs.extend((seq[i], seq[i + 1]) for i in range(len(seq) - 1))
+                triples.extend((seq[i], seq[i + 1], seq[i + 2]) for i in range(len(seq) - 2))
+        elif fallback_consecutive:
+            start = ptr + min(max(int(skip_first_spatial_parts), 0), count)
+            if start < ptr + count:
+                valid_objects += 1
+            seq = list(range(start, ptr + count))
+            pairs.extend((seq[i], seq[i + 1]) for i in range(len(seq) - 1))
+            triples.extend((seq[i], seq[i + 1], seq[i + 2]) for i in range(len(seq) - 2))
+        ptr += count
+
+    return pairs, triples, valid_objects
+
+
+def _sample_bbox_aligned_surface_queries(
+    source_surfaces: torch.Tensor,
+    target_surfaces: torch.Tensor,
+    num_points: int,
+) -> torch.Tensor:
+    total_points = source_surfaces.shape[1]
+    count = min(max(int(num_points), 1), total_points)
+    indices = torch.randint(0, total_points, (source_surfaces.shape[0], count), device=source_surfaces.device)
+    points = torch.gather(source_surfaces[..., :3].float(), 1, indices[..., None].expand(-1, -1, 3)).detach()
+
+    src_xyz = source_surfaces[..., :3].float().detach()
+    dst_xyz = target_surfaces[..., :3].float().detach()
+    src_min, src_max = src_xyz.amin(dim=1), src_xyz.amax(dim=1)
+    dst_min, dst_max = dst_xyz.amin(dim=1), dst_xyz.amax(dim=1)
+    src_center = 0.5 * (src_min + src_max)
+    dst_center = 0.5 * (dst_min + dst_max)
+    src_extent = (src_max - src_min).clamp_min(1e-6)
+    dst_extent = (dst_max - dst_min).clamp_min(1e-6)
+    local = (points - src_center[:, None, :]) / src_extent[:, None, :]
+    return dst_center[:, None, :] + local * dst_extent[:, None, :]
+
+
+def _compute_temporal_geometry_auxiliary_loss(
+    vae: TripoSGVAEModel,
+    clean_latents: torch.Tensor,
+    part_surfaces: torch.Tensor,
+    num_parts: torch.Tensor,
+    num_frames: torch.Tensor | None,
+    num_spatial_parts: torch.Tensor | None,
+    layout_pose_pred: torch.Tensor | None,
+    *,
+    latent_weight: float,
+    surface_weight: float,
+    scale_weight: float,
+    accel_weight: float,
+    num_surface_points: int,
+    decoder_num_chunks: int,
+    decoder_dtype: torch.dtype,
+    fallback_consecutive: bool,
+    skip_first_spatial_parts: int = 0,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    zero = clean_latents.sum() * 0.0
+    terms = {
+        "latent": zero.detach(),
+        "surface": zero.detach(),
+        "scale": zero.detach(),
+        "accel": zero.detach(),
+        "pairs": torch.tensor(0, device=clean_latents.device, dtype=torch.long),
+        "objects": torch.tensor(0, device=clean_latents.device, dtype=torch.long),
+    }
+    if latent_weight <= 0.0 and surface_weight <= 0.0 and scale_weight <= 0.0 and accel_weight <= 0.0:
+        return zero, terms
+
+    pairs, triples, valid_objects = _temporal_grid_pairs(
+        num_parts,
+        num_frames,
+        num_spatial_parts,
+        fallback_consecutive=fallback_consecutive,
+        skip_first_spatial_parts=skip_first_spatial_parts,
+    )
+    terms["pairs"] = torch.tensor(len(pairs), device=clean_latents.device, dtype=torch.long)
+    terms["objects"] = torch.tensor(valid_objects, device=clean_latents.device, dtype=torch.long)
+    if not pairs:
+        return zero, terms
+
+    pair_idx = torch.tensor(pairs, device=clean_latents.device, dtype=torch.long)
+    src_idx, dst_idx = pair_idx[:, 0], pair_idx[:, 1]
+    total = zero
+
+    if latent_weight > 0.0:
+        latent_loss = (
+            clean_latents[src_idx].float().view(len(pairs), -1)
+            - clean_latents[dst_idx].float().view(len(pairs), -1)
+        ).pow(2).mean()
+        terms["latent"] = latent_loss.detach()
+        total = total + float(latent_weight) * latent_loss
+
+    if surface_weight > 0.0:
+        src_surfaces = part_surfaces[src_idx]
+        dst_surfaces = part_surfaces[dst_idx]
+        src_to_dst_points = _sample_bbox_aligned_surface_queries(src_surfaces, dst_surfaces, num_surface_points)
+        dst_to_src_points = _sample_bbox_aligned_surface_queries(dst_surfaces, src_surfaces, num_surface_points)
+        dst_field = vae.decode(
+            clean_latents[dst_idx].to(dtype=decoder_dtype),
+            sampled_points=src_to_dst_points.to(dtype=decoder_dtype),
+            num_chunks=int(decoder_num_chunks),
+        ).sample.float()
+        src_field = vae.decode(
+            clean_latents[src_idx].to(dtype=decoder_dtype),
+            sampled_points=dst_to_src_points.to(dtype=decoder_dtype),
+            num_chunks=int(decoder_num_chunks),
+        ).sample.float()
+        surface_loss = 0.5 * (
+            dst_field.abs().mean() + dst_field.pow(2).mean()
+            + src_field.abs().mean() + src_field.pow(2).mean()
+        )
+        terms["surface"] = surface_loss.detach()
+        total = total + float(surface_weight) * surface_loss
+
+    if scale_weight > 0.0 and layout_pose_pred is not None:
+        scale_loss = (layout_pose_pred[src_idx, 3:].float() - layout_pose_pred[dst_idx, 3:].float()).pow(2).mean()
+        terms["scale"] = scale_loss.detach()
+        total = total + float(scale_weight) * scale_loss
+
+    if accel_weight > 0.0 and triples:
+        triple_idx = torch.tensor(triples, device=clean_latents.device, dtype=torch.long)
+        prev_latents = clean_latents[triple_idx[:, 0]].float().view(len(triples), -1)
+        cur_latents = clean_latents[triple_idx[:, 1]].float().view(len(triples), -1)
+        next_latents = clean_latents[triple_idx[:, 2]].float().view(len(triples), -1)
+        accel_loss = (next_latents - 2.0 * cur_latents + prev_latents).pow(2).mean()
+        terms["accel"] = accel_loss.detach()
+        total = total + float(accel_weight) * accel_loss
+
+    return total, terms
 
 
 def _compute_geometry_field_auxiliary_loss(
@@ -838,7 +998,7 @@ def main():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=8,
+        default=0,
         help="The number of processed spawned by the batch provider"
     )
     parser.add_argument(
@@ -849,7 +1009,7 @@ def main():
     parser.add_argument(
         "--prefetch_factor",
         type=int,
-        default=4,
+        default=2,
         help="Number of batches each DataLoader worker prefetches. Only used when num_workers > 0."
     )
     parser.add_argument(
@@ -1049,6 +1209,8 @@ def main():
         deepspeed_plugin = None
 
     # Initialize the accelerator
+    if torch.cuda.is_available() and "LOCAL_RANK" in os.environ:
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     ddp_timeout_minutes = int(os.environ.get("COM4D_DDP_TIMEOUT_MINUTES", "180"))
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=ddp_timeout_minutes))
     accelerator = Accelerator(
@@ -1060,9 +1222,20 @@ def main():
         deepspeed_plugin=deepspeed_plugin,
         kwargs_handlers=[process_group_kwargs],
     )
+    if torch.cuda.is_available():
+        torch.cuda.set_device(accelerator.local_process_index)
     logger.info(f"Accelerator state:\n{accelerator.state}\n")
     logger.info(
         f"Distributed process group timeout: [{ddp_timeout_minutes}] minutes\n"
+    )
+    trace_sequence_parallel_event(
+        "startup.after_accelerator",
+        world_size=accelerator.num_processes,
+        process_index=accelerator.process_index,
+        local_process_index=accelerator.local_process_index,
+        distributed_type=accelerator.distributed_type,
+        device=accelerator.device,
+        cuda_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES", ""),
     )
 
     # Set the random seed
@@ -1082,18 +1255,120 @@ def main():
         cfgs_3d['dataset'] = copy.deepcopy(configs['dataset_3d'])
     if 'dataset_4d' in configs:
         cfgs_4d['dataset'] = copy.deepcopy(configs['dataset_4d'])
+    physics_dataset_specs = []
     if 'dataset_physics' in configs:
         cfgs_physics = copy.deepcopy(configs)
         cfgs_physics['dataset'] = copy.deepcopy(configs['dataset_physics'])
-        physics_dataset_json = configs["train"].get("physics_dataset_json", HUMOTO_PHYSICS_DATASET_JSON)
-        physics_dataset_path = Path(physics_dataset_json).expanduser()
-        if not physics_dataset_path.is_file():
-            raise FileNotFoundError(
-                f"Physics dataset JSON does not exist: {physics_dataset_path}. "
-                "Set train.physics_dataset_json to an existing dataset_json/*.json file."
+
+        def _config_list(value):
+            if value is None:
+                return []
+            if isinstance(value, (list, tuple, ListConfig)):
+                return list(value)
+            text = str(value).strip()
+            if text.startswith("[") and text.endswith("]"):
+                text = text[1:-1]
+            if "," in text:
+                return [item.strip() for item in text.split(",") if item.strip()]
+            return [text]
+
+        physics_dataset_jsons = _config_list(configs["train"].get("physics_dataset_jsons", None))
+        if not physics_dataset_jsons:
+            physics_dataset_jsons = _config_list(configs["train"].get("physics_dataset_json", HUMOTO_PHYSICS_DATASET_JSON))
+        def _optional_int(value):
+            if value is None:
+                return None
+            text = str(value).strip().lower()
+            if text in {"", "none", "null", "auto"}:
+                return None
+            return int(value)
+
+        def _bool_value(value):
+            if isinstance(value, bool):
+                return value
+            text = str(value).strip().lower()
+            if text in {"1", "true", "yes", "y", "on"}:
+                return True
+            if text in {"0", "false", "no", "n", "off"}:
+                return False
+            raise ValueError(f"Expected a boolean value, got {value!r}")
+
+        physics_dataset_num_spatial_parts = _config_list(configs["train"].get("physics_dataset_num_spatial_parts", None))
+        if physics_dataset_num_spatial_parts:
+            physics_dataset_num_spatial_parts = [_optional_int(num_parts) for num_parts in physics_dataset_num_spatial_parts]
+            if len(physics_dataset_num_spatial_parts) != len(physics_dataset_jsons):
+                raise ValueError(
+                    "train.physics_dataset_num_spatial_parts must have the same length as "
+                    "train.physics_dataset_jsons."
+                )
+        else:
+            physics_dataset_num_spatial_parts = [cfgs_physics['dataset'].get('num_spatial_parts', None)] * len(physics_dataset_jsons)
+
+        physics_dataset_spatiotemporal_grid = _config_list(configs["train"].get("physics_dataset_spatiotemporal_grid", None))
+        if physics_dataset_spatiotemporal_grid:
+            physics_dataset_spatiotemporal_grid = [_bool_value(value) for value in physics_dataset_spatiotemporal_grid]
+            if len(physics_dataset_spatiotemporal_grid) != len(physics_dataset_jsons):
+                raise ValueError(
+                    "train.physics_dataset_spatiotemporal_grid must have the same length as "
+                    "train.physics_dataset_jsons."
+                )
+        else:
+            physics_dataset_spatiotemporal_grid = [True] * len(physics_dataset_jsons)
+
+        physics_dataset_probs = _config_list(configs["train"].get("physics_dataset_probs", None))
+        if physics_dataset_probs:
+            physics_dataset_probs = [float(prob) for prob in physics_dataset_probs]
+            if len(physics_dataset_probs) != len(physics_dataset_jsons):
+                raise ValueError(
+                    "train.physics_dataset_probs must have the same length as "
+                    "train.physics_dataset_jsons."
+                )
+        else:
+            physics_dataset_probs = [1.0 / len(physics_dataset_jsons)] * len(physics_dataset_jsons)
+        prob_sum = float(sum(physics_dataset_probs))
+        if prob_sum <= 0.0:
+            raise ValueError("train.physics_dataset_probs must sum to a positive value.")
+        physics_dataset_probs = [float(prob) / prob_sum for prob in physics_dataset_probs]
+
+        for source_idx, (
+            physics_dataset_json,
+            source_prob,
+            source_num_spatial_parts,
+            source_spatiotemporal_grid,
+        ) in enumerate(
+            zip(
+                physics_dataset_jsons,
+                physics_dataset_probs,
+                physics_dataset_num_spatial_parts,
+                physics_dataset_spatiotemporal_grid,
             )
-        cfgs_physics['dataset']['config'] = [str(physics_dataset_path)]
-        cfgs_physics['dataset']['spatiotemporal_grid'] = True
+        ):
+            physics_dataset_path = Path(str(physics_dataset_json)).expanduser()
+            if not physics_dataset_path.is_file():
+                raise FileNotFoundError(
+                    f"Physics dataset JSON does not exist: {physics_dataset_path}. "
+                    "Set train.physics_dataset_json or train.physics_dataset_jsons to existing dataset_json/*.json files."
+                )
+            source_cfgs_physics = copy.deepcopy(cfgs_physics)
+            source_cfgs_physics['dataset']['config'] = [str(physics_dataset_path)]
+            source_cfgs_physics['dataset']['spatiotemporal_grid'] = bool(source_spatiotemporal_grid)
+            if source_spatiotemporal_grid:
+                if source_num_spatial_parts is not None:
+                    source_cfgs_physics['dataset']['num_spatial_parts'] = int(source_num_spatial_parts)
+                else:
+                    source_cfgs_physics['dataset'].pop('num_spatial_parts', None)
+            else:
+                source_cfgs_physics['dataset'].pop('num_spatial_parts', None)
+            physics_dataset_specs.append(
+                {
+                    "index": source_idx,
+                    "path": str(physics_dataset_path),
+                    "prob": float(source_prob),
+                    "spatiotemporal_grid": bool(source_spatiotemporal_grid),
+                    "num_spatial_parts": source_num_spatial_parts,
+                    "configs": source_cfgs_physics,
+                }
+            )
 
     loader_kwargs = {}
     if args.num_workers > 0:
@@ -1194,30 +1469,37 @@ def main():
 
     train_dataset_physics = None
     train_loader_physics = None
+    train_datasets_physics = []
+    train_loaders_physics = []
     physics_data_prob = float(configs["train"].get("physics_data_prob", 0.0))
-    if cfgs_physics is not None and physics_data_prob > 0.0:
-        train_dataset_physics = BatchedObjaversePartDataset4D(
-            configs=cfgs_physics,
-            batch_size=configs["train"]["batch_size_per_gpu"],
-            is_main_process=accelerator.is_main_process,
-            shuffle=True,
-            training=True,
-        )
-        train_loader_physics = MultiEpochsDataLoader(
-            train_dataset_physics,
-            batch_size=configs["train"]["batch_size_per_gpu"],
-            num_workers=args.num_workers,
-            drop_last=True,
-            pin_memory=args.pin_memory,
-            collate_fn=train_dataset_physics.collate_fn,
-            **loader_kwargs,
-        )
-        if len(train_dataset_physics) == 0 or len(train_loader_physics) == 0:
-            raise RuntimeError(
-                "Physics data mixing is enabled, but the batched physics dataset is empty. "
-                "Generate more physics sequences, lower train.batch_size_per_gpu, or lower "
-                "dataset_physics.min_num_parts/max_num_parts."
+    if physics_dataset_specs and physics_data_prob > 0.0:
+        for spec in physics_dataset_specs:
+            train_dataset_physics_source = BatchedObjaversePartDataset4D(
+                configs=spec["configs"],
+                batch_size=configs["train"]["batch_size_per_gpu"],
+                is_main_process=accelerator.is_main_process,
+                shuffle=True,
+                training=True,
             )
+            train_loader_physics_source = MultiEpochsDataLoader(
+                train_dataset_physics_source,
+                batch_size=configs["train"]["batch_size_per_gpu"],
+                num_workers=args.num_workers,
+                drop_last=True,
+                pin_memory=args.pin_memory,
+                collate_fn=train_dataset_physics_source.collate_fn,
+                **loader_kwargs,
+            )
+            if len(train_dataset_physics_source) == 0 or len(train_loader_physics_source) == 0:
+                raise RuntimeError(
+                    "Physics data mixing is enabled, but a batched physics dataset is empty. "
+                    f"source={spec['path']}. Generate more physics sequences, lower "
+                    "train.batch_size_per_gpu, or lower dataset_physics.min_num_parts/max_num_parts."
+                )
+            train_datasets_physics.append(train_dataset_physics_source)
+            train_loaders_physics.append(train_loader_physics_source)
+        train_dataset_physics = train_datasets_physics[0] if train_datasets_physics else None
+        train_loader_physics = train_loaders_physics[0] if train_loaders_physics else None
 
     objaverse_dataset_configs = copy.deepcopy(configs)
     objaverse_dataset_configs['dataset'] = configs['dataset_objaverse']
@@ -1243,26 +1525,30 @@ def main():
         ("4d", train_dataset_4d),
         ("objaverse", objaverse_dataset),
     ]
-    if train_dataset_physics is not None:
-        cache_prewarm_streams.append(("physics", train_dataset_physics))
+    for spec, dataset in zip(physics_dataset_specs, train_datasets_physics):
+        cache_prewarm_streams.append((f"physics:{Path(spec['path']).stem}", dataset))
     cache_prewarmed = prewarm_dataset_cache_streams(cache_prewarm_streams)
 
     logger.info(
         f"Loaded 3D [{len(train_dataset_3d)}] train / [{len(val_dataset_3d)}] val; "
         f"4D [{len(train_dataset_4d)}] train / [{len(val_dataset_4d)}] val; "
-        f"Physics [{len(train_dataset_physics) if train_dataset_physics is not None else 0}] train; "
+        f"Physics [{sum(len(dataset) for dataset in train_datasets_physics)}] train; "
         f"Objaverse [{len(objaverse_dataset)}] train\n"
     )
     if accelerator.is_main_process:
         logger.info(
             f"Physics data mix: prob={physics_data_prob} "
-            f"enabled={train_loader_physics is not None}\n"
+            f"enabled={len(train_loaders_physics) > 0}\n"
         )
-        if cfgs_physics is not None:
-            logger.info(
-                f"Physics dataset source: {cfgs_physics['dataset'].get('config')} "
-                f"spatiotemporal_grid={cfgs_physics['dataset'].get('spatiotemporal_grid', False)}\n"
-            )
+        if physics_dataset_specs:
+            source_summary = [
+                (
+                    f"{Path(spec['path']).name}:{spec['prob']:.3f}:len={len(dataset)}:"
+                    f"grid={spec['spatiotemporal_grid']}:spatial={spec['num_spatial_parts']}"
+                )
+                for spec, dataset in zip(physics_dataset_specs, train_datasets_physics)
+            ]
+            logger.info(f"Physics dataset sources: {source_summary}\n")
         logger.info(
             f"Dataset cache: enabled={dataset_cache_enabled} "
             f"source_root={args.dataset_source_root} cache_root={args.dataset_cache_root} "
@@ -1385,6 +1671,34 @@ def main():
     camera_condition_dim = int(configs["model"]["transformer"].get("camera_condition_dim", 25))
     physics_condition_dim = int(configs["model"]["transformer"].get("physics_condition_dim", 8))
     mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "current"))
+    flash_attention_cfg = configs["model"]["transformer"].get("flash_attention", {}) or {}
+    transformer_sdpa_backend = str(flash_attention_cfg.get("backend", "auto")).lower()
+    verify_flash_attention_once = bool(flash_attention_cfg.get("verify_once", False))
+    valid_sdpa_backends = {"auto", "flash", "mem_efficient", "math"}
+    if transformer_sdpa_backend not in valid_sdpa_backends:
+        raise ValueError(
+            "model.transformer.flash_attention.backend must be one of "
+            f"{sorted(valid_sdpa_backends)}, got {transformer_sdpa_backend!r}."
+        )
+    sp_attention_cfg = configs["model"]["transformer"].get("sequence_parallel_attention", {}) or {}
+    enable_sequence_parallel_attention = bool(sp_attention_cfg.get("enabled", False))
+    sequence_parallel_replicated_batch = bool(sp_attention_cfg.get("replicated_batch", False))
+    sequence_parallel_validate_replicated = bool(sp_attention_cfg.get("validate_replicated", True))
+    sequence_parallel_replicate_inputs = bool(sp_attention_cfg.get("replicate_inputs", False))
+    if enable_sequence_parallel_attention and not sequence_parallel_replicated_batch:
+        raise ValueError(
+            "model.transformer.sequence_parallel_attention.enabled=true currently requires "
+            "replicated_batch=true. Ordinary DDP batches are not safe for SP attention."
+        )
+    if sequence_parallel_replicate_inputs and not enable_sequence_parallel_attention:
+        raise ValueError("sequence_parallel_attention.replicate_inputs=true requires enabled=true.")
+
+    def _sequence_parallel_active_for_mode(mode_name: str) -> bool:
+        # Replicated sequence-parallel attention is only valid for physics/Humoto
+        # steps, where grouped interactions are intentional and all ranks follow
+        # the same collective path. 4D/3D-Front steps remain ordinary DDP.
+        return enable_sequence_parallel_attention and mode_name == "physics"
+
     # Separate spatial and temporal global-attn block ids; fallback to global_attn_block_ids
     spatial_global_attn_block_ids = configs["model"]["transformer"].get("spatial_global_attn_block_ids", None)
     if spatial_global_attn_block_ids is not None:
@@ -1683,6 +1997,42 @@ def main():
         )
     elif accelerator.is_main_process:
         logger.info("Geometry-image auxiliary supervision disabled.\n")
+
+    temporal_geometry_aux_cfg = configs["train"].get("temporal_geometry_auxiliary", {})
+    if not hasattr(temporal_geometry_aux_cfg, "get"):
+        temporal_geometry_aux_cfg = {}
+    temporal_geometry_aux_enabled = bool(temporal_geometry_aux_cfg.get("enabled", False))
+    temporal_geometry_aux_modes = set(str(mode) for mode in temporal_geometry_aux_cfg.get("modes", ["physics"]))
+    temporal_geometry_aux_latent_weight = float(temporal_geometry_aux_cfg.get("latent_weight", 0.0))
+    temporal_geometry_aux_surface_weight = float(temporal_geometry_aux_cfg.get("surface_weight", 0.0))
+    temporal_geometry_aux_scale_weight = float(temporal_geometry_aux_cfg.get("scale_weight", 0.0))
+    temporal_geometry_aux_accel_weight = float(temporal_geometry_aux_cfg.get("accel_weight", 0.0))
+    temporal_geometry_aux_num_surface_points = int(temporal_geometry_aux_cfg.get("num_surface_points", 32))
+    temporal_geometry_aux_decoder_num_chunks = int(temporal_geometry_aux_cfg.get("decoder_num_chunks", 8192))
+    temporal_geometry_aux_fallback_consecutive = bool(temporal_geometry_aux_cfg.get("fallback_consecutive", False))
+    temporal_geometry_aux_skip_first_spatial_parts = int(temporal_geometry_aux_cfg.get("skip_first_spatial_parts", 0))
+    temporal_geometry_aux_active = temporal_geometry_aux_enabled and (
+        temporal_geometry_aux_latent_weight > 0.0
+        or temporal_geometry_aux_surface_weight > 0.0
+        or temporal_geometry_aux_scale_weight > 0.0
+        or temporal_geometry_aux_accel_weight > 0.0
+    )
+    if temporal_geometry_aux_active:
+        logger.info(
+            "Temporal-geometry auxiliary supervision enabled: "
+            f"modes={sorted(temporal_geometry_aux_modes)}, "
+            f"latent_weight={temporal_geometry_aux_latent_weight}, "
+            f"surface_weight={temporal_geometry_aux_surface_weight}, "
+            f"scale_weight={temporal_geometry_aux_scale_weight}, "
+            f"accel_weight={temporal_geometry_aux_accel_weight}, "
+            f"num_surface_points={temporal_geometry_aux_num_surface_points}, "
+            f"fallback_consecutive={temporal_geometry_aux_fallback_consecutive}, "
+            f"skip_first_spatial_parts={temporal_geometry_aux_skip_first_spatial_parts}. "
+            "Pairs are adjacent same spatial-part frames for frame-major physics grids; "
+            "the surface term uses bbox-aligned implicit SDF cross-consistency, so global motion is not penalized.\n"
+        )
+    elif accelerator.is_main_process:
+        logger.info("Temporal-geometry auxiliary supervision disabled.\n")
 
     layout_pose_aux_init_path = args.load_layout_pose_aux_head or _checkpoint_aux_head_path(
         args.load_pretrained_model,
@@ -1983,8 +2333,7 @@ def main():
     # Derive total steps; prefer existing value in configs if provided
     if "total_steps" not in configs["lr_scheduler"] or int(configs["lr_scheduler"]["total_steps"]) <= 0:
         loader_lengths = [len(train_loader_3d), len(train_loader_4d)]
-        if train_loader_physics is not None:
-            loader_lengths.append(len(train_loader_physics))
+        loader_lengths.extend(len(loader) for loader in train_loaders_physics)
         approx_len = max(1, max(loader_lengths))
         configs["lr_scheduler"]["total_steps"] = configs["train"]["epochs"] * math.ceil(
             approx_len // max(1, accelerator.num_processes) / max(1, args.gradient_accumulation_steps)
@@ -2014,8 +2363,7 @@ def main():
         random_val_loader_3d,
         random_val_loader_4d,
     ]
-    if train_loader_physics is not None:
-        prepare_items.append(train_loader_physics)
+    prepare_items.extend(train_loaders_physics)
     if layout_pose_aux_head is not None:
         prepare_items.append(layout_pose_aux_head)
     if room_layout_aux_head is not None:
@@ -2033,9 +2381,10 @@ def main():
         random_val_loader_4d,
         *optional_prepared_loaders,
     ) = prepared_items
-    if train_loader_physics is not None:
-        train_loader_physics = optional_prepared_loaders[0]
-        optional_prepared_loaders = optional_prepared_loaders[1:]
+    if train_loaders_physics:
+        train_loaders_physics = list(optional_prepared_loaders[:len(train_loaders_physics)])
+        train_loader_physics = train_loaders_physics[0]
+        optional_prepared_loaders = optional_prepared_loaders[len(train_loaders_physics):]
     if layout_pose_aux_head is not None:
         layout_pose_aux_head = optional_prepared_loaders[0]
         optional_prepared_loaders = optional_prepared_loaders[1:]
@@ -2246,6 +2595,91 @@ def main():
         disable=not accelerator.is_main_process
     )
 
+    def _replication_collectives_ready(active: bool) -> bool:
+        return (
+            active
+            and sequence_parallel_replicate_inputs
+            and dist.is_available()
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        )
+
+    def _replicate_batch_from_main_process(batch_obj, *, active: bool):
+        if not _replication_collectives_ready(active):
+            return batch_obj
+        payload = [_move_tensors_to_local_device(batch_obj) if accelerator.is_main_process else None]
+        dist.broadcast_object_list(payload, src=0)
+        return _move_tensors_to_local_device(payload[0])
+
+    def _move_tensors_to_local_device(obj):
+        if torch.is_tensor(obj):
+            return obj.to(accelerator.device)
+        if isinstance(obj, dict):
+            return {key: _move_tensors_to_local_device(value) for key, value in obj.items()}
+        if isinstance(obj, list):
+            return [_move_tensors_to_local_device(value) for value in obj]
+        if isinstance(obj, tuple):
+            return tuple(_move_tensors_to_local_device(value) for value in obj)
+        return obj
+
+    def _replicate_tensor_from_main_process(tensor, *, active: bool):
+        if tensor is None or not _replication_collectives_ready(active):
+            return tensor
+        tensor = tensor.to(accelerator.device).contiguous()
+        dist.broadcast(tensor, src=0)
+        return tensor
+
+    def _replicate_mode_choice_from_main_process(mode_choice):
+        if not _replication_collectives_ready(enable_sequence_parallel_attention):
+            return mode_choice
+        payload = [mode_choice if accelerator.is_main_process else None]
+        dist.broadcast_object_list(payload, src=0)
+        return payload[0]
+
+    def _transformer_sdpa_context():
+        if transformer_sdpa_backend == "auto" or not torch.cuda.is_available():
+            return nullcontext()
+        return torch.backends.cuda.sdp_kernel(
+            enable_flash=transformer_sdpa_backend == "flash",
+            enable_mem_efficient=transformer_sdpa_backend == "mem_efficient",
+            enable_math=transformer_sdpa_backend == "math",
+        )
+
+    flash_attention_profiled = False
+
+    def _profiled_transformer_forward(**forward_kwargs):
+        nonlocal flash_attention_profiled
+        should_profile = (
+            verify_flash_attention_once
+            and not flash_attention_profiled
+            and torch.cuda.is_available()
+            and accelerator.is_main_process
+        )
+        with _transformer_sdpa_context():
+            if not should_profile:
+                return transformer(**forward_kwargs)
+            activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+            with torch.profiler.profile(activities=activities) as prof:
+                output = transformer(**forward_kwargs)
+                torch.cuda.synchronize(accelerator.device)
+            flash_attention_profiled = True
+            event_names = {event.key for event in prof.key_averages()}
+            flash_hits = sorted(
+                name for name in event_names
+                if "scaled_dot_product_flash_attention" in name or "flash_attention" in name
+            )
+            if flash_hits:
+                logger.info("FlashAttention SDPA verified for transformer forward: %s", flash_hits)
+            else:
+                logger.warning(
+                    "FlashAttention SDPA was not observed in the profiled transformer forward. "
+                    "backend=%s dtype=%s device=%s",
+                    transformer_sdpa_backend,
+                    forward_kwargs["hidden_states"].dtype,
+                    forward_kwargs["hidden_states"].device,
+                )
+            return output
+
     def _discard_pending_update() -> None:
         # `AcceleratedOptimizer.zero_grad()` is a no-op when sync_gradients is False,
         # so force a real clear before resetting the accumulation window.
@@ -2262,7 +2696,15 @@ def main():
     # Mixed training iterators
     train_iter_3d = yield_forever(train_loader_3d)
     train_iter_4d = yield_forever(train_loader_4d)
-    train_iter_physics = yield_forever(train_loader_physics) if train_loader_physics is not None else None
+    train_iters_physics = [yield_forever(loader) for loader in train_loaders_physics]
+    train_iter_physics = train_iters_physics[0] if train_iters_physics else None
+    physics_source_probs = [spec["prob"] for spec in physics_dataset_specs]
+    physics_source_names = [Path(spec["path"]).stem for spec in physics_dataset_specs]
+
+    def _choose_physics_source_index() -> int:
+        if not train_iters_physics:
+            return 0
+        return int(random.choices(range(len(train_iters_physics)), weights=physics_source_probs, k=1)[0])
     objaverse_train_iter = yield_forever(objaverse_train_loader)
     # Probability to pick 4D at each iter (default 0.5)
     p_4d = float(configs["train"].get("prob_4d", 0.5))
@@ -2291,6 +2733,8 @@ def main():
             micro_step += 1
             timing_start = time.perf_counter()
             last_timing = timing_start
+            if debug_step_timing and torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(accelerator.device)
 
             def _debug_timing(stage: str) -> None:
                 nonlocal last_timing
@@ -2301,40 +2745,91 @@ def main():
                     current_mode = mode
                 except (NameError, UnboundLocalError):
                     current_mode = "pending"
+                memory_suffix = ""
+                if torch.cuda.is_available():
+                    allocated_gib = torch.cuda.memory_allocated(accelerator.device) / (1024 ** 3)
+                    reserved_gib = torch.cuda.memory_reserved(accelerator.device) / (1024 ** 3)
+                    peak_gib = torch.cuda.max_memory_allocated(accelerator.device) / (1024 ** 3)
+                    memory_suffix = (
+                        f" mem_alloc_gib={allocated_gib:.3f}"
+                        f" mem_reserved_gib={reserved_gib:.3f}"
+                        f" mem_peak_gib={peak_gib:.3f}"
+                    )
                 logger.info(
                     f"[timing] update={global_update_step:06d} micro={micro_step:06d} "
                     f"stage={stage} mode={current_mode} "
                     f"dt={now - last_timing:.3f}s total={now - timing_start:.3f}s "
                     f"sync={accelerator.sync_gradients}"
+                    f"{memory_suffix}"
                 )
                 last_timing = now
 
-            # Randomly choose dataset for this iteration. Keep this behavior
-            # close to the original trainer; the cache-lock fix, not mode
-            # selection, was the cause of the observed dataloader stall.
+            # Randomly choose dataset for this iteration. With replicated SP
+            # inputs, every SP rank must enter the same attention backend and
+            # collectives, so rank 0 owns this stochastic choice.
             _debug_timing("mode_rng")
-            use_physics = train_iter_physics is not None and random.random() < physics_data_prob
-            if use_physics:
-                is_single_object_step = False
-                mode = "physics"
-                _debug_timing("batch_wait:physics")
-                batch = next(train_iter_physics)
-                use_4d = False
-                switch_to_mode(mode)
-            else:
-                is_single_object_step = random.random() < single_object_reg_prob and single_object_configs != []
-                if is_single_object_step:
-                    mode = "single"
-                    _debug_timing("batch_wait:single")
-                    batch = next(objaverse_train_iter)
-                    use_4d = False
+            if accelerator.is_main_process or not sequence_parallel_replicate_inputs:
+                chosen_use_physics = bool(train_iters_physics) and random.random() < physics_data_prob
+                if chosen_use_physics:
+                    physics_source_index = _choose_physics_source_index()
+                    mode_choice = {
+                        "use_physics": True,
+                        "is_single_object_step": False,
+                        "use_4d": False,
+                        "mode": "physics",
+                        "physics_source_index": physics_source_index,
+                        "physics_source_name": physics_source_names[physics_source_index],
+                    }
                 else:
-                    use_4d = random.random() < p_4d
-                    mode = "4d" if use_4d else "3d"
+                    chosen_single_object = random.random() < single_object_reg_prob and single_object_configs != []
+                    if chosen_single_object:
+                        mode_choice = {
+                            "use_physics": False,
+                            "is_single_object_step": True,
+                            "use_4d": False,
+                            "mode": "single",
+                        }
+                    else:
+                        chosen_use_4d = random.random() < p_4d
+                        mode_choice = {
+                            "use_physics": False,
+                            "is_single_object_step": False,
+                            "use_4d": chosen_use_4d,
+                            "mode": "4d" if chosen_use_4d else "3d",
+                        }
+            else:
+                mode_choice = None
+
+            mode_choice = _replicate_mode_choice_from_main_process(mode_choice)
+            use_physics = bool(mode_choice["use_physics"])
+            is_single_object_step = bool(mode_choice["is_single_object_step"])
+            use_4d = bool(mode_choice["use_4d"])
+            mode = mode_choice["mode"]
+            sequence_parallel_active = _sequence_parallel_active_for_mode(mode)
+
+            fetch_batch_on_this_rank = accelerator.is_main_process or not (
+                sequence_parallel_active and sequence_parallel_replicate_inputs
+            )
+            if use_physics:
+                physics_source_index = int(mode_choice.get("physics_source_index", 0))
+                physics_source_name = str(mode_choice.get("physics_source_name", "physics"))
+                _debug_timing(f"batch_wait:physics:{physics_source_name}")
+                batch = next(train_iters_physics[physics_source_index]) if fetch_batch_on_this_rank else None
+            else:
+                if is_single_object_step:
+                    _debug_timing("batch_wait:single")
+                    batch = next(objaverse_train_iter) if fetch_batch_on_this_rank else None
+                else:
                     _debug_timing(f"batch_wait:{mode}")
-                    batch = next(train_iter_4d) if use_4d else next(train_iter_3d)
-                    # Switch attention mode
-                    switch_to_mode(mode)
+                    batch = (
+                        next(train_iter_4d) if use_4d else next(train_iter_3d)
+                    ) if fetch_batch_on_this_rank else None
+            trace_sequence_parallel_event("train.before_switch_mode", active=sequence_parallel_active, mode=mode)
+            switch_to_mode(mode)
+            trace_sequence_parallel_event("train.after_switch_mode", active=sequence_parallel_active, mode=mode)
+            trace_sequence_parallel_event("train.before_batch_broadcast", active=sequence_parallel_active, has_batch=batch is not None)
+            batch = _replicate_batch_from_main_process(batch, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_batch_broadcast", active=sequence_parallel_active, batch_keys=sorted(batch.keys()))
             _debug_timing("batch")
 
             images_hw3 = batch["images"] # [N, H, W, 3]
@@ -2350,12 +2845,17 @@ def main():
                     preprocess_kwargs["crop_size"] = target_size
                     preprocess_kwargs["do_resize"] = True
                     preprocess_kwargs["do_center_crop"] = False
+                trace_sequence_parallel_event("train.before_feature_extractor", active=sequence_parallel_active)
                 pixel_values = feature_extractor_dinov2(**preprocess_kwargs).pixel_values
+                trace_sequence_parallel_event("train.after_feature_extractor", pixel_values, active=sequence_parallel_active)
             pixel_values = pixel_values.to(device=accelerator.device, dtype=weight_dtype) # [N, 3, Hf, Wf]
+            trace_sequence_parallel_event("train.after_pixel_to_device", pixel_values, active=sequence_parallel_active)
             _debug_timing("preprocess")
             # Original single-image tokens (frozen DINO)
             with torch.no_grad():
+                trace_sequence_parallel_event("train.before_dino", pixel_values, active=sequence_parallel_active)
                 single_tokens = image_encoder_dinov2(pixel_values).last_hidden_state  # [N, T, D]
+                trace_sequence_parallel_event("train.after_dino", single_tokens, active=sequence_parallel_active)
             _debug_timing("dino")
 
             # Group indices by objects using num_parts
@@ -2376,18 +2876,29 @@ def main():
                 dropout_mask = torch.rand_like(image_embeds, device=accelerator.device) < configs["train"]["occlusion_dropout_prob"]
                 if dropout_mask.any():
                     image_embeds[dropout_mask] = negative_image_embeds[dropout_mask]
+            trace_sequence_parallel_event("train.before_image_embeds_broadcast", image_embeds, active=sequence_parallel_active)
+            image_embeds = _replicate_tensor_from_main_process(image_embeds, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_image_embeds_broadcast", image_embeds, active=sequence_parallel_active)
 
             part_surfaces = batch["part_surfaces"] # [N, P, 6]
             part_surfaces = part_surfaces.to(device=accelerator.device, dtype=weight_dtype)
 
             with torch.no_grad():
+                trace_sequence_parallel_event("train.before_vae_encode", part_surfaces, active=sequence_parallel_active)
                 latents = vae.encode(
                     part_surfaces, 
                     **configs["model"]["vae"]
                 ).latent_dist.sample()
+                trace_sequence_parallel_event("train.after_vae_encode", latents, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.before_latents_broadcast", latents, active=sequence_parallel_active)
+            latents = _replicate_tensor_from_main_process(latents, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_latents_broadcast", latents, active=sequence_parallel_active)
             _debug_timing("vae_encode")
 
             noise = torch.randn_like(latents)
+            trace_sequence_parallel_event("train.before_noise_broadcast", noise, active=sequence_parallel_active)
+            noise = _replicate_tensor_from_main_process(noise, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_noise_broadcast", noise, active=sequence_parallel_active)
             # For weighting schemes where we sample timesteps non-uniformly
             # ---- DF-aware per-token timestep sampling ----
             if df_enabled:
@@ -2431,8 +2942,15 @@ def main():
                 noise = noise.float()
             else:
                 sigmas = get_sigmas(timesteps, len(latents.shape), weight_dtype)
+            trace_sequence_parallel_event("train.before_timesteps_broadcast", timesteps, active=sequence_parallel_active)
+            timesteps = _replicate_tensor_from_main_process(timesteps, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_timesteps_broadcast", timesteps, active=sequence_parallel_active)
+            sigmas = get_sigmas(timesteps, len(latents.shape), torch.float32 if force_fp32 else weight_dtype)
             noisy_latents = (1. - sigmas) * latents + sigmas * noise
             latent_model_input = noisy_latents.to(weight_dtype)
+            trace_sequence_parallel_event("train.before_latent_model_input_broadcast", latent_model_input, active=sequence_parallel_active)
+            latent_model_input = _replicate_tensor_from_main_process(latent_model_input, active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_latent_model_input_broadcast", latent_model_input, active=sequence_parallel_active)
 
             # Note: CFG dropout is applied via gating above, so no in-place
             # replacement here. This preserves the autograd path even when
@@ -2465,16 +2983,32 @@ def main():
             elif is_single_object_step:
                 attn_kwargs = {"num_parts": ones, "num_frames": ones}
 
-            model_pred = transformer(
+            if sequence_parallel_active:
+                attn_kwargs.update({
+                    "sequence_parallel_attention": True,
+                    "sequence_parallel_replicated_batch": sequence_parallel_replicated_batch,
+                    "sequence_parallel_validate_replicated": sequence_parallel_validate_replicated,
+                })
+
+            trace_sequence_parallel_event("train.before_condition_broadcasts", active=sequence_parallel_active)
+            camera_params = _replicate_tensor_from_main_process(batch.get("camera_params", None), active=sequence_parallel_active)
+            frame_time = _replicate_tensor_from_main_process(batch.get("frame_time", None), active=sequence_parallel_active)
+            has_camera = _replicate_tensor_from_main_process(batch.get("has_camera", None), active=sequence_parallel_active)
+            physics_context = _replicate_tensor_from_main_process(batch.get("physics_context", None), active=sequence_parallel_active)
+            trace_sequence_parallel_event("train.after_condition_broadcasts", active=sequence_parallel_active)
+
+            trace_sequence_parallel_event("train.before_transformer", latent_model_input, active=sequence_parallel_active, mode=mode)
+            model_pred = _profiled_transformer_forward(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
                 encoder_hidden_states=image_embeds,
                 attention_kwargs=attn_kwargs,
-                camera_params=batch.get("camera_params", None),
-                frame_time=batch.get("frame_time", None),
-                has_camera=batch.get("has_camera", None),
-                physics_context=batch.get("physics_context", None),
+                camera_params=camera_params,
+                frame_time=frame_time,
+                has_camera=has_camera,
+                physics_context=physics_context,
             ).sample
+            trace_sequence_parallel_event("train.after_transformer", model_pred, active=sequence_parallel_active, mode=mode)
             _debug_timing("transformer")
 
             # Keep a copy of the raw model predictions for consistency loss
@@ -2495,7 +3029,15 @@ def main():
             geometry_image_mask_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
             geometry_image_empty_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
             geometry_image_valid_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
+            temporal_geometry_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            temporal_geometry_latent_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            temporal_geometry_surface_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            temporal_geometry_scale_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            temporal_geometry_accel_loss = torch.tensor(0.0, device=accelerator.device, dtype=torch.float32)
+            temporal_geometry_pair_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
+            temporal_geometry_object_count = torch.tensor(0, device=accelerator.device, dtype=torch.long)
             layout_latents = None
+            layout_pose_pred = None
             use_room_aux = mode == "3d"
             layout_pose_step_active = use_room_aux and layout_pose_aux_head is not None
             room_layout_step_active = use_room_aux and room_layout_aux_head is not None
@@ -2608,6 +3150,55 @@ def main():
                 geometry_image_mask_loss = geometry_image_terms["mask"]
                 geometry_image_empty_loss = geometry_image_terms["empty"]
                 geometry_image_valid_count = geometry_image_terms["valid"]
+
+            temporal_geometry_step_active = temporal_geometry_aux_active and mode in temporal_geometry_aux_modes
+            if temporal_geometry_step_active:
+                if clean_latents_for_aux is None:
+                    clean_latents_for_aux = _predict_clean_latents(
+                        raw_model_pred=raw_model_pred,
+                        noisy_latents=noisy_latents,
+                        sigmas=sigmas,
+                        objective=configs["train"]["training_objective"],
+                    )
+                temporal_layout_pose_pred = None
+                if temporal_geometry_aux_scale_weight > 0.0 and layout_pose_aux_head is not None:
+                    temporal_layout_pose_pred = layout_pose_pred
+                    if temporal_layout_pose_pred is None:
+                        # Use the layout/pose head as a frozen scale probe here. The
+                        # temporal term should shape the predicted clean latents, not
+                        # teach the probe to output constant scales.
+                        aux_param_requires_grad = [param.requires_grad for param in layout_pose_aux_head.parameters()]
+                        try:
+                            for param in layout_pose_aux_head.parameters():
+                                param.requires_grad_(False)
+                            temporal_layout_pose_pred = layout_pose_aux_head(clean_latents_for_aux)
+                        finally:
+                            for param, requires_grad in zip(layout_pose_aux_head.parameters(), aux_param_requires_grad):
+                                param.requires_grad_(requires_grad)
+                temporal_geometry_loss, temporal_geometry_terms = _compute_temporal_geometry_auxiliary_loss(
+                    vae=vae,
+                    clean_latents=clean_latents_for_aux,
+                    part_surfaces=part_surfaces,
+                    num_parts=num_parts,
+                    num_frames=batch.get("num_frames"),
+                    num_spatial_parts=batch.get("num_spatial_parts"),
+                    layout_pose_pred=temporal_layout_pose_pred,
+                    latent_weight=temporal_geometry_aux_latent_weight,
+                    surface_weight=temporal_geometry_aux_surface_weight,
+                    scale_weight=temporal_geometry_aux_scale_weight,
+                    accel_weight=temporal_geometry_aux_accel_weight,
+                    num_surface_points=temporal_geometry_aux_num_surface_points,
+                    decoder_num_chunks=temporal_geometry_aux_decoder_num_chunks,
+                    decoder_dtype=weight_dtype,
+                    fallback_consecutive=temporal_geometry_aux_fallback_consecutive,
+                    skip_first_spatial_parts=temporal_geometry_aux_skip_first_spatial_parts,
+                )
+                temporal_geometry_latent_loss = temporal_geometry_terms["latent"]
+                temporal_geometry_surface_loss = temporal_geometry_terms["surface"]
+                temporal_geometry_scale_loss = temporal_geometry_terms["scale"]
+                temporal_geometry_accel_loss = temporal_geometry_terms["accel"]
+                temporal_geometry_pair_count = temporal_geometry_terms["pairs"]
+                temporal_geometry_object_count = temporal_geometry_terms["objects"]
             _debug_timing("aux")
 
             if configs["train"]["training_objective"] == "x0":  # Section 5 of https://arxiv.org/abs/2206.00364
@@ -2671,6 +3262,8 @@ def main():
                 loss = loss + geometry_aux_weight * geometry_field_loss
             if geometry_image_aux_step_active:
                 loss = loss + geometry_image_aux_weight * geometry_image_loss
+            if temporal_geometry_step_active:
+                loss = loss + temporal_geometry_loss
 
             # Ensure optional embedding parameters participate every step to keep DDP reductions consistent.
             base_transformer = _unwrap_transformer_for_attn()
@@ -2716,9 +3309,12 @@ def main():
 
             # Skip this batch if loss is NaN/Inf on any rank.
             # We clear gradients to avoid carrying partial accumulation forward.
+            trace_sequence_parallel_event("train.before_finite_check", loss.detach())
             finite_int = torch.isfinite(loss.detach()).to(device=accelerator.device, dtype=torch.int32)
+            trace_sequence_parallel_event("train.before_finite_reduce", finite_int)
             if accelerator.num_processes > 1:
                 finite_int = accelerator.reduce(finite_int, reduction="min")
+            trace_sequence_parallel_event("train.after_finite_reduce", finite_int)
             if finite_int.item() == 0:
                 nonfinite_retry_count += 1
                 _discard_pending_update()
@@ -2737,7 +3333,9 @@ def main():
             nonfinite_retry_count = 0
 
             # Backpropagate
+            trace_sequence_parallel_event("train.before_backward", loss.detach())
             accelerator.backward(loss)
+            trace_sequence_parallel_event("train.after_backward", loss.detach())
             _debug_timing("backward")
             if accelerator.sync_gradients:
                 clip_params = [param for group in optimizer.param_groups for param in group["params"]]
@@ -2817,6 +3415,23 @@ def main():
                     if geometry_image_aux_empty_weight > 0.0:
                         geometry_image_logs["loss_geometry_image_empty"] = geometry_image_empty_loss.item()
                     logs.update(geometry_image_logs)
+            if temporal_geometry_step_active:
+                pair_count = accelerator.gather(temporal_geometry_pair_count.detach()).sum()
+                object_count = accelerator.gather(temporal_geometry_object_count.detach()).sum()
+                temporal_logs = {
+                    "loss_temporal_geometry": temporal_geometry_loss.item(),
+                    "temporal_geometry_pairs": int(pair_count.item()),
+                    "temporal_geometry_objects": int(object_count.item()),
+                }
+                if temporal_geometry_aux_latent_weight > 0.0:
+                    temporal_logs["loss_temporal_geometry_latent"] = temporal_geometry_latent_loss.item()
+                if temporal_geometry_aux_surface_weight > 0.0:
+                    temporal_logs["loss_temporal_geometry_surface"] = temporal_geometry_surface_loss.item()
+                if temporal_geometry_aux_scale_weight > 0.0:
+                    temporal_logs["loss_temporal_geometry_scale"] = temporal_geometry_scale_loss.item()
+                if temporal_geometry_aux_accel_weight > 0.0:
+                    temporal_logs["loss_temporal_geometry_accel"] = temporal_geometry_accel_loss.item()
+                logs.update(temporal_logs)
             if use_ema_for_transformer:
                 ema_transformer.step(transformer.parameters())
                 logs.update({"ema": ema_transformer.cur_decay_value})
@@ -2859,6 +3474,18 @@ def main():
                     image_parts.append(f"empty: {logs['loss_geometry_image_empty']:.4f}")
                 image_parts.append(f"valid: {logs['geometry_image_valid']}")
                 msg += f", loss_geometry_image: {logs['loss_geometry_image']:.4f} ({', '.join(image_parts)})"
+            if 'loss_temporal_geometry' in logs:
+                temporal_parts = []
+                if "loss_temporal_geometry_latent" in logs:
+                    temporal_parts.append(f"latent: {logs['loss_temporal_geometry_latent']:.4f}")
+                if "loss_temporal_geometry_surface" in logs:
+                    temporal_parts.append(f"surface: {logs['loss_temporal_geometry_surface']:.4f}")
+                if "loss_temporal_geometry_scale" in logs:
+                    temporal_parts.append(f"scale: {logs['loss_temporal_geometry_scale']:.4f}")
+                if "loss_temporal_geometry_accel" in logs:
+                    temporal_parts.append(f"accel: {logs['loss_temporal_geometry_accel']:.4f}")
+                temporal_parts.append(f"pairs: {logs['temporal_geometry_pairs']}")
+                msg += f", loss_temporal_geometry: {logs['loss_temporal_geometry']:.4f} ({', '.join(temporal_parts)})"
             if use_ema_for_transformer and 'ema' in logs:
                 msg += f", ema: {logs['ema']:.4f}"
             logger.info(msg)
@@ -2928,6 +3555,21 @@ def main():
                             to_log["training/loss_geometry_image_mask"] = logs["loss_geometry_image_mask"]
                         if "loss_geometry_image_empty" in logs:
                             to_log["training/loss_geometry_image_empty"] = logs["loss_geometry_image_empty"]
+                    if "loss_temporal_geometry" in logs:
+                        to_log.update({
+                            "training/loss_temporal_geometry": logs["loss_temporal_geometry"],
+                            "training/temporal_geometry_pairs": logs["temporal_geometry_pairs"],
+                            "training/temporal_geometry_objects": logs["temporal_geometry_objects"],
+                            f"training_{mode}/loss_temporal_geometry": logs["loss_temporal_geometry"],
+                        })
+                        if "loss_temporal_geometry_latent" in logs:
+                            to_log["training/loss_temporal_geometry_latent"] = logs["loss_temporal_geometry_latent"]
+                        if "loss_temporal_geometry_surface" in logs:
+                            to_log["training/loss_temporal_geometry_surface"] = logs["loss_temporal_geometry_surface"]
+                        if "loss_temporal_geometry_scale" in logs:
+                            to_log["training/loss_temporal_geometry_scale"] = logs["loss_temporal_geometry_scale"]
+                        if "loss_temporal_geometry_accel" in logs:
+                            to_log["training/loss_temporal_geometry_accel"] = logs["loss_temporal_geometry_accel"]
                     wandb.log(to_log, step=global_update_step)
                     if use_ema_for_transformer:
                         wandb.log({

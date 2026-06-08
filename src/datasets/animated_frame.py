@@ -168,6 +168,10 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
 
         self.min_num_parts = configs['dataset']['min_num_parts']
         self.max_num_parts = configs['dataset']['max_num_parts']
+        # For new frame-format datasets, min/max_num_parts historically mean
+        # sampled frame count. Prefer explicit aliases when provided.
+        self.min_num_frames = int(configs['dataset'].get('min_num_frames', self.min_num_parts))
+        self.max_num_frames = int(configs['dataset'].get('max_num_frames', self.max_num_parts))
         self.val_min_num_parts = configs['val']['min_num_parts']
         self.val_max_num_parts = configs['val']['max_num_parts']
 
@@ -180,6 +184,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.spatiotemporal_grid = bool(configs['dataset'].get('spatiotemporal_grid', False))
         configured_num_spatial_parts = configs['dataset'].get('num_spatial_parts', None)
         self.num_spatial_parts = int(configured_num_spatial_parts) if configured_num_spatial_parts is not None else None
+        configured_max_spatial_parts = configs['dataset'].get('max_num_spatial_parts', None)
+        self.max_num_spatial_parts = int(configured_max_spatial_parts) if configured_max_spatial_parts is not None else None
         self.max_spatiotemporal_grid_retries = int(configs['dataset'].get('max_spatiotemporal_grid_retries', 64))
         self._bad_spatiotemporal_configs = set()
 
@@ -253,15 +259,17 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 else:
                     objects = objects[split:]
 
-            # Assign a fixed num_parts to each object (sampled within [min_parts, feasible_max])
+            # Assign a fixed sampled-frame count to each object. For new frame-format
+            # datasets, min/max_num_frames are the clear names; min/max_num_parts are
+            # kept as backward-compatible aliases.
             data_configs = []
             for obj in objects:
                 n_frames = obj['num_frames']
                 # Limit upper bound by object's frames with stride-2 feasibility (0,2,4,...)
                 feasible_max = (n_frames + 1) // 2  # maximum K with step=2 contiguous selection
-                upper = min(self.max_num_parts, feasible_max)
+                upper = min(self.max_num_frames, feasible_max)
                 # If object has fewer frames than dataset min, lower falls back to what's available
-                lower = min(max(1, self.min_num_parts), upper)
+                lower = min(max(1, self.min_num_frames), upper)
                 if lower <= 0:
                     continue
                 num_frames_sample = random.randint(lower, upper)
@@ -270,6 +278,8 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                         spatial_parts = _count_surface_parts(obj['frames'][0]['surface_path'])
                     else:
                         spatial_parts = self.num_spatial_parts
+                    if self.max_num_spatial_parts is not None and spatial_parts > self.max_num_spatial_parts:
+                        continue
                     num_parts = num_frames_sample * spatial_parts
                 else:
                     spatial_parts = 1

@@ -32,9 +32,10 @@ DATASET_SOURCE_ROOT=${DATASET_SOURCE_ROOT:-/mnt/mocap_b/work/com4d/datasets}
 DATASET_CACHE_PREFETCH_WINDOW=${DATASET_CACHE_PREFETCH_WINDOW:-16}
 DATASET_CACHE_PREFETCH_WORKERS=${DATASET_CACHE_PREFETCH_WORKERS:-2}
 DATASET_CACHE_MAX_GB=${DATASET_CACHE_MAX_GB:-300}
-NUM_WORKERS=${NUM_WORKERS:-4}
+NUM_WORKERS=${NUM_WORKERS:-0}
 PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
-PERSISTENT_WORKERS=${PERSISTENT_WORKERS:-1}
+PERSISTENT_WORKERS=${PERSISTENT_WORKERS:-0}
+PIN_MEMORY=${PIN_MEMORY:-0}
 RANDOM=$$$(date +%s)  # generate a random seed based on current time and process ID
 MAX_GPUS=${MAX_GPUS:-4}
 GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-4}
@@ -93,6 +94,7 @@ configs=(
     sdemb/mf16_mp16/mf8_mp8_nt512 # 1
     sdemb/mf16_mp16/dfot/mf8_mp8_nt512 # 2
     sdemb/mf16_mp16/dfot/mask/mf8_mp8_nt512 # 3
+    sdemb/mf8_mp8_nt512_physics_twoball # 4
 )
 
 pretrained_model_paths=(
@@ -100,9 +102,11 @@ pretrained_model_paths=(
     /
     /
     /
+    /
 )
 
 pretrained_model_ckpts=(
+    -1
     -1
     -1
     -1
@@ -150,11 +154,17 @@ echo "Using DATASET_CACHE_MAX_GB=$DATASET_CACHE_MAX_GB"
 echo "Using NUM_WORKERS=$NUM_WORKERS"
 echo "Using PREFETCH_FACTOR=$PREFETCH_FACTOR"
 echo "Using PERSISTENT_WORKERS=$PERSISTENT_WORKERS"
+echo "Using PIN_MEMORY=$PIN_MEMORY"
 if [ -n "$BATCH_SIZE_PER_GPU" ]; then
     echo "Using train.batch_size_per_gpu=$BATCH_SIZE_PER_GPU"
 fi
 if [ "${#extra_train_args[@]}" -gt 0 ]; then
     echo "Using extra train args: ${extra_train_args[*]}"
+fi
+
+pin_memory_args=()
+if [ "$PIN_MEMORY" = "1" ]; then
+    pin_memory_args=(--pin_memory)
 fi
 
 dataset_cache_args=()
@@ -173,7 +183,7 @@ accelerate launch \
     --num_processes $(( $NUM_MACHINES * $NUM_LOCAL_GPUS )) \
     --machine_rank $MACHINE_RANK \
     src/train_com4d.py \
-        --pin_memory \
+        "${pin_memory_args[@]}" \
         --num_workers $NUM_WORKERS \
         --prefetch_factor $PREFETCH_FACTOR \
         $([ "$PERSISTENT_WORKERS" = "1" ] && echo "--persistent_workers") \

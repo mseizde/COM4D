@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Convert two-ball pipeline outputs into COM4D 4D training data.
+"""Convert synthetic physics pipeline outputs into COM4D 4D training data.
 
 Input layout can be either one sequence directory:
   outputs/two_ball_dataset/sample_000001/physics_metadata.json
@@ -16,6 +16,11 @@ This writes:
   <json-output>
 
 The JSON format matches src/datasets/animated_frame.py.
+
+The preprocessor is backward-compatible with the legacy two-ball metadata, and
+also supports generalized metadata with an ``objects`` dictionary. In generalized
+metadata, all objects with ``dynamic: true`` are reconstructed as parts. Static
+objects can appear in RGB renders without becoming dynamic training targets.
 """
 
 from __future__ import annotations
@@ -92,30 +97,85 @@ def get_radius(metadata: dict, ball_name: str) -> float:
     return float(metadata.get("ball_radii", {}).get(ball_name, metadata.get("ball_radius", 0.25)))
 
 
-def make_ball_mesh(radius: float, position: list[float], quat_xyzw: list[float], subdivisions: int) -> trimesh.Trimesh:
-    mesh = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
+def legacy_object_specs(metadata: dict) -> dict[str, dict]:
+    return {
+        "ball_0": {
+            "type": "sphere",
+            "dynamic": True,
+            "radius": get_radius(metadata, "ball_0"),
+        },
+        "ball_1": {
+            "type": "sphere",
+            "dynamic": True,
+            "radius": get_radius(metadata, "ball_1"),
+        },
+    }
+
+
+def object_specs(metadata: dict) -> dict[str, dict]:
+    objects = metadata.get("objects")
+    if isinstance(objects, dict) and objects:
+        return objects
+    return legacy_object_specs(metadata)
+
+
+def dynamic_object_specs(metadata: dict) -> dict[str, dict]:
+    return {
+        name: spec
+        for name, spec in object_specs(metadata).items()
+        if bool(spec.get("dynamic", True))
+    }
+
+
+def transform_matrix(position: list[float], quat_xyzw: list[float]) -> np.ndarray:
     rotation = np.eye(4)
     rotation[:3, :3] = Rotation.from_quat(quat_xyzw).as_matrix()
     translation = np.eye(4)
     translation[:3, 3] = np.asarray(position, dtype=np.float64)
-    mesh.apply_transform(translation @ rotation)
+    return translation @ rotation
+
+
+def object_pose(name: str, spec: dict, frame: dict) -> tuple[list[float], list[float]]:
+    frame_pose = frame.get(name)
+    if isinstance(frame_pose, dict):
+        position = frame_pose.get("position", spec.get("position", [0.0, 0.0, 0.0]))
+        quaternion = frame_pose.get("quaternion", spec.get("quaternion", [0.0, 0.0, 0.0, 1.0]))
+        return list(position), list(quaternion)
+    return list(spec.get("position", [0.0, 0.0, 0.0])), list(spec.get("quaternion", [0.0, 0.0, 0.0, 1.0]))
+
+
+def make_sphere_mesh(spec: dict, position: list[float], quat_xyzw: list[float], subdivisions: int) -> trimesh.Trimesh:
+    radius = float(spec.get("radius", 0.25))
+    mesh = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
+    mesh.apply_transform(transform_matrix(position, quat_xyzw))
     return mesh
 
 
-def build_frame_meshes(metadata: dict, frame: dict, subdivisions: int) -> tuple[trimesh.Trimesh, trimesh.Trimesh]:
-    ball_0 = make_ball_mesh(
-        radius=get_radius(metadata, "ball_0"),
-        position=frame["ball_0"]["position"],
-        quat_xyzw=frame["ball_0"]["quaternion"],
-        subdivisions=subdivisions,
-    )
-    ball_1 = make_ball_mesh(
-        radius=get_radius(metadata, "ball_1"),
-        position=frame["ball_1"]["position"],
-        quat_xyzw=frame["ball_1"]["quaternion"],
-        subdivisions=subdivisions,
-    )
-    return ball_0, ball_1
+def make_box_mesh(spec: dict, position: list[float], quat_xyzw: list[float]) -> trimesh.Trimesh:
+    size = spec.get("size", spec.get("extents", [1.0, 1.0, 1.0]))
+    mesh = trimesh.creation.box(extents=np.asarray(size, dtype=np.float64))
+    mesh.apply_transform(transform_matrix(position, quat_xyzw))
+    return mesh
+
+
+def make_object_mesh(name: str, spec: dict, frame: dict, sphere_subdivisions: int) -> trimesh.Trimesh:
+    position, quat_xyzw = object_pose(name, spec, frame)
+    object_type = str(spec.get("type", "sphere")).lower()
+    if object_type in {"sphere", "ball"}:
+        return make_sphere_mesh(spec, position, quat_xyzw, sphere_subdivisions)
+    if object_type in {"box", "cube", "cuboid"}:
+        return make_box_mesh(spec, position, quat_xyzw)
+    raise ValueError(f"Unsupported object type for {name}: {object_type!r}")
+
+
+def build_frame_meshes(metadata: dict, frame: dict, subdivisions: int) -> list[tuple[str, trimesh.Trimesh]]:
+    specs = dynamic_object_specs(metadata)
+    if not specs:
+        raise ValueError("Metadata does not define any dynamic objects.")
+    return [
+        (name, make_object_mesh(name, spec, frame, subdivisions))
+        for name, spec in specs.items()
+    ]
 
 
 def surface_dict(mesh: trimesh.Trimesh, num_points: int) -> dict[str, np.ndarray]:
@@ -129,7 +189,7 @@ def surface_dict(mesh: trimesh.Trimesh, num_points: int) -> dict[str, np.ndarray
 def write_points(
     output_path: Path,
     object_mesh: trimesh.Trimesh,
-    part_meshes: tuple[trimesh.Trimesh, trimesh.Trimesh],
+    part_meshes: list[trimesh.Trimesh],
     num_points: int,
     include_parts: bool,
 ) -> None:
@@ -181,12 +241,13 @@ def process_sequence(
         frame_preproc_dir.mkdir(parents=True, exist_ok=True)
 
         if overwrite or not points_path.exists():
-            ball_0_mesh, ball_1_mesh = build_frame_meshes(metadata, frame, sphere_subdivisions)
-            object_mesh = trimesh.util.concatenate([ball_0_mesh, ball_1_mesh])
+            named_part_meshes = build_frame_meshes(metadata, frame, sphere_subdivisions)
+            part_meshes = [mesh for _, mesh in named_part_meshes]
+            object_mesh = trimesh.util.concatenate(part_meshes) if len(part_meshes) > 1 else part_meshes[0].copy()
             write_points(
                 output_path=points_path,
                 object_mesh=object_mesh,
-                part_meshes=(ball_0_mesh, ball_1_mesh),
+                part_meshes=part_meshes,
                 num_points=num_points,
                 include_parts=include_parts,
             )
@@ -194,7 +255,8 @@ def process_sequence(
             with num_parts_path.open("w") as f:
                 json.dump(
                     {
-                        "num_parts": 2,
+                        "num_parts": len(part_meshes),
+                        "part_names": [part_name for part_name, _ in named_part_meshes],
                         "mesh_path": str((glb_dir / f"{name}.glb").resolve()) if write_glb else None,
                         "source_metadata": str(metadata_path.resolve()),
                     },
@@ -204,8 +266,8 @@ def process_sequence(
 
             if write_glb:
                 scene = trimesh.Scene()
-                scene.add_geometry(ball_0_mesh, geom_name="ball_0")
-                scene.add_geometry(ball_1_mesh, geom_name="ball_1")
+                for part_name, part_mesh in named_part_meshes:
+                    scene.add_geometry(part_mesh, geom_name=part_name)
                 scene.export(glb_dir / f"{name}.glb", file_type="glb")
 
         src_rgb = sequence_dir / "render_rgb" / f"{name}.png"
@@ -239,7 +301,7 @@ def main() -> None:
 
     sequence_dirs = find_sequence_dirs(input_root, args.sequence_glob)
     if not sequence_dirs:
-        raise FileNotFoundError(f"No two-ball sequences found under {input_root}")
+        raise FileNotFoundError(f"No synthetic physics sequences found under {input_root}")
 
     dataset_index = {}
     worker_count = max(1, int(args.workers))
@@ -256,7 +318,7 @@ def main() -> None:
                 write_glb=args.write_glb,
                 include_parts=args.include_parts,
             )
-            for sequence_dir in tqdm(sequence_dirs, desc="Preprocessing two-ball sequences")
+            for sequence_dir in tqdm(sequence_dirs, desc="Preprocessing synthetic physics sequences")
         ]
     else:
         results = []
@@ -276,7 +338,7 @@ def main() -> None:
                 )
                 for sequence_dir in sequence_dirs
             ]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Preprocessing two-ball sequences"):
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Preprocessing synthetic physics sequences"):
                 results.append(future.result())
 
     for sequence_name, entries in results:

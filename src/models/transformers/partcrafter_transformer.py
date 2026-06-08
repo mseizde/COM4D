@@ -127,6 +127,7 @@ from ..attention_processor import (
     TripoSGAttnProcessor2_0,
     PartCrafterAttnProcessor,
     PartFrameCrafterAttnProcessor,
+    trace_sequence_parallel_event,
 )
 from .modeling_outputs import Transformer1DModelOutput
 
@@ -975,6 +976,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         num_parts: Union[int, torch.Tensor],
         layout: str,
         phase: str,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
         frame_counts = self._as_count_list(num_frames)
         part_counts = self._as_count_list(num_parts, len(frame_counts))
@@ -991,7 +993,14 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         def _slice_optional(tensor: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
             return None if tensor is None else tensor[start:end]
 
+        def _phase_attention_kwargs(*, phase_num_parts: int, phase_num_frames: int) -> Dict[str, Any]:
+            kwargs = dict(attention_kwargs or {})
+            kwargs["num_parts"] = phase_num_parts
+            kwargs["num_frames"] = phase_num_frames
+            return kwargs
+
         def _spatial_phase() -> torch.Tensor:
+            trace_sequence_parallel_event("transformer.inference_spatial_phase_enter", hidden_states)
             offset = 0
             chunks = []
             for frame_count, part_count in zip(frame_counts, part_counts):
@@ -999,18 +1008,20 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 for frame_idx in range(frame_count):
                     start = offset + frame_idx * part_count
                     end = start + part_count
+                    trace_sequence_parallel_event("transformer.inference_spatial_block_call", hidden_states[start:end], frame_idx=frame_idx, part_count=part_count)
                     chunks.append(block(
                         hidden_states[start:end],
                         encoder_hidden_states=_slice_optional(encoder_hidden_states, start, end),
                         temb=temb[start:end],
                         image_rotary_emb=image_rotary_emb,
                         skip=_slice_optional(skip, start, end),
-                        attention_kwargs={"num_parts": part_count, "num_frames": 1},
+                        attention_kwargs=_phase_attention_kwargs(phase_num_parts=part_count, phase_num_frames=1),
                     ))
                 offset += total
             return torch.cat(chunks, dim=0)
 
         def _temporal_phase() -> torch.Tensor:
+            trace_sequence_parallel_event("transformer.inference_temporal_phase_enter", hidden_states)
             offset = 0
             chunks = []
             for frame_count, part_count in zip(frame_counts, part_counts):
@@ -1031,13 +1042,14 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 )
                 part_chunks = []
                 for part_idx in range(part_count):
+                    trace_sequence_parallel_event("transformer.inference_temporal_block_call", obj_state[:, part_idx], part_idx=part_idx, frame_count=frame_count)
                     part_chunks.append(block(
                         obj_state[:, part_idx].contiguous(),
                         encoder_hidden_states=None if obj_enc is None else obj_enc[:, part_idx].contiguous(),
                         temb=obj_temb[:, part_idx].contiguous(),
                         image_rotary_emb=image_rotary_emb,
                         skip=None if obj_skip is None else obj_skip[:, part_idx].contiguous(),
-                        attention_kwargs={"num_parts": 1, "num_frames": frame_count},
+                        attention_kwargs=_phase_attention_kwargs(phase_num_parts=1, phase_num_frames=frame_count),
                     ))
                 chunks.append(torch.stack(part_chunks, dim=1).reshape(total, *hidden_states.shape[1:]))
                 offset += total
@@ -1240,8 +1252,23 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # prepare negative encoder_hidden_states
         negative_encoder_hidden_states = torch.zeros_like(encoder_hidden_states) if encoder_hidden_states is not None else None
 
+        trace_sequence_parallel_event(
+            "transformer.forward_before_blocks",
+            hidden_states,
+            mixing_mode=mixing_mode,
+            mixing_active=mixing_active,
+            global_attn_block_ids=list(self.global_attn_block_ids),
+        )
         skips = []
         for layer, block in enumerate(self.blocks):
+            if layer == 0 or layer in self.global_attn_block_ids:
+                trace_sequence_parallel_event(
+                    "transformer.block_enter",
+                    hidden_states,
+                    layer=layer,
+                    is_global=layer in self.global_attn_block_ids,
+                    mixing_mode=mixing_mode,
+                )
             skip = None if layer <= self.config.num_layers // 2 else skips.pop()
             if (
                 (not self.enable_local_cross_attn)
@@ -1288,6 +1315,12 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 hidden_states = hidden_states + dynamic_embed.unsqueeze(dim=1)
 
             if mixing_active and mixing_mode == "inference_emulation" and (layer in self.global_attn_block_ids):
+                trace_sequence_parallel_event(
+                    "transformer.inference_emulation_enter",
+                    hidden_states,
+                    layer=layer,
+                    has_attention_kwargs=input_attention_kwargs is not None,
+                )
                 if layer in self.spatial_global_attn_block_ids:
                     emulation_phase = "spatial"
                 elif layer in self.temporal_global_attn_block_ids:
@@ -1321,6 +1354,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         local_layout: str = mixing_layout,
                         local_phase: str = emulation_phase,
                         local_skip_is_none: bool = skip_is_none,
+                        local_attention_kwargs: Optional[Dict[str, Any]] = input_attention_kwargs,
                     ) -> torch.Tensor:
                         return self._apply_inference_emulation_mixing(
                             block=local_block,
@@ -1333,6 +1367,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                             num_parts=local_num_parts,
                             layout=local_layout,
                             phase=local_phase,
+                            attention_kwargs=local_attention_kwargs,
                         )
 
                     ckpt_kwargs: Dict[str, Any] = (
@@ -1358,6 +1393,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         num_parts=num_parts_kw,
                         layout=mixing_layout,
                         phase=emulation_phase,
+                        attention_kwargs=input_attention_kwargs,
                     )
             elif mixing_active and mixing_mode in {"spatial_temporal", "temporal_spatial"} and (layer in self.global_attn_block_ids):
                 if self.training and self.gradient_checkpointing:

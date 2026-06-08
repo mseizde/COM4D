@@ -1,6 +1,11 @@
 from typing import Callable, List, Optional, Tuple, Union
 
+import os
+import sys
+import time
+
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 from diffusers.utils import logging
@@ -10,6 +15,288 @@ from einops import rearrange
 from torch import nn
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _sp_trace(event: str, tensor: Optional[torch.Tensor] = None, group=None, **fields) -> None:
+    if os.environ.get("COM4D_SP_TRACE", "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+    try:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get("RANK", "-1"))
+        group_rank = _get_group_rank(group) if dist.is_available() and dist.is_initialized() else -1
+        local_rank = os.environ.get("LOCAL_RANK", "?")
+        cuda_current = torch.cuda.current_device() if torch.cuda.is_available() and torch.cuda.is_initialized() else "uninit"
+        parts = [
+            f"ts={time.time():.6f}",
+            f"pid={os.getpid()}",
+            f"rank={rank}",
+            f"group_rank={group_rank}",
+            f"local_rank={local_rank}",
+            f"cuda_current={cuda_current}",
+            f"event={event}",
+        ]
+        if tensor is not None:
+            parts.extend([
+                f"shape={tuple(tensor.shape)}",
+                f"device={tensor.device}",
+                f"dtype={tensor.dtype}",
+            ])
+        parts.extend(f"{key}={value}" for key, value in fields.items())
+        trace_file = os.environ.get("COM4D_SP_TRACE_FILE") or f"/tmp/com4d_sp_trace_rank{rank}.log"
+        with open(trace_file, "a", encoding="utf-8") as handle:
+            handle.write(" ".join(parts) + "\n")
+    except Exception as exc:
+        print(
+            f"[COM4D_SP_TRACE] failed to write event={event!r}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def trace_sequence_parallel_event(event: str, tensor: Optional[torch.Tensor] = None, group=None, **fields) -> None:
+    _sp_trace(event, tensor=tensor, group=group, **fields)
+
+
+def _distributed_is_ready(group=None) -> bool:
+    return dist.is_available() and dist.is_initialized() and dist.get_world_size(group=group) > 1
+
+
+def _get_group_rank(group=None) -> int:
+    if group is None:
+        return dist.get_rank()
+    return dist.get_group_rank(group, dist.get_rank())
+
+
+def _pad_sequence_dim(tensor: torch.Tensor, multiple: int, dim: int = 2) -> Tuple[torch.Tensor, int]:
+    size = tensor.shape[dim]
+    pad_len = (multiple - size % multiple) % multiple
+    if pad_len == 0:
+        return tensor, 0
+
+    pad = [0] * (2 * tensor.dim())
+    pad[2 * (tensor.dim() - dim - 1) + 1] = pad_len
+    return F.pad(tensor, tuple(pad)), pad_len
+
+
+def _depad_sequence_dim(tensor: torch.Tensor, pad_len: int, dim: int = 2) -> torch.Tensor:
+    if pad_len == 0:
+        return tensor.contiguous()
+    keep = tensor.shape[dim] - pad_len
+    return tensor.narrow(dim, 0, keep).contiguous()
+
+
+class _HeadsSequenceAllToAll(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_tensor, process_group, scatter_dim, gather_dim):
+        ctx.process_group = process_group
+        ctx.scatter_dim = scatter_dim
+        ctx.gather_dim = gather_dim
+        world_size = dist.get_world_size(group=process_group)
+        _sp_trace("a2a.forward.enter", input_tensor, process_group, scatter_dim=scatter_dim, gather_dim=gather_dim, world_size=world_size)
+        chunks = [chunk.contiguous() for chunk in torch.chunk(input_tensor, world_size, dim=scatter_dim)]
+        outputs = [torch.empty_like(chunks[0]) for _ in range(world_size)]
+        _sp_trace("a2a.forward.before", input_tensor, process_group, chunk_shape=tuple(chunks[0].shape))
+        dist.all_to_all(outputs, chunks, group=process_group)
+        _sp_trace("a2a.forward.after", outputs[0], process_group)
+        return torch.cat(outputs, dim=gather_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_input = _HeadsSequenceAllToAll.apply(
+            grad_output,
+            ctx.process_group,
+            ctx.gather_dim,
+            ctx.scatter_dim,
+        )
+        return grad_input, None, None, None
+
+
+def _all_to_all_heads_sequence(
+    tensor: torch.Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    group=None,
+) -> torch.Tensor:
+    return _HeadsSequenceAllToAll.apply(tensor, group, scatter_dim, gather_dim)
+
+
+
+
+class _GatherSequenceShards(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input_tensor, process_group, gather_dim):
+        ctx.process_group = process_group
+        ctx.gather_dim = gather_dim
+        world_size = dist.get_world_size(group=process_group)
+        _sp_trace("gather.forward.enter", input_tensor, process_group, gather_dim=gather_dim, world_size=world_size)
+        outputs = [torch.empty_like(input_tensor) for _ in range(world_size)]
+        _sp_trace("gather.forward.before", input_tensor, process_group)
+        dist.all_gather(outputs, input_tensor.contiguous(), group=process_group)
+        _sp_trace("gather.forward.after", outputs[0], process_group)
+        return torch.cat(outputs, dim=gather_dim).contiguous()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        rank = _get_group_rank(ctx.process_group)
+        world_size = dist.get_world_size(group=ctx.process_group)
+        chunks = torch.chunk(grad_output, world_size, dim=ctx.gather_dim)
+        return chunks[rank].contiguous(), None, None
+
+
+def _gather_sequence_shards(tensor: torch.Tensor, group=None, dim: int = 2) -> torch.Tensor:
+    return _GatherSequenceShards.apply(tensor, group, dim)
+
+
+def _validate_replicated_tensor(tensor: torch.Tensor, *, group=None, name: str, atol: float = 1e-2) -> None:
+    if not _distributed_is_ready(group):
+        return
+    with torch.no_grad():
+        check = tensor.detach().float()
+        stats = torch.stack([
+            check.sum(),
+            check.square().sum(),
+            check.mean(),
+        ])
+        gathered = [torch.empty_like(stats) for _ in range(dist.get_world_size(group=group))]
+        _sp_trace("validate.before", stats, group, name=name)
+        dist.all_gather(gathered, stats, group=group)
+        _sp_trace("validate.after", gathered[0], group, name=name)
+        ref = gathered[0]
+        for idx, other in enumerate(gathered[1:], start=1):
+            if not torch.allclose(ref, other, atol=atol, rtol=1e-4):
+                raise ValueError(
+                    f"sequence_parallel_replicated_batch=True requires identical {name} on all SP ranks; "
+                    f"rank 0 stats={ref.tolist()}, rank {idx} stats={other.tolist()}. "
+                    "This usually means normal DDP is feeding different samples to each rank."
+                )
+
+
+def _sequence_parallel_replicated_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    group=None,
+    attention_mask: Optional[torch.Tensor] = None,
+    validate_replicated: bool = True,
+) -> torch.Tensor:
+    """Shard a replicated full [B, H, L, D] sequence across SP ranks for attention only."""
+    if query.is_cuda:
+        torch.cuda.set_device(query.device)
+    _sp_trace("replicated.enter", query, group, validate=validate_replicated)
+    if not _distributed_is_ready(group):
+        return F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
+    if attention_mask is not None:
+        raise ValueError("sequence-parallel replicated grouped self-attention does not support attention_mask yet.")
+
+    world_size = dist.get_world_size(group=group)
+    rank = _get_group_rank(group)
+    if query.shape[1] % world_size != 0:
+        raise ValueError(
+            f"num attention heads ({query.shape[1]}) must be divisible by sequence-parallel size ({world_size})."
+        )
+    original_seq_len = query.shape[2]
+    pad_len = (world_size - original_seq_len % world_size) % world_size
+    if validate_replicated:
+        _validate_replicated_tensor(query, group=group, name="query")
+        _validate_replicated_tensor(key, group=group, name="key")
+        _validate_replicated_tensor(value, group=group, name="value")
+    _sp_trace("replicated.after_validate", query, group, original_seq_len=original_seq_len, pad_len=pad_len)
+
+    if pad_len > 0:
+        query = _pad_sequence_dim(query, world_size, dim=2)[0]
+        key = _pad_sequence_dim(key, world_size, dim=2)[0]
+        value = _pad_sequence_dim(value, world_size, dim=2)[0]
+        padded_seq_len = query.shape[2]
+        pad_mask = torch.zeros(
+            1, 1, padded_seq_len, padded_seq_len,
+            dtype=torch.float32,
+            device=query.device,
+        )
+        pad_mask[..., original_seq_len:] = torch.finfo(torch.float32).min
+        attention_mask = pad_mask
+
+    shard_len = query.shape[2] // world_size
+    start = rank * shard_len
+    query_shard = query.narrow(2, start, shard_len).contiguous()
+    key_shard = key.narrow(2, start, shard_len).contiguous()
+    value_shard = value.narrow(2, start, shard_len).contiguous()
+
+    _sp_trace("replicated.before_inner", query_shard, group, shard_len=shard_len, start=start)
+    local_output = _sequence_parallel_sdpa(
+        query_shard,
+        key_shard,
+        value_shard,
+        group=group,
+        attention_mask=attention_mask,
+    )
+    _sp_trace("replicated.after_inner", local_output, group)
+    output = _gather_sequence_shards(local_output, group=group, dim=2)
+    return _depad_sequence_dim(output, pad_len, dim=2)
+
+
+def _sequence_parallel_sdpa(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    group=None,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Hunyuan/HY-World style sequence-parallel SDPA for already sequence-sharded
+    [B, H, L_local, D] tensors. Each SP rank must hold the same batch items and
+    a different sequence shard before this function is called.
+    """
+    if query.is_cuda:
+        torch.cuda.set_device(query.device)
+    _sp_trace("sp_sdpa.enter", query, group)
+    if not _distributed_is_ready(group):
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+
+    world_size = dist.get_world_size(group=group)
+    if query.shape[1] % world_size != 0:
+        raise ValueError(
+            f"num attention heads ({query.shape[1]}) must be divisible by sequence-parallel size ({world_size})."
+        )
+
+    local_length = torch.tensor([query.shape[2]], device=query.device, dtype=torch.int64)
+    gathered_lengths = [torch.empty_like(local_length) for _ in range(world_size)]
+    _sp_trace("length.before", local_length, group)
+    dist.all_gather(gathered_lengths, local_length, group=group)
+    _sp_trace("length.after", gathered_lengths[0], group)
+    local_lengths = [int(length.item()) for length in gathered_lengths]
+    if len(set(local_lengths)) != 1:
+        raise ValueError(
+            "sequence-parallel grouped self-attention currently requires equal sequence shard lengths "
+            f"on all ranks, got {local_lengths}."
+        )
+
+    qkv = torch.cat([query, key, value], dim=0).contiguous()
+
+    # [3B, H, L_local, D] -> [3B, H/P, L_global, D]
+    _sp_trace("sp_sdpa.before_first_a2a", qkv, group)
+    qkv = _all_to_all_heads_sequence(qkv, scatter_dim=1, gather_dim=2, group=group)
+    _sp_trace("sp_sdpa.after_first_a2a", qkv, group)
+    query_sp, key_sp, value_sp = qkv.chunk(3, dim=0)
+
+    _sp_trace("sp_sdpa.before_sdpa", query_sp, group)
+    hidden_states = F.scaled_dot_product_attention(
+        query_sp,
+        key_sp,
+        value_sp,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+
+    _sp_trace("sp_sdpa.after_sdpa", hidden_states, group)
+    # [B, H/P, L_global, D] -> [B, H, L_local, D]
+    hidden_states = _all_to_all_heads_sequence(hidden_states, scatter_dim=2, gather_dim=1, group=group)
+    _sp_trace("sp_sdpa.after_second_a2a", hidden_states, group)
+    return hidden_states.contiguous()
+
 
 class FlashTripo2AttnProcessor2_0:
     r"""
@@ -629,13 +916,19 @@ class PartFrameCrafterAttnProcessor:
     Multi-instance attention processor that supports either spatial grouping by parts or temporal grouping by frames.
     Accepts either `num_parts` or `num_frames` in kwargs (tensor per-object or int). If both are provided, `num_frames`
     takes precedence.
+
+    The optional sequence-parallel backend is only for already sequence-sharded grouped self-attention. It must not be
+    enabled for ordinary DDP batches, where each rank owns different samples rather than a different shard of the same
+    sequence.
     """
 
-    def __init__(self):
+    def __init__(self, sequence_parallel_attention: bool = False, sequence_parallel_group=None):
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
                 "AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
             )
+        self.sequence_parallel_attention = sequence_parallel_attention
+        self.sequence_parallel_group = sequence_parallel_group
 
     def __call__(
         self,
@@ -647,8 +940,30 @@ class PartFrameCrafterAttnProcessor:
         image_rotary_emb: Optional[torch.Tensor] = None,
         num_parts: Optional[Union[int, torch.Tensor]] = None,
         num_frames: Optional[Union[int, torch.Tensor]] = None,
+        sequence_parallel_attention: Optional[bool] = None,
+        sequence_parallel_group=None,
+        sequence_parallel_sharded: bool = False,
+        sequence_parallel_replicated_batch: bool = False,
+        sequence_parallel_validate_replicated: bool = True,
     ) -> torch.Tensor:
         from diffusers.models.embeddings import apply_rotary_emb
+
+        use_sequence_parallel = (
+            self.sequence_parallel_attention
+            if sequence_parallel_attention is None
+            else sequence_parallel_attention
+        )
+        sequence_parallel_group = (
+            self.sequence_parallel_group
+            if sequence_parallel_group is None
+            else sequence_parallel_group
+        )
+        if use_sequence_parallel and not (sequence_parallel_sharded or sequence_parallel_replicated_batch):
+            raise ValueError(
+                "sequence_parallel_attention=True requires either sequence_parallel_sharded=True or "
+                "sequence_parallel_replicated_batch=True. Normal DDP batches contain different samples per rank; "
+                "using SP attention on them would mix unrelated examples across GPUs."
+            )
 
         # Choose grouping cardinality. If caller explicitly passes `num_frames=1`, fall back to
         # part-based grouping so static passes can still leverage part embeddings without mixing frames.
@@ -674,6 +989,8 @@ class PartFrameCrafterAttnProcessor:
         num_instances = num_frames if num_frames is not None else num_parts
 
         if num_instances is None:
+            if use_sequence_parallel:
+                raise ValueError("sequence_parallel_attention requires num_parts or num_frames grouping metadata.")
             # Fallback to plain attention without grouping
             proc = TripoSGAttnProcessor2_0()
             return proc(attn, hidden_states, encoder_hidden_states, attention_mask, temb, image_rotary_emb)
@@ -764,7 +1081,25 @@ class PartFrameCrafterAttnProcessor:
                     k = rearrange(k, "(b ni) h nt c -> b h (ni nt) c", ni=n_i)
                     v = rearrange(v, "(b ni) h nt c -> b h (ni nt) c", ni=n_i)
                     q = rearrange(q, "(b ni) h nt c -> b h (ni nt) c", ni=n_i)
-                    h_s = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+                    if use_sequence_parallel and sequence_parallel_replicated_batch:
+                        h_s = _sequence_parallel_replicated_sdpa(
+                            q,
+                            k,
+                            v,
+                            group=sequence_parallel_group,
+                            attention_mask=attention_mask,
+                            validate_replicated=sequence_parallel_validate_replicated,
+                        )
+                    elif use_sequence_parallel:
+                        h_s = _sequence_parallel_sdpa(
+                            q,
+                            k,
+                            v,
+                            group=sequence_parallel_group,
+                            attention_mask=attention_mask,
+                        )
+                    else:
+                        h_s = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
                     h_s = h_s.transpose(1, 2).reshape(n_i, -1, attn.heads * head_dim)
                 else:
                     # #### HERE CROSS_ATTN BUG START
@@ -783,9 +1118,27 @@ class PartFrameCrafterAttnProcessor:
                 key = rearrange(key, "(b ni) h nt c -> b h (ni nt) c", ni=num_instances)
                 value = rearrange(value, "(b ni) h nt c -> b h (ni nt) c", ni=num_instances)
                 query = rearrange(query, "(b ni) h nt c -> b h (ni nt) c", ni=num_instances)
-                hidden_states = F.scaled_dot_product_attention(
-                    query, key, value, dropout_p=0.0, is_causal=False
-                )
+                if use_sequence_parallel and sequence_parallel_replicated_batch:
+                    hidden_states = _sequence_parallel_replicated_sdpa(
+                        query,
+                        key,
+                        value,
+                        group=sequence_parallel_group,
+                        attention_mask=attention_mask,
+                        validate_replicated=sequence_parallel_validate_replicated,
+                    )
+                elif use_sequence_parallel:
+                    hidden_states = _sequence_parallel_sdpa(
+                        query,
+                        key,
+                        value,
+                        group=sequence_parallel_group,
+                        attention_mask=attention_mask,
+                    )
+                else:
+                    hidden_states = F.scaled_dot_product_attention(
+                        query, key, value, dropout_p=0.0, is_causal=False
+                    )
                 hidden_states = hidden_states.transpose(1, 2).reshape(
                     batch_size, -1, attn.heads * head_dim
                 )

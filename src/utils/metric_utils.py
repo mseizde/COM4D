@@ -217,7 +217,8 @@ def compute_f_score(
     min_1_to_2, min_2_to_1 = compute_mutual_nearest_distance_for_meshes(mesh1, mesh2, num_samples, metric=metric)
     precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
     precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
-    fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
+    denom = precision_1 + precision_2
+    fscore = 0.0 if denom == 0.0 else 2 * precision_1 * precision_2 / denom
     return fscore
 
 def compute_cd_and_f_score(
@@ -231,7 +232,8 @@ def compute_cd_and_f_score(
     chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
     precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
     precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
-    fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
+    denom = precision_1 + precision_2
+    fscore = 0.0 if denom == 0.0 else 2 * precision_1 * precision_2 / denom
     return chamfer_dist, fscore
 
 def compute_cd_and_f_score_in_training(
@@ -249,7 +251,8 @@ def compute_cd_and_f_score_in_training(
     chamfer_dist = np.mean(min_2_to_1) + np.mean(min_1_to_2)
     precision_1 = np.mean((min_1_to_2 < threshold).astype(np.float32))
     precision_2 = np.mean((min_2_to_1 < threshold).astype(np.float32))
-    fscore = 2 * precision_1 * precision_2 / (precision_1 + precision_2)
+    denom = precision_1 + precision_2
+    fscore = 0.0 if denom == 0.0 else 2 * precision_1 * precision_2 / denom
     return chamfer_dist, fscore
 
 def get_voxel_set(

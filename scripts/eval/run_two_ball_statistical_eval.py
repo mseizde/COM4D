@@ -7,7 +7,19 @@ Outputs are intentionally long-form so they work for more than one physics model
   <eval-root>/two_ball_statistical_tests.csv
   <eval-root>/two_ball_per_frame_metrics_full.csv
   <eval-root>/two_ball_model_runs.csv
+  <eval-root>/predictions/<sample>/<model>/<run-tag>_<timestamp>/...
   <eval-root>/metrics/<sample>/<model>/{physics,reconstruction}/...
+
+Quick visual loop:
+  python COM4D/scripts/eval/run_two_ball_statistical_eval.py --quick
+
+This runs only representative two-ball samples, inference only, one worker:
+  two_ball_eval_000, two_ball_eval_003, two_ball_eval_007
+
+Use --quick --quick-metrics after visual inspection to compute metrics on that
+same small subset. Reserve full metrics for branches that pass the GIF/GLB
+visual check: identity preservation, actual motion, no object swapping,
+plausible collision response, and no collapse/explosion.
 """
 
 from __future__ import annotations
@@ -36,6 +48,7 @@ EVALUATE_RECONSTRUCTION = SCRIPT_DIR / "evaluate_reconstruction.py"
 DEFAULT_DATASET_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/two_ball_compare")
 DEFAULT_EVAL_ROOT = PROJECT_ROOT / "outputs" / "evaluation" / "two_ball_compare"
 DEFAULT_BASE_WEIGHTS = "pretrained_weights/TripoSG"
+QUICK_SAMPLES = ["two_ball_eval_000", "two_ball_eval_003", "two_ball_eval_007"]
 DEFAULT_MODELS = [
     ("base", REPO_ROOT / "pretrained_weights" / "COM4D" / "transformer_ema"),
     ("joint_1500", PROJECT_ROOT / "outputs" / "ckpts" / "physics_st_mix_joint_from_t2s_humoto_1000" / "checkpoints" / "001500"),
@@ -45,14 +58,46 @@ DEFAULT_MODELS = [
 
 
 RECON_SUMMARY_FIELDS = [
+    # Backward-compatible raw metric aliases from evaluate_reconstruction.py.
     "scene_chamfer_distance_mean",
-    "scene_bbox_iou_3d_mean",
+    "scene_f_score_mean",
+    "scene_voxel_iou_mean",
     "object_chamfer_distance_mean",
-    "object_bbox_iou_3d_mean",
+    "object_f_score_mean",
+    "object_voxel_iou_mean",
     "scene_per_frame_chamfer_distance_mean",
     "scene_per_frame_iou_mean",
     "object_per_frame_chamfer_distance_mean",
     "object_per_frame_iou_mean",
+    # Explicit raw metrics.
+    "scene_raw_chamfer_distance_mean",
+    "scene_raw_f_score_mean",
+    "scene_raw_voxel_iou_mean",
+    "object_raw_chamfer_distance_mean",
+    "object_raw_f_score_mean",
+    "object_raw_voxel_iou_mean",
+    "scene_raw_per_frame_chamfer_distance_mean",
+    "scene_raw_per_frame_iou_mean",
+    "object_raw_per_frame_chamfer_distance_mean",
+    "object_raw_per_frame_iou_mean",
+    # Sequence-level aligned metrics, populated when --recon-alignment is not none.
+    "scene_aligned_chamfer_distance_mean",
+    "scene_aligned_f_score_mean",
+    "scene_aligned_voxel_iou_mean",
+    "object_aligned_chamfer_distance_mean",
+    "object_aligned_f_score_mean",
+    "object_aligned_voxel_iou_mean",
+    "scene_aligned_per_frame_chamfer_distance_mean",
+    "scene_aligned_per_frame_iou_mean",
+    "object_aligned_per_frame_chamfer_distance_mean",
+    "object_aligned_per_frame_iou_mean",
+    # Diagnostic bounding-box metrics are kept in CSV/JSON, but they are not the headline IoU.
+    "scene_bbox_iou_3d_mean",
+    "object_bbox_iou_3d_mean",
+    "scene_raw_bbox_iou_3d_mean",
+    "object_raw_bbox_iou_3d_mean",
+    "scene_aligned_bbox_iou_3d_mean",
+    "object_aligned_bbox_iou_3d_mean",
 ]
 PHYSICS_SUMMARY_FIELDS = [
     "bbox_collision_rate",
@@ -80,7 +125,47 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--eval-root", type=Path, default=DEFAULT_EVAL_ROOT)
     ap.add_argument("--sample-glob", default="two_ball_eval_*")
     ap.add_argument("--sample", action="append", default=None, help="Specific sample name. Can be repeated.")
-    ap.add_argument("--model", action="append", type=parse_model, default=None, help="TAG=TRANSFORMER_PATH. Can be repeated.")
+    ap.add_argument(
+        "--quick",
+        action="store_true",
+        help=(
+            "Use the visual-inspection loop: representative samples "
+            f"{', '.join(QUICK_SAMPLES)}, inference only, and one worker."
+        ),
+    )
+    ap.add_argument(
+        "--quick-metrics",
+        action="store_true",
+        help="With --quick, also run reconstruction/physics metrics on the quick sample subset.",
+    )
+    ap.add_argument(
+        "--model",
+        action="append",
+        type=parse_model,
+        default=None,
+        help=(
+            "TAG=TRANSFORMER_PATH. By default this augments/replaces the discovered prediction-model intersection; "
+            "combine with --no-discover-prediction-models for explicit-only evaluation. Can be repeated."
+        ),
+    )
+    ap.add_argument(
+        "--extra-model",
+        action="append",
+        type=parse_model,
+        default=None,
+        help=(
+            "Additional TAG=TRANSFORMER_PATH to evaluate after the models discovered from existing predictions. "
+            "Can be repeated."
+        ),
+    )
+    ap.add_argument(
+        "--no-discover-prediction-models",
+        action="store_true",
+        help=(
+            "Do not auto-discover the intersection of model tags present under "
+            "<eval-root>/predictions/<sample>/. With this flag, only --model/--extra-model or DEFAULT_MODELS are used."
+        ),
+    )
     ap.add_argument("--base-model-tag", default="base", help="Baseline tag used for paired statistical tests.")
     ap.add_argument("--base-weights-dir", default=DEFAULT_BASE_WEIGHTS)
     ap.add_argument("--num-tokens", type=int, default=1024)
@@ -93,6 +178,23 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--skip-prepare-input", action="store_true")
     ap.add_argument("--reuse-predictions", action="store_true", help="Reuse newest prediction matching <model>_<sample>_* if present.")
     ap.add_argument("--skip-existing-metrics", action="store_true", help="Do not re-evaluate runs that already have reconstruction metrics.")
+    ap.add_argument(
+        "--force-metrics",
+        action="store_true",
+        help="Recompute metrics even when metrics already exist; useful with --reuse-predictions.",
+    )
+    ap.add_argument(
+        "--recon-alignment",
+        choices=("none", "translation", "similarity"),
+        default="similarity",
+        help="Sequence-level prediction-to-GT alignment used for additional reconstruction metrics.",
+    )
+    ap.add_argument(
+        "--recon-object-assignment",
+        choices=("fixed", "best"),
+        default="best",
+        help="Object matching mode for reconstruction metrics.",
+    )
     ap.add_argument("--only-inference", action="store_true", help="Run/collect predictions only; skip metrics and aggregate CSVs.")
     ap.add_argument("--only-aggregate", action="store_true", help="Skip inference/evaluation and rebuild aggregate CSVs from existing metrics.")
     ap.add_argument("--parallel-workers", type=int, default=1, help="Number of independent model/sample jobs to run concurrently.")
@@ -221,32 +323,91 @@ def prepare_input(args: argparse.Namespace, sample: str, raw_dir: Path, input_di
     )
 
 
-def newest_prediction(predictions_dir: Path, tag_prefix: str) -> Path | None:
-    candidates = [path for path in predictions_dir.glob(f"{tag_prefix}_*") if path.is_dir()]
-    if not candidates:
+def prediction_has_reconstruction_outputs(path: Path) -> bool:
+    return any((path / "dynamic").glob("dynamic_scene_frame_*.glb")) or any(
+        (path / "dynamic").glob("object_*/frame_*.glb")
+    )
+
+
+def prediction_parent(predictions_root: Path, sample: str, model_tag: str) -> Path:
+    return predictions_root / sample / model_tag
+
+
+def newest_prediction(predictions_root: Path, sample: str, model_tag: str) -> Path | None:
+    new_parent = prediction_parent(predictions_root, sample, model_tag)
+    candidates = [path for path in new_parent.glob(f"{model_tag}_*") if path.is_dir()]
+
+    # Backward compatibility for the old flat layout:
+    #   predictions/<model>_<sample>_<timestamp>/...
+    legacy_prefix = f"{model_tag}_{sample}"
+    candidates.extend(path for path in predictions_root.glob(f"{legacy_prefix}_*") if path.is_dir())
+
+    complete = [path for path in candidates if prediction_has_reconstruction_outputs(path)]
+    skipped = len(candidates) - len(complete)
+    if skipped:
+        print(f"[warn] ignoring {skipped} incomplete reused prediction(s) for {sample}/{model_tag}", flush=True)
+    if not complete:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    return max(complete, key=lambda path: path.stat().st_mtime)
+
+
+def discover_prediction_model_tags(predictions_root: Path, samples: list[str]) -> list[str]:
+    """Return model tags with complete predictions for every selected sample."""
+    sample_sets: list[set[str]] = []
+    for sample in samples:
+        sample_dir = predictions_root / sample
+        if not sample_dir.is_dir():
+            print(f"[warn] no prediction directory for {sample}: {sample_dir}", flush=True)
+            sample_sets.append(set())
+            continue
+        tags = {path.name for path in sample_dir.iterdir() if path.is_dir()}
+        complete_tags = {tag for tag in tags if newest_prediction(predictions_root, sample, tag) is not None}
+        sample_sets.append(complete_tags)
+    if not sample_sets:
+        return []
+    common = set.intersection(*sample_sets)
+    return sorted(common)
+
+
+def model_path_for_log(transformer: Path | None) -> str:
+    return str(transformer) if transformer is not None else ""
 
 
 def run_inference(
     args: argparse.Namespace,
     model_tag: str,
-    transformer: Path,
+    transformer: Path | None,
     sample: str,
     input_dir: Path,
     predictions_dir: Path,
     gpu_id: str | None = None,
 ) -> Path:
-    run_tag = f"{model_tag}_{sample}"
+    run_tag = model_tag
+    run_parent = prediction_parent(predictions_dir, sample, model_tag)
+    run_parent.mkdir(parents=True, exist_ok=True)
     if args.reuse_predictions and not args.force:
-        existing = newest_prediction(predictions_dir, run_tag)
+        existing = newest_prediction(predictions_dir, sample, model_tag)
         if existing is not None:
             print(f"Reusing prediction: {existing}", flush=True)
             return existing
-    before = set(predictions_dir.glob(f"{run_tag}_*")) if predictions_dir.exists() else set()
+    if transformer is None:
+        raise RuntimeError(
+            f"No transformer path is known for discovered model {model_tag!r} on {sample}; "
+            "rerun with --reuse-predictions or provide it via --extra-model/--model."
+        )
+    before = set(run_parent.glob(f"{run_tag}_*")) if run_parent.exists() else set()
     env = os.environ.copy()
     if gpu_id is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+        parent_visible = [item.strip() for item in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if item.strip()]
+        gpu_id_str = str(gpu_id)
+        if parent_visible:
+            try:
+                gpu_index = int(gpu_id_str)
+            except ValueError:
+                gpu_index = -1
+            if 0 <= gpu_index < len(parent_visible):
+                gpu_id_str = parent_visible[gpu_index]
+        env["CUDA_VISIBLE_DEVICES"] = gpu_id_str
     run(
         [
             sys.executable,
@@ -258,7 +419,7 @@ def run_inference(
             "--masks_static_dir",
             input_dir / "masks_static",
             "--output_dir",
-            predictions_dir,
+            run_parent,
             "--tag",
             run_tag,
             "--transformer_dir",
@@ -298,10 +459,10 @@ def run_inference(
         env=env,
     )
     if args.dry_run:
-        return predictions_dir / f"{run_tag}_DRY_RUN"
-    candidates = [path for path in predictions_dir.glob(f"{run_tag}_*") if path.is_dir() and path not in before]
+        return run_parent / f"{run_tag}_DRY_RUN"
+    candidates = [path for path in run_parent.glob(f"{run_tag}_*") if path.is_dir() and path not in before]
     if not candidates:
-        candidates = [path for path in predictions_dir.glob(f"{run_tag}_*") if path.is_dir()]
+        candidates = [path for path in run_parent.glob(f"{run_tag}_*") if path.is_dir()]
     if not candidates:
         raise FileNotFoundError(f"No prediction output found for tag {run_tag}")
     return max(candidates, key=lambda path: path.stat().st_mtime)
@@ -312,12 +473,25 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
     physics_dir = metrics_dir / sample / model_tag / "physics"
     recon_json = recon_dir / "metrics.json"
     physics_json = physics_dir / "metrics.json"
-    if not args.skip_existing_metrics or args.force or not recon_json.is_file():
+    if args.force_metrics or not args.skip_existing_metrics or args.force or not recon_json.is_file():
         run(
-            [sys.executable, EVALUATE_RECONSTRUCTION, "--pred-dir", pred_dir, "--gt-dir", raw_dir, "--output-dir", recon_dir],
+            [
+                sys.executable,
+                EVALUATE_RECONSTRUCTION,
+                "--pred-dir",
+                pred_dir,
+                "--gt-dir",
+                raw_dir,
+                "--output-dir",
+                recon_dir,
+                "--alignment",
+                args.recon_alignment,
+                "--object-assignment",
+                args.recon_object_assignment,
+            ],
             dry_run=args.dry_run,
         )
-    if not args.skip_existing_metrics or args.force or not physics_json.is_file():
+    if args.force_metrics or not args.skip_existing_metrics or args.force or not physics_json.is_file():
         run(
             [
                 sys.executable,
@@ -345,10 +519,20 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
                     "level": row.get("level"),
                     "object_id": row.get("object_id"),
                     "frame": row.get("frame"),
+                    "gt_object_id": row.get("gt_object_id"),
                     "per_frame_chamfer_distance": row.get("chamfer_distance"),
-                    "per_frame_iou": row.get("bbox_iou_3d"),
+                    "per_frame_iou": row.get("voxel_iou"),
+                    "per_frame_bbox_iou_3d": row.get("bbox_iou_3d"),
                     "f_score": row.get("f_score"),
                     "bbox_overlap_volume": row.get("bbox_overlap_volume"),
+                    "raw_per_frame_chamfer_distance": row.get("raw_chamfer_distance"),
+                    "raw_per_frame_iou": row.get("raw_voxel_iou"),
+                    "raw_per_frame_bbox_iou_3d": row.get("raw_bbox_iou_3d"),
+                    "raw_f_score": row.get("raw_f_score"),
+                    "aligned_per_frame_chamfer_distance": row.get("aligned_chamfer_distance"),
+                    "aligned_per_frame_iou": row.get("aligned_voxel_iou"),
+                    "aligned_per_frame_bbox_iou_3d": row.get("aligned_bbox_iou_3d"),
+                    "aligned_f_score": row.get("aligned_f_score"),
                     "pred_path": row.get("pred_path"),
                     "gt_path": row.get("gt_path"),
                 }
@@ -357,7 +541,7 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
 
 
 
-def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, transformer: Path, dataset_root: Path, eval_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, transformer: Path | None, dataset_root: Path, eval_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     metrics_dir = eval_root / "metrics"
     recon_json = metrics_dir / sample / model_tag / "reconstruction" / "metrics.json"
     physics_json = metrics_dir / sample / model_tag / "physics" / "metrics.json"
@@ -373,7 +557,7 @@ def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, t
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "sample_name": sample,
         "model_tag": model_tag,
-        "transformer": str(transformer),
+        "transformer": model_path_for_log(transformer),
         "pred_dir": pred_dir,
         "animation_gif": str(Path(pred_dir) / "animation.gif") if pred_dir else "",
         "raw_dir": str(dataset_root / "gt_raw" / sample),
@@ -388,15 +572,25 @@ def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, t
                 {
                     "sample_name": sample,
                     "model_tag": model_tag,
-                    "transformer": str(transformer),
+                    "transformer": model_path_for_log(transformer),
                     "pred_dir": pred_dir,
                     "level": pf.get("level"),
                     "object_id": pf.get("object_id"),
                     "frame": pf.get("frame"),
+                    "gt_object_id": pf.get("gt_object_id"),
                     "per_frame_chamfer_distance": pf.get("chamfer_distance"),
-                    "per_frame_iou": pf.get("bbox_iou_3d"),
+                    "per_frame_iou": pf.get("voxel_iou"),
+                    "per_frame_bbox_iou_3d": pf.get("bbox_iou_3d"),
                     "f_score": pf.get("f_score"),
                     "bbox_overlap_volume": pf.get("bbox_overlap_volume"),
+                    "raw_per_frame_chamfer_distance": pf.get("raw_chamfer_distance"),
+                    "raw_per_frame_iou": pf.get("raw_voxel_iou"),
+                    "raw_per_frame_bbox_iou_3d": pf.get("raw_bbox_iou_3d"),
+                    "raw_f_score": pf.get("raw_f_score"),
+                    "aligned_per_frame_chamfer_distance": pf.get("aligned_chamfer_distance"),
+                    "aligned_per_frame_iou": pf.get("aligned_voxel_iou"),
+                    "aligned_per_frame_bbox_iou_3d": pf.get("aligned_bbox_iou_3d"),
+                    "aligned_f_score": pf.get("aligned_f_score"),
                     "pred_path": pf.get("pred_path"),
                     "gt_path": pf.get("gt_path"),
                 }
@@ -408,7 +602,7 @@ def run_one_job(
     args: argparse.Namespace,
     sample: str,
     model_tag: str,
-    transformer: Path,
+    transformer: Path | None,
     dataset_root: Path,
     eval_root: Path,
     gpu_id: str | None,
@@ -421,7 +615,7 @@ def run_one_job(
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "sample_name": sample,
             "model_tag": model_tag,
-            "transformer": str(transformer),
+            "transformer": model_path_for_log(transformer),
             "pred_dir": str(pred_dir),
             "animation_gif": str(pred_dir / "animation.gif"),
             "raw_dir": str(raw_dir),
@@ -433,7 +627,7 @@ def run_one_job(
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "sample_name": sample,
         "model_tag": model_tag,
-        "transformer": str(transformer),
+        "transformer": model_path_for_log(transformer),
         "pred_dir": str(pred_dir),
         "animation_gif": str(pred_dir / "animation.gif"),
         "raw_dir": str(raw_dir),
@@ -442,7 +636,7 @@ def run_one_job(
     row.update(recon_summary)
     row.update(physics_summary)
     for pf in per_frame:
-        pf.update({"transformer": str(transformer), "pred_dir": str(pred_dir)})
+        pf.update({"transformer": model_path_for_log(transformer), "pred_dir": str(pred_dir)})
     return row, per_frame
 
 
@@ -531,18 +725,27 @@ def generate_report(
         reconstruction_rows.append(
             [
                 model,
-                fmt(row_metric(summary_rows, model, "scene_chamfer_distance_mean"), 3),
-                fmt(row_metric(summary_rows, model, "scene_bbox_iou_3d_mean"), 4),
-                fmt(row_metric(summary_rows, model, "object_chamfer_distance_mean"), 3),
-                fmt(row_metric(summary_rows, model, "object_bbox_iou_3d_mean"), 5),
+                fmt(row_metric(summary_rows, model, "scene_raw_chamfer_distance_mean"), 3),
+                fmt(row_metric(summary_rows, model, "scene_raw_voxel_iou_mean"), 4),
+                fmt(row_metric(summary_rows, model, "object_raw_chamfer_distance_mean"), 3),
+                fmt(row_metric(summary_rows, model, "object_raw_voxel_iou_mean"), 5),
+                fmt(row_metric(summary_rows, model, "scene_aligned_chamfer_distance_mean"), 3),
+                fmt(row_metric(summary_rows, model, "scene_aligned_voxel_iou_mean"), 4),
+                fmt(row_metric(summary_rows, model, "object_aligned_chamfer_distance_mean"), 3),
+                fmt(row_metric(summary_rows, model, "object_aligned_f_score_mean"), 4),
+                fmt(row_metric(summary_rows, model, "object_aligned_voxel_iou_mean"), 5),
             ]
         )
 
     win_specs = [
-        ("Scene Chamfer ↓", "scene_chamfer_distance_mean", "min"),
-        ("Scene IoU ↑", "scene_bbox_iou_3d_mean", "max"),
-        ("Object Chamfer ↓", "object_chamfer_distance_mean", "min"),
-        ("Object IoU ↑", "object_bbox_iou_3d_mean", "max"),
+        ("Raw Scene Chamfer ↓", "scene_raw_chamfer_distance_mean", "min"),
+        ("Raw Scene Voxel IoU ↑", "scene_raw_voxel_iou_mean", "max"),
+        ("Raw Object Chamfer ↓", "object_raw_chamfer_distance_mean", "min"),
+        ("Raw Object Voxel IoU ↑", "object_raw_voxel_iou_mean", "max"),
+        ("Aligned Scene Chamfer ↓", "scene_aligned_chamfer_distance_mean", "min"),
+        ("Aligned Scene Voxel IoU ↑", "scene_aligned_voxel_iou_mean", "max"),
+        ("Aligned Object Chamfer ↓", "object_aligned_chamfer_distance_mean", "min"),
+        ("Aligned Object Voxel IoU ↑", "object_aligned_voxel_iou_mean", "max"),
     ]
     win_rows = [[label, format_counts(winner_counts(model_rows, metric, direction))] for label, metric, direction in win_specs]
 
@@ -558,10 +761,10 @@ def generate_report(
             ]
         )
 
-    best_scene_chamfer = best_model(summary_rows, models, "scene_chamfer_distance_mean", "min")
-    best_object_chamfer = best_model(summary_rows, models, "object_chamfer_distance_mean", "min")
-    best_scene_iou = best_model(summary_rows, models, "scene_bbox_iou_3d_mean", "max")
-    best_object_iou = best_model(summary_rows, models, "object_bbox_iou_3d_mean", "max")
+    best_scene_chamfer = best_model(summary_rows, models, "scene_aligned_chamfer_distance_mean", "min")
+    best_object_chamfer = best_model(summary_rows, models, "object_aligned_chamfer_distance_mean", "min")
+    best_scene_iou = best_model(summary_rows, models, "scene_aligned_voxel_iou_mean", "max")
+    best_object_iou = best_model(summary_rows, models, "object_aligned_voxel_iou_mean", "max")
     best_collision = best_model(summary_rows, models, "bbox_collision_rate", "min")
     best_scale = best_model(summary_rows, models, "scale_error_mean", "min")
     best_accel = best_model(summary_rows, models, "trajectory_acceleration_max_mean", "min")
@@ -577,12 +780,23 @@ def generate_report(
     lines = [
         f"Here is the summary from the full {len(samples)}-sample / {len(models)}-model run.",
         "",
-        "Metrics are sample-level means; Chamfer lower is better, IoU higher is better.",
+        "Metrics are sample-level means; Chamfer lower is better, F-score and voxel IoU higher are better.",
         "",
         "## Main Reconstruction Metrics",
         "",
         markdown_table(
-            ["Model", "Scene Chamfer ↓", "Scene IoU ↑", "Object Chamfer ↓", "Object IoU ↑"],
+            [
+                "Model",
+                "Raw Scene Chamfer ↓",
+                "Raw Scene IoU ↑",
+                "Raw Object Chamfer ↓",
+                "Raw Object IoU ↑",
+                "Aligned Scene Chamfer ↓",
+                "Aligned Scene IoU ↑",
+                "Aligned Object Chamfer ↓",
+                "Aligned Object F ↑",
+                "Aligned Object IoU ↑",
+            ],
             reconstruction_rows,
         ),
         "",
@@ -590,7 +804,7 @@ def generate_report(
         "",
         markdown_table(["Metric", "Winner Count"], win_rows),
         "",
-        "Object IoU can have ties, so counts can exceed the number of samples.",
+        "Object voxel IoU can have ties, so counts can exceed the number of samples.",
         "",
         "## Physics Metrics",
         "",
@@ -610,20 +824,20 @@ def generate_report(
     lines.append("")
 
     if best_object_chamfer:
-        t_p = test_metric(test_rows, best_object_chamfer, "object_chamfer_distance_mean", "paired_t_p")
-        w_p = test_metric(test_rows, best_object_chamfer, "object_chamfer_distance_mean", "wilcoxon_p")
+        t_p = test_metric(test_rows, best_object_chamfer, "object_aligned_chamfer_distance_mean", "paired_t_p")
+        w_p = test_metric(test_rows, best_object_chamfer, "object_aligned_chamfer_distance_mean", "wilcoxon_p")
         if best_object_chamfer == base_model_tag:
-            lines.append(f"{base_model_tag} has the best object Chamfer mean among all models.")
+            lines.append(f"{base_model_tag} has the best aligned object Chamfer mean among all models.")
         else:
             significance = "significant" if (not math.isnan(t_p) and t_p < 0.05) or (not math.isnan(w_p) and w_p < 0.05) else "not significant"
             lines.append(
-                f"{best_object_chamfer} best matches visual/object geometry by object Chamfer. "
+                f"{best_object_chamfer} best matches visual/object geometry by aligned object Chamfer. "
                 f"Versus {base_model_tag}, this object-Chamfer difference is {significance}: "
                 f"paired t-test p={fmt(t_p, 3)}, Wilcoxon p={fmt(w_p, 3)}."
             )
     lines.append("")
 
-    lines.append(f"{best_scene_iou} is strongest on scene IoU, and {best_object_iou} is strongest on object IoU.")
+    lines.append(f"{best_scene_iou} is strongest on aligned scene voxel IoU, and {best_object_iou} is strongest on aligned object voxel IoU.")
     lines.append("")
 
     if physics_best:
@@ -638,7 +852,7 @@ def generate_report(
         lines.append(
             f"So: if you care most about visual/object geometry, {best_object_chamfer} is the best candidate by Chamfer. "
             f"If you care most about physical plausibility, {physics_best} is strongest. "
-            f"If you care strictly about IoU, compare against {best_scene_iou}/{best_object_iou}."
+            f"If you care strictly about voxel IoU, compare against {best_scene_iou}/{best_object_iou}."
         )
     elif best_object_chamfer:
         lines.append(f"So: {best_object_chamfer} is the main candidate from this metric subset, but inspect animations before making the final choice.")
@@ -713,6 +927,13 @@ def aggregate(model_rows: list[dict[str, Any]], base_model_tag: str) -> tuple[li
 
 def main() -> None:
     args = parse_args()
+    if args.quick_metrics and not args.quick:
+        raise SystemExit("--quick-metrics requires --quick")
+    if args.quick:
+        if args.sample is None:
+            args.sample = list(QUICK_SAMPLES)
+        args.parallel_workers = 1
+        args.only_inference = not args.quick_metrics
     dataset_root = args.dataset_root.expanduser().resolve()
     eval_root = args.eval_root.expanduser().resolve()
     predictions_dir = eval_root / "predictions"
@@ -720,11 +941,35 @@ def main() -> None:
     predictions_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
-    models = args.model or DEFAULT_MODELS
-    models = [(tag, resolve_transformer(path)) for tag, path in models]
     samples = discover_samples(dataset_root, args.sample_glob, args.sample)
+    models: list[tuple[str, Path | None]] = []
+    if not args.no_discover_prediction_models:
+        discovered_tags = discover_prediction_model_tags(predictions_dir, samples)
+        if discovered_tags:
+            models.extend((tag, None) for tag in discovered_tags)
+        elif args.model is None and args.extra_model is None:
+            print("[warn] no complete prediction-model intersection found; falling back to DEFAULT_MODELS", flush=True)
+            models.extend((tag, resolve_transformer(path)) for tag, path in DEFAULT_MODELS)
+    elif args.model is None and args.extra_model is None:
+        models.extend((tag, resolve_transformer(path)) for tag, path in DEFAULT_MODELS)
+
+    def add_or_replace_model(tag: str, transformer: Path) -> None:
+        nonlocal models
+        for idx, (existing_tag, _) in enumerate(models):
+            if existing_tag == tag:
+                models[idx] = (tag, transformer)
+                return
+        models.append((tag, transformer))
+
+    for tag, path in args.model or []:
+        add_or_replace_model(tag, resolve_transformer(path))
+    for tag, path in args.extra_model or []:
+        add_or_replace_model(tag, resolve_transformer(path))
+    if args.quick:
+        mode = "metrics on quick subset" if args.quick_metrics else "inference-only visual inspection"
+        print(f"Quick mode: {mode}; parallel_workers={args.parallel_workers}", flush=True)
     print(f"Samples ({len(samples)}): {', '.join(samples)}", flush=True)
-    print("Models: " + ", ".join(f"{tag}={path}" for tag, path in models), flush=True)
+    print("Models: " + ", ".join(f"{tag}={model_path_for_log(path) or '<discovered-prediction>'}" for tag, path in models), flush=True)
 
     model_rows: list[dict[str, Any]] = []
     per_frame_rows: list[dict[str, Any]] = []
@@ -752,7 +997,7 @@ def main() -> None:
         for sample in samples:
             for model_idx, (model_tag, transformer) in enumerate(models):
                 existing = None if args.force else existing_metric_row(args, sample, model_tag, transformer, dataset_root, eval_root)
-                if existing is not None and (args.skip_existing_metrics or args.reuse_predictions):
+                if existing is not None and (args.skip_existing_metrics or args.reuse_predictions) and not args.force_metrics:
                     row, per_frame = existing
                     model_rows.append(row)
                     run_rows.append(row)
@@ -786,6 +1031,13 @@ def main() -> None:
     if args.only_inference:
         write_csv(eval_root / "two_ball_model_runs.csv", run_rows)
         print(f"Wrote run table: {eval_root / 'two_ball_model_runs.csv'}")
+        print("Visual inspection checklist:")
+        print("  - identity preservation")
+        print("  - actual motion")
+        print("  - no object swapping")
+        print("  - collision response plausibility")
+        print("  - no collapse/explosion")
+        print("Run full metrics only after this visual pass; use --quick --quick-metrics for a small metric subset.")
         return
     summary_rows, test_rows = aggregate(model_rows, args.base_model_tag)
     write_csv(eval_root / "two_ball_model_runs.csv", run_rows)
