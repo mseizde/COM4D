@@ -149,6 +149,98 @@ def trajectory_acceleration_stats(centers: np.ndarray, fps: float) -> Dict[str, 
         "std": float(np.std(accelerations)),
     }
 
+
+def best_yaw_angle(correlation: np.ndarray) -> float:
+    """Return the yaw angle that maximizes trace(Rz(theta) * correlation)."""
+    correlation = np.asarray(correlation, dtype=np.float64)
+    if correlation.shape != (3, 3):
+        raise ValueError("correlation must have shape (3, 3).")
+    a = correlation[0, 1] - correlation[1, 0]
+    b = correlation[0, 0] + correlation[1, 1]
+    return float(np.pi / 2.0 - np.arctan2(b, a))
+
+
+def rotation_matrix_z(theta: float) -> np.ndarray:
+    c = float(np.cos(theta))
+    s = float(np.sin(theta))
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def align_umeyama(
+    model: np.ndarray,
+    data: np.ndarray,
+    known_scale: bool = False,
+    yaw_only: bool = False,
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """Return s, R, t minimizing ||model - (s * R @ data + t)||^2.
+
+    This is the closed-form Umeyama similarity alignment used by ATE-style
+    trajectory metrics. Pass ``known_scale=True`` for SE(3) alignment.
+    """
+    model = np.asarray(model, dtype=np.float64)
+    data = np.asarray(data, dtype=np.float64)
+    if model.shape != data.shape or model.ndim != 2 or model.shape[1] != 3:
+        raise ValueError("model and data must both have shape (N, 3).")
+    if len(model) == 0:
+        raise ValueError("Umeyama alignment requires at least one point.")
+    if not np.isfinite(model).all() or not np.isfinite(data).all():
+        raise ValueError("model and data must contain only finite values.")
+
+    n = len(model)
+    mu_model = model.mean(axis=0)
+    mu_data = data.mean(axis=0)
+    model_centered = model - mu_model
+    data_centered = data - mu_data
+
+    covariance = model_centered.T @ data_centered / n
+    sigma2_data = float(np.mean(np.sum(data_centered**2, axis=1)))
+    u, singular_values, vt = np.linalg.svd(covariance)
+
+    w = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u) * np.linalg.det(vt.T) < 0.0:
+        w[2, 2] = -1.0
+
+    if yaw_only:
+        rot_correlation = data_centered.T @ model_centered
+        rotation = rotation_matrix_z(best_yaw_angle(rot_correlation))
+    else:
+        rotation = u @ w @ vt
+
+    if known_scale or sigma2_data <= 0.0:
+        scale = 1.0
+    else:
+        scale = float(np.trace(np.diag(singular_values) @ w) / sigma2_data)
+    translation = mu_model - scale * rotation @ mu_data
+    return scale, rotation, translation
+
+
+def similarity_transform_umeyama(
+    src: np.ndarray,
+    dst: np.ndarray,
+    known_scale: bool = False,
+    yaw_only: bool = False,
+) -> np.ndarray:
+    """Return a 4x4 transform mapping src points to dst points."""
+    src = np.asarray(src, dtype=np.float64)
+    dst = np.asarray(dst, dtype=np.float64)
+    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
+        raise ValueError("src and dst must both have shape (N, 3).")
+    if len(src) == 0:
+        return np.eye(4, dtype=np.float64)
+    scale, rotation, translation = align_umeyama(dst, src, known_scale=known_scale, yaw_only=yaw_only)
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = scale * rotation
+    transform[:3, 3] = translation
+    return transform
+
+
 def sample_from_mesh(
     mesh: trimesh.Trimesh,
     num_samples: Optional[int] = 10000,

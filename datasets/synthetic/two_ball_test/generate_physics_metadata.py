@@ -281,8 +281,17 @@ def main() -> None:
                 time.sleep(dt)
 
         metadata = {
+            "scenario": "two_ball_collision",
             "fps": args.fps,
             "num_frames": args.num_frames,
+            "active_objects": ["ball_0", "ball_1", "floor"],
+            "render_objects": ["ball_0", "ball_1", "floor"],
+            "physics_objects": ["ball_0", "ball_1", "floor"],
+            "objects": {
+                "ball_0": {"type": "sphere", "dynamic": True, "radius": ball_0_radius, "mass": ball_0_mass},
+                "ball_1": {"type": "sphere", "dynamic": True, "radius": ball_1_radius, "mass": ball_1_mass},
+                "floor": {"type": "plane", "dynamic": False},
+            },
             "ball_radius": args.ball_radius,
             "ball_radii": {
                 "ball_0": ball_0_radius,

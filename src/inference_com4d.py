@@ -486,6 +486,11 @@ def main():
         help="Run identifier appended to output directory",
     )
     parser.add_argument(
+        "--no-timestamp-output",
+        action="store_true",
+        help="Use the tag as the output directory name without appending a timestamp.",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -932,10 +937,7 @@ def main():
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     base_tag = (args.tag or Path(args.frames_dir).name).replace(" ", "_")
-    tag_components = [
-        base_tag,
-        timestamp,
-    ]
+    tag_components = [base_tag] if args.no_timestamp_output else [base_tag, timestamp]
     tag = "_".join(str(t) for t in tag_components if str(t))
 
     output_root = Path(args.output_dir)

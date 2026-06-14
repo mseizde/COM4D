@@ -29,6 +29,7 @@ from src.utils.metric_utils import (  # noqa: E402
     compute_IoU,
     load_mesh_or_scene,
     scene_to_single_mesh,
+    similarity_transform_umeyama,
 )
 
 
@@ -44,9 +45,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--iou-scale", type=float, default=2.0)
     ap.add_argument(
         "--alignment",
-        choices=("none", "translation", "similarity"),
+        choices=("none", "translation", "similarity", "first_frame_similarity"),
         default="none",
-        help="Optional sequence-level transform from predicted coordinates to GT coordinates.",
+        help="Optional transform from predicted coordinates to GT coordinates. first_frame_similarity matches the COM4D paper protocol.",
     )
     ap.add_argument(
         "--object-assignment",
@@ -58,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         "--alignment-samples-per-frame",
         type=int,
         default=1024,
-        help="Reserved for point-sampled alignment; current implementation uses object/scene centers.",
+        help="Number of deterministic mesh points used by first_frame_similarity alignment.",
     )
     ap.add_argument(
         "--pred-scene-glob",
@@ -114,19 +115,46 @@ def dynamic_object_paths(root: Path) -> dict[str, dict[int, Path]]:
     return tracks
 
 
-def two_ball_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]]]:
-    """Return GT object tracks from raw two-ball renderer outputs.
+def dynamic_metadata_names(root: Path) -> list[str]:
+    metadata_path = root / "physics_metadata.json"
+    if not metadata_path.is_file():
+        return []
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    objects = metadata.get("objects")
+    if isinstance(objects, dict) and objects:
+        names = [
+            name
+            for name, spec in objects.items()
+            if isinstance(spec, dict) and bool(spec.get("dynamic", name.startswith("ball_")))
+        ]
+        render_objects = metadata.get("render_objects")
+        if isinstance(render_objects, list):
+            order = {name: idx for idx, name in enumerate(render_objects)}
+            return sorted(names, key=lambda name: order.get(name, len(order)))
+        return sorted(names)
+    render_objects = metadata.get("render_objects")
+    if isinstance(render_objects, list):
+        return [name for name in render_objects if isinstance(name, str) and name.startswith("ball_")]
+    return []
 
-    The raw two-ball GT stores canonical meshes as meshes/ball_*.glb and per-frame
-    poses as transforms/frame_*.json, not as one GLB per frame.
+
+def two_ball_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]]]:
+    """Return GT object tracks from raw renderer outputs.
+
+    Raw synthetic GT stores canonical meshes as meshes/<object>.glb and per-frame
+    poses as transforms/frame_*.json, not necessarily one GLB per frame.
     """
     mesh_dir = root / "meshes"
     transform_dir = root / "transforms"
+    object_names = dynamic_metadata_names(root)
+    if not object_names:
+        object_names = [path.stem for path in sorted(mesh_dir.glob("ball_*.glb"))]
     object_map = {
-        "object_000": ("ball_0", mesh_dir / "ball_0.glb"),
-        "object_001": ("ball_1", mesh_dir / "ball_1.glb"),
+        f"object_{idx:03d}": (name, mesh_dir / f"{name}.glb")
+        for idx, name in enumerate(object_names)
     }
-    if not transform_dir.is_dir() or not all(path.is_file() for _, path in object_map.values()):
+    if not transform_dir.is_dir() or not object_map or not all(path.is_file() for _, path in object_map.values()):
         return {}
 
     tracks: dict[str, dict[int, tuple[Path, Path, str]]] = {object_id: {} for object_id in object_map}
@@ -134,8 +162,8 @@ def two_ball_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]
         idx = frame_index(transform_path)
         if idx is None:
             continue
-        for object_id, (ball_key, mesh_path) in object_map.items():
-            tracks[object_id][idx] = (mesh_path, transform_path, ball_key)
+        for object_id, (object_key, mesh_path) in object_map.items():
+            tracks[object_id][idx] = (mesh_path, transform_path, object_key)
     return {object_id: frames for object_id, frames in tracks.items() if frames}
 
 
@@ -162,7 +190,10 @@ def two_ball_gt_scene_frames(root: Path) -> dict[int, list[tuple[Path, Path, str
 def transform_matrix_from_json(transform_path: Path, ball_key: str) -> np.ndarray:
     with transform_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
-    item = data[ball_key]
+    objects = data.get("objects")
+    item = objects.get(ball_key) if isinstance(objects, dict) else data.get(ball_key)
+    if item is None:
+        raise KeyError(f"Missing transform for {ball_key!r} in {transform_path}")
     matrix = trimesh.transformations.quaternion_matrix(item["quaternion_blender_wxyz"])
     matrix[:3, 3] = np.asarray(item["location"], dtype=np.float64)
     return matrix
@@ -189,35 +220,85 @@ def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
     return points @ transform[:3, :3].T + transform[:3, 3]
 
 
-def similarity_transform_umeyama(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
-    """Return a 4x4 Sim(3) transform mapping src points to dst points."""
-    src = np.asarray(src, dtype=np.float64)
-    dst = np.asarray(dst, dtype=np.float64)
-    if src.shape != dst.shape or src.ndim != 2 or src.shape[1] != 3:
-        raise ValueError("src and dst must both have shape (N, 3)")
-    if len(src) == 0:
+def deterministic_mesh_points(mesh: trimesh.Trimesh, max_points: int) -> np.ndarray:
+    """Return deterministic mesh point samples for alignment."""
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if len(vertices) == 0:
+        return vertices.reshape(0, 3)
+    if len(vertices) <= max_points:
+        return vertices
+    order = np.lexsort((vertices[:, 2], vertices[:, 1], vertices[:, 0]))
+    indices = np.linspace(0, len(order) - 1, max_points, dtype=np.int64)
+    return vertices[order[indices]]
+
+
+def mesh_points_from_path(path: Path, max_points: int) -> np.ndarray:
+    mesh = scene_to_single_mesh(load_mesh_or_scene(path))
+    return deterministic_mesh_points(mesh, max_points)
+
+
+def mesh_points_from_gt_spec(spec: Path | tuple[Path, Path, str], max_points: int) -> np.ndarray:
+    return deterministic_mesh_points(gt_track_mesh(spec), max_points)
+
+
+def first_common_frame(left: set[int], right: set[int]) -> int | None:
+    common = sorted(left.intersection(right))
+    return common[0] if common else None
+
+
+def collect_first_frame_point_clouds(
+    pred_scenes: dict[int, Path],
+    gt_scenes: dict[int, Path],
+    gt_two_ball_scenes: dict[int, list[tuple[Path, Path, str]]],
+    pred_tracks: dict[str, dict[int, Path]],
+    gt_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]],
+    assignment: dict[str, str],
+    max_points: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    frame = first_common_frame(set(pred_scenes), set(gt_scenes))
+    if frame is not None:
+        return mesh_points_from_path(pred_scenes[frame], max_points), mesh_points_from_path(gt_scenes[frame], max_points)
+
+    frame = first_common_frame(set(pred_scenes), set(gt_two_ball_scenes))
+    if frame is not None:
+        gt_mesh = load_gt_scene(gt_two_ball_scenes[frame])
+        return mesh_points_from_path(pred_scenes[frame], max_points), deterministic_mesh_points(gt_mesh, max_points)
+
+    pred_points = []
+    gt_points = []
+    per_object_points = max(16, max_points // max(1, len(assignment)))
+    for pred_id, gt_id in sorted(assignment.items()):
+        pred_frames = pred_tracks.get(pred_id, {})
+        gt_frames = gt_tracks.get(gt_id, {})
+        frame = first_common_frame(set(pred_frames), set(gt_frames))
+        if frame is None:
+            continue
+        pred_points.append(mesh_points_from_path(pred_frames[frame], per_object_points))
+        gt_points.append(mesh_points_from_gt_spec(gt_frames[frame], per_object_points))
+    if not pred_points or not gt_points:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+    return np.concatenate(pred_points, axis=0), np.concatenate(gt_points, axis=0)
+
+
+def first_frame_similarity_transform(pred_points: np.ndarray, gt_points: np.ndarray) -> np.ndarray:
+    if len(pred_points) == 0 or len(gt_points) == 0:
         return np.eye(4, dtype=np.float64)
-
-    src_mean = src.mean(axis=0)
-    dst_mean = dst.mean(axis=0)
-    src_c = src - src_mean
-    dst_c = dst - dst_mean
-
-    cov = dst_c.T @ src_c / len(src)
-    U, singular_values, Vt = np.linalg.svd(cov)
-    R = U @ Vt
-    if np.linalg.det(R) < 0:
-        U[:, -1] *= -1
-        R = U @ Vt
-
-    var_src = np.mean(np.sum(src_c**2, axis=1))
-    scale = np.sum(singular_values) / var_src if var_src > 0 else 1.0
-    t = dst_mean - scale * R @ src_mean
-
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = scale * R
-    transform[:3, 3] = t
-    return transform
+    try:
+        matrix, _transformed, _cost = trimesh.registration.icp(
+            pred_points,
+            gt_points,
+            threshold=1e-6,
+            max_iterations=50,
+            scale=True,
+        )
+        return np.asarray(matrix, dtype=np.float64)
+    except Exception:
+        count = min(len(pred_points), len(gt_points))
+        if count == 0:
+            return np.eye(4, dtype=np.float64)
+        pred_idx = np.linspace(0, len(pred_points) - 1, count, dtype=np.int64)
+        gt_idx = np.linspace(0, len(gt_points) - 1, count, dtype=np.int64)
+        return similarity_transform_umeyama(pred_points[pred_idx], gt_points[gt_idx])
 
 
 def translation_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
@@ -292,6 +373,8 @@ def alignment_transform(method: str, pred_points: np.ndarray, gt_points: np.ndar
         return translation_transform(pred_points, gt_points)
     if method == "similarity":
         return similarity_transform_umeyama(pred_points, gt_points)
+    if method == "first_frame_similarity":
+        return first_frame_similarity_transform(pred_points, gt_points)
     raise ValueError(f"Unsupported alignment method: {method}")
 
 
@@ -460,15 +543,39 @@ def main() -> None:
     gt_file_tracks = dynamic_object_paths(gt_dir)
     gt_object_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]] = gt_file_tracks or two_ball_gt_tracks(gt_dir)
 
-    alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks)
-    if len(alignment_pred_points) == 0:
-        alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(pred_scenes, gt_scenes, gt_two_ball_scenes)
-    pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
-
     object_assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_object_tracks))}
+
+    if args.alignment == "first_frame_similarity":
+        alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
+            pred_scenes,
+            gt_scenes,
+            gt_two_ball_scenes,
+            pred_tracks,
+            gt_object_tracks,
+            object_assignment,
+            args.alignment_samples_per_frame,
+        )
+        pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
+    else:
+        alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks)
+        if len(alignment_pred_points) == 0:
+            alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(pred_scenes, gt_scenes, gt_two_ball_scenes)
+        pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
+
     if args.object_assignment == "best" and gt_object_tracks:
         object_assignment = best_object_assignment(pred_tracks, gt_object_tracks, pred_to_gt_transform)
-        if args.alignment != "none":
+        if args.alignment == "first_frame_similarity":
+            alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
+                pred_scenes,
+                gt_scenes,
+                gt_two_ball_scenes,
+                pred_tracks,
+                gt_object_tracks,
+                object_assignment,
+                args.alignment_samples_per_frame,
+            )
+            pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
+        elif args.alignment != "none":
             alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks, object_assignment)
             pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
 
@@ -568,8 +675,8 @@ def main() -> None:
 
     if not args.allow_empty and not scene_rows and not object_rows:
         raise RuntimeError(
-            "No reconstruction GT/pred GLB pairs were found. For raw two-ball GT, expected "
-            f"{gt_dir / 'meshes' / 'ball_0.glb'}, {gt_dir / 'meshes' / 'ball_1.glb'}, and "
+            "No reconstruction GT/pred GLB pairs were found. For raw synthetic GT, expected "
+            f"dynamic object meshes under {gt_dir / 'meshes'} and "
             f"{gt_dir / 'transforms' / 'frame_0000.json'}. Pass --allow-empty to write NaN summaries."
         )
 
@@ -586,6 +693,22 @@ def main() -> None:
         "object_assignment": args.object_assignment,
         "alignment_num_points": int(len(alignment_pred_points)),
         "pred_to_gt_transform": pred_to_gt_transform.tolist(),
+        "reconstruction_alignment": args.alignment,
+        "reconstruction_alignment_scope": (
+            "first_frame_point_cloud" if args.alignment == "first_frame_similarity"
+            else "all_dynamic_object_trajectories_or_scene_centers" if args.alignment != "none"
+            else "none"
+        ),
+        "reconstruction_alignment_num_points": int(len(alignment_pred_points)),
+        "reconstruction_alignment_scale": float(np.cbrt(abs(np.linalg.det(pred_to_gt_transform[:3, :3])))) if args.alignment != "none" else 1.0,
+        "reconstruction_alignment_rotation": (
+            (pred_to_gt_transform[:3, :3] / float(np.cbrt(abs(np.linalg.det(pred_to_gt_transform[:3, :3]))))).tolist()
+            if args.alignment != "none" and abs(float(np.linalg.det(pred_to_gt_transform[:3, :3]))) > 0.0
+            else np.eye(3, dtype=np.float64).tolist()
+        ),
+        "reconstruction_alignment_translation_x": float(pred_to_gt_transform[0, 3]),
+        "reconstruction_alignment_translation_y": float(pred_to_gt_transform[1, 3]),
+        "reconstruction_alignment_translation_z": float(pred_to_gt_transform[2, 3]),
         "object_assignment_map": object_assignment,
     }
     add_prefixed_means(summary, "scene", scene_rows)

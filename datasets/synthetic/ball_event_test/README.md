@@ -3,7 +3,7 @@
 This package is intended for single-ball bounce and rolling-occlusion synthetic
 physics data. The preprocessor is already available as
 `preprocess_ball_event_outputs.py`; it delegates to the generalized synthetic
-preprocessor in `../two_ball_test/preprocess_two_ball_outputs.py`.
+preprocessor in `../two_ball_test/preprocess_physics_outputs.py`.
 
 ## Metadata Contract
 

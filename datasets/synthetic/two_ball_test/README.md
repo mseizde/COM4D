@@ -1,6 +1,6 @@
 # Two-Ball Physics Dataset
 
-Use `generate_two_ball_dataset.py` as the main entrypoint. It runs PyBullet
+Use `generate_physics_dataset.py` as the main entrypoint. It runs PyBullet
 metadata generation, Blender RGB rendering, and COM4D preprocessing.
 
 The preprocessing step writes `points.npy` files with:
@@ -17,7 +17,7 @@ instance layout.
 ```bash
 cd /data/mseizde/com4d/COM4D
 
-micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_two_ball_dataset.py \
+micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_physics_dataset.py \
   --num-samples 100 \
   --num-frames 48 \
   --workers 4 \
@@ -30,8 +30,8 @@ micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_two_bal
   --overwrite
 ```
 
-`generate_two_ball_dataset.py` now passes `--include-parts` to
-`preprocess_two_ball_outputs.py` automatically.
+`generate_physics_dataset.py` now passes `--include-parts` to
+`preprocess_physics_outputs.py` automatically.
 
 ## Repair Existing Processed Dataset
 
@@ -53,11 +53,11 @@ adds `parts=[ball_0, ball_1]` from the existing per-frame GLBs.
 
 ## Main Files
 
-- `generate_two_ball_dataset.py`: recommended end-to-end dataset generator.
-- `run_two_ball_pipeline.py`: generate one raw sample folder.
+- `generate_physics_dataset.py`: recommended end-to-end dataset generator.
+- `run_physics_pipeline.py`: generate one raw sample folder.
 - `generate_physics_metadata.py`: PyBullet trajectory and collision metadata.
-- `render_blender_outputs.py`: Blender rendering for a raw sample.
-- `preprocess_two_ball_outputs.py`: convert raw samples into COM4D training JSON and `points.npy`.
+- `render_physics_outputs.py`: Blender rendering for a raw sample.
+- `preprocess_physics_outputs.py`: convert raw samples into COM4D training JSON and `points.npy`.
 - `repair_two_ball_parts.py`: add explicit `parts` to an already processed dataset from existing GLBs.
 - `two_ball_scene.blend`: Blender scene template.
 

@@ -18,7 +18,7 @@ import numpy as np
 import trimesh
 from tqdm.auto import tqdm
 
-from preprocess_two_ball_outputs import surface_dict
+from preprocess_physics_outputs import surface_dict
 
 
 FRAME_RE = re.compile(r"^(?P<sample>.+)_frame_(?P<frame>\d+)$")
