@@ -3,19 +3,19 @@
 """Render RGB frames, object masks, transforms, and GLB meshes in Blender.
 
 Cluster/headless example with the included prepared scene:
-  micromamba run -n com4d blender --background datasets/synthetic/two_ball_test/two_ball_scene.blend \
-    --python datasets/synthetic/two_ball_test/render_physics_outputs.py -- \
-    --base-dir outputs/two_ball_test \
+  micromamba run -n com4d blender --background datasets/synthetic/physics/physics_scene.blend \
+    --python datasets/synthetic/physics/render_physics_outputs.py -- \
+    --base-dir outputs/physics \
     --device CPU
 
 Cluster/headless example using the script's default scene lookup:
   micromamba run -n com4d blender --background \
-    --python datasets/synthetic/two_ball_test/render_physics_outputs.py -- \
-    --base-dir outputs/two_ball_test \
+    --python datasets/synthetic/physics/render_physics_outputs.py -- \
+    --base-dir outputs/physics \
     --device CPU
 
 When Blender is launched without an explicit .blend, this script opens
-two_ball_scene.blend from this folder by default. If no prepared scene is
+physics_scene.blend from this folder by default. If no prepared scene is
 available, it can still create a simple fallback scene with ball_0 and ball_1.
 """
 
@@ -34,8 +34,8 @@ import mathutils
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BLEND_FILE = SCRIPT_DIR / "physics_scene.blend" if (SCRIPT_DIR / "physics_scene.blend").exists() else SCRIPT_DIR / "two_ball_scene.blend"
-DEFAULT_BASE_DIR = PROJECT_ROOT / "outputs" / "two_ball_test"
+DEFAULT_BLEND_FILE = SCRIPT_DIR / "physics_scene.blend" 
+DEFAULT_BASE_DIR = PROJECT_ROOT / "outputs" / "physics"
 LOOK_COLORS = {
     "red": (1.0, 0.1, 0.1, 1.0),
     "blue": (0.1, 0.1, 1.0, 1.0),
@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-open-default-blend",
         action="store_true",
-        help="Do not auto-open two_ball_scene.blend when Blender was launched without a .blend.",
+        help="Do not auto-open physics_scene.blend when Blender was launched without a .blend.",
     )
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--samples", type=int, default=32)
@@ -132,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ball-1-color", type=float, nargs=4)
     parser.add_argument("--floor-look", choices=sorted(FLOOR_COLORS), default="gray")
     parser.add_argument("--floor-color", type=float, nargs=4)
+    parser.add_argument("--world-color", type=float, nargs=3, default=[0.78, 0.78, 0.78])
     parser.add_argument("--material-roughness", type=float, default=0.45)
     parser.add_argument("--light-seed", type=int)
     parser.add_argument("--light-location", type=float, nargs=3)
@@ -153,6 +154,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-normals", action="store_true", help="Save ground-truth normal pass as OpenEXR files.")
     parser.add_argument("--skip-transforms", action="store_true")
     parser.add_argument("--skip-canonical-meshes", action="store_true")
+    parser.add_argument(
+        "--skip-camera-metadata",
+        action="store_true",
+        help="Do not add the rendered camera intrinsics/extrinsics to physics_metadata.json.",
+    )
     parser.add_argument(
         "--device",
         choices=("AUTO", "CPU", "GPU"),
@@ -237,6 +243,48 @@ def configure_camera_view(args: argparse.Namespace) -> None:
             "target": target,
         },
     )
+
+
+def build_camera_metadata(scene: bpy.types.Scene, args: argparse.Namespace) -> dict:
+    """Serialize the actual static Blender camera used for rendering."""
+    bpy.context.view_layer.update()
+    camera = scene.camera
+    if camera is None or camera.type != "CAMERA":
+        raise RuntimeError("Cannot save camera metadata without an active camera")
+
+    scale = float(scene.render.resolution_percentage) / 100.0
+    width = int(round(scene.render.resolution_x * scale))
+    height = int(round(scene.render.resolution_y * scale))
+    pixel_aspect = float(scene.render.pixel_aspect_y) / float(scene.render.pixel_aspect_x)
+    fit = camera.data.sensor_fit
+    if fit == "VERTICAL":
+        fy = float(camera.data.lens) * height / float(camera.data.sensor_height)
+        fx = fy / pixel_aspect
+    else:
+        fx = float(camera.data.lens) * width / float(camera.data.sensor_width)
+        fy = fx * pixel_aspect
+    cx = width * (0.5 - float(camera.data.shift_x))
+    cy = height * (0.5 + float(camera.data.shift_y))
+    matrix_world = [[float(value) for value in row] for row in camera.matrix_world]
+
+    return {
+        "static": True,
+        "coordinate_system": "blender_world",
+        "camera_convention": "opencv_values_with_blender_camera_to_world_minus_z_forward_y_up",
+        "location": [float(value) for value in camera.location],
+        "target": [float(value) for value in args.camera_target],
+        "camera_to_world": matrix_world,
+        "lens_mm": float(camera.data.lens),
+        "sensor_width_mm": float(camera.data.sensor_width),
+        "sensor_height_mm": float(camera.data.sensor_height),
+        "sensor_fit": str(camera.data.sensor_fit),
+        "shift_x": float(camera.data.shift_x),
+        "shift_y": float(camera.data.shift_y),
+        "clip_start": float(camera.data.clip_start),
+        "clip_end": float(camera.data.clip_end),
+        "resolution": [width, height],
+        "intrinsics": [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+    }
 
 
 def configure_cycles(device: str, samples: int) -> None:
@@ -779,13 +827,21 @@ def main() -> None:
         if obj.name not in mask_names:
             obj.pass_index = 0
     configure_floor_material(args)
+    if bpy.context.scene.world is not None and args.world_color is not None:
+        bpy.context.scene.world.color = tuple(float(value) for value in args.world_color)
     configure_camera_view(args)
     configure_lighting(args)
 
     scene = bpy.context.scene
     scene.render.resolution_x = args.resolution
     scene.render.resolution_y = args.resolution
+    scene.render.resolution_percentage = 100
     scene.render.fps = data["fps"]
+
+    if not args.skip_camera_metadata:
+        data["camera"] = build_camera_metadata(scene, args)
+        with json_path.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
 
     if args.engine == "CYCLES":
         configure_cycles(args.device, args.samples)

@@ -94,7 +94,7 @@ configs=(
     sdemb/mf16_mp16/mf8_mp8_nt512 # 1
     sdemb/mf16_mp16/dfot/mf8_mp8_nt512 # 2
     sdemb/mf16_mp16/dfot/mask/mf8_mp8_nt512 # 3
-    sdemb/mf8_mp8_nt512_physics_twoball # 4
+    test/mf8_mp8_nt512 # 4
 )
 
 pretrained_model_paths=(

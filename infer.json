@@ -338,6 +338,42 @@
         "dynamic_max_memory_frames": 8,
         "scene_mix_cutoff": 50,
         "dynamic_mix_cutoff": 20
+    },
+
+    "inference_emulation_physics_mix_1000": {
+        "tag": "inference_emulation_physics_mix_1000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/inference_humoto_50_50_physics_1000/checkpoints/001000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "joint_physics_mix_500": {
+        "tag": "joint_physics_mix_1000",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/joint_humoto_50_50_physics_1000/checkpoints/000500",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
     }
 
 }

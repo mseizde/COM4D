@@ -3,10 +3,8 @@
 """Run multi-model synthetic physics evaluation across all prepared comparison samples.
 
 Outputs are intentionally long-form so they work for more than one physics model:
-  <eval-root>/two_ball_statistical_summary.csv
-  <eval-root>/two_ball_statistical_tests.csv
-  <eval-root>/two_ball_per_frame_metrics_full.csv
-  <eval-root>/two_ball_model_runs.csv
+  <eval-root>/physics_model_runs.csv
+  <eval-root>/physics_per_frame_metrics_full.csv
   <eval-root>/physics_statistical_report.md
   <eval-root>/physics_statistical_summary.csv
   <eval-root>/physics_statistical_tests.csv
@@ -19,8 +17,7 @@ Outputs are intentionally long-form so they work for more than one physics model
 Quick visual loop:
   python COM4D/scripts/eval/run_physics_statistical_eval.py --quick
 
-This runs only representative two-ball samples, inference only, one worker:
-  two_ball_eval_000, two_ball_eval_003, two_ball_eval_007
+This runs representative physics samples, inference only, one worker.
 
 Use --quick --quick-metrics after visual inspection to compute metrics on that
 same small subset. Reserve full metrics for branches that pass the GIF/GLB
@@ -217,6 +214,40 @@ def parse_args() -> argparse.Namespace:
         help="Object matching mode for reconstruction metrics.",
     )
     ap.add_argument(
+        "--recon-iou-num-grids",
+        "--iou-num-grids",
+        dest="recon_iou_num_grids",
+        type=int,
+        default=32,
+        help="Voxel IoU grid resolution forwarded to reconstruction evaluation.",
+    )
+    ap.add_argument(
+        "--recon-skip-object-level",
+        "--skip-object-level",
+        dest="recon_skip_object_level",
+        action="store_true",
+        help="Forward --skip-object-level to reconstruction evaluation.",
+    )
+    ap.add_argument(
+        "--recon-skip-voxel-iou",
+        "--skip-voxel-iou",
+        dest="recon_skip_voxel_iou",
+        action="store_true",
+        help="Forward --skip-voxel-iou to reconstruction evaluation.",
+    )
+    ap.add_argument(
+        "--recon-skip-raw-metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute only aligned reconstruction metrics when alignment is enabled (default: true).",
+    )
+    ap.add_argument(
+        "--reconstruction-timeout-seconds",
+        type=float,
+        default=1800.0,
+        help="Terminate a reconstruction evaluator after this many seconds; 0 disables the timeout.",
+    )
+    ap.add_argument(
         "--max-recon-glb-mb",
         type=float,
         default=0.0,
@@ -260,10 +291,11 @@ def run(
     cwd: Path = REPO_ROOT,
     dry_run: bool = False,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> None:
     print("+", " ".join(str(part) for part in cmd), flush=True)
     if not dry_run:
-        subprocess.run([str(part) for part in cmd], cwd=str(cwd), check=True, env=env)
+        subprocess.run([str(part) for part in cmd], cwd=str(cwd), check=True, env=env, timeout=timeout)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -648,23 +680,31 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
             else:
                 write_skipped_reconstruction_metrics(recon_dir, pred_dir, raw_dir, args, glb_stats, skip_reason)
         else:
-            run(
-                [
-                    sys.executable,
-                    EVALUATE_RECONSTRUCTION,
-                    "--pred-dir",
-                    pred_dir,
-                    "--gt-dir",
-                    raw_dir,
-                    "--output-dir",
-                    recon_dir,
-                    "--alignment",
-                    args.recon_alignment,
-                    "--object-assignment",
-                    args.recon_object_assignment,
-                ],
-                dry_run=args.dry_run,
-            )
+            reconstruction_cmd = [
+                sys.executable,
+                EVALUATE_RECONSTRUCTION,
+                "--pred-dir",
+                pred_dir,
+                "--gt-dir",
+                raw_dir,
+                "--output-dir",
+                recon_dir,
+                "--alignment",
+                args.recon_alignment,
+                "--object-assignment",
+                args.recon_object_assignment,
+                "--iou-num-grids",
+                args.recon_iou_num_grids,
+                *(["--skip-object-level"] if args.recon_skip_object_level else []),
+                *(["--skip-voxel-iou"] if args.recon_skip_voxel_iou else []),
+                *(["--skip-raw-metrics"] if args.recon_skip_raw_metrics else []),
+            ]
+            timeout = args.reconstruction_timeout_seconds if args.reconstruction_timeout_seconds > 0.0 else None
+            try:
+                run(reconstruction_cmd, dry_run=args.dry_run, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                reason = f"reconstruction evaluator exceeded {args.reconstruction_timeout_seconds:.1f} seconds"
+                write_skipped_reconstruction_metrics(recon_dir, pred_dir, raw_dir, args, glb_stats, reason)
     if args.force_metrics or not args.skip_existing_metrics or args.force or physics_metrics_stale(physics_json):
         run(
             [
@@ -1087,10 +1127,6 @@ def generate_report(
         reconstruction_rows.append(
             [
                 model,
-                fmt(row_metric(summary_rows, model, "scene_raw_chamfer_distance_mean"), 3),
-                fmt(row_metric(summary_rows, model, "scene_raw_voxel_iou_mean"), 4),
-                fmt(row_metric(summary_rows, model, "object_raw_chamfer_distance_mean"), 3),
-                fmt(row_metric(summary_rows, model, "object_raw_voxel_iou_mean"), 5),
                 fmt(row_metric(summary_rows, model, "scene_aligned_chamfer_distance_mean"), 3),
                 fmt(row_metric(summary_rows, model, "scene_aligned_voxel_iou_mean"), 4),
                 fmt(row_metric(summary_rows, model, "object_aligned_chamfer_distance_mean"), 3),
@@ -1100,10 +1136,6 @@ def generate_report(
         )
 
     win_specs = [
-        ("Raw Scene Chamfer ↓", "scene_raw_chamfer_distance_mean", "min"),
-        ("Raw Scene Voxel IoU ↑", "scene_raw_voxel_iou_mean", "max"),
-        ("Raw Object Chamfer ↓", "object_raw_chamfer_distance_mean", "min"),
-        ("Raw Object Voxel IoU ↑", "object_raw_voxel_iou_mean", "max"),
         ("Aligned Scene Chamfer ↓", "scene_aligned_chamfer_distance_mean", "min"),
         ("Aligned Scene Voxel IoU ↑", "scene_aligned_voxel_iou_mean", "max"),
         ("Aligned Object Chamfer ↓", "object_aligned_chamfer_distance_mean", "min"),
@@ -1135,10 +1167,6 @@ def generate_report(
         markdown_table(
             [
                 "Model",
-                "Raw Scene Chamfer ↓",
-                "Raw Scene IoU ↑",
-                "Raw Object Chamfer ↓",
-                "Raw Object IoU ↑",
                 "Aligned Scene Chamfer ↓",
                 "Aligned Scene IoU ↑",
                 "Aligned Object Chamfer ↓",

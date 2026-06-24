@@ -44,6 +44,30 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--iou-num-grids", type=int, default=64)
     ap.add_argument("--iou-scale", type=float, default=2.0)
     ap.add_argument(
+        "--skip-raw-metrics",
+        action="store_true",
+        help="With alignment enabled, compute only aligned reconstruction metrics.",
+    )
+    ap.add_argument("--skip-voxel-iou", action="store_true", help="Skip voxelization and report voxel IoU as NaN.")
+    ap.add_argument(
+        "--max-voxel-vertices",
+        type=int,
+        default=2_000_000,
+        help="Skip voxel IoU when either mesh exceeds this vertex count; 0 disables the guard.",
+    )
+    ap.add_argument(
+        "--max-voxel-faces",
+        type=int,
+        default=4_000_000,
+        help="Skip voxel IoU when either mesh exceeds this face count; 0 disables the guard.",
+    )
+    ap.add_argument(
+        "--max-voxel-cells",
+        type=int,
+        default=16_777_216,
+        help="Skip voxel IoU when either mesh's estimated bounding grid exceeds this cell count; 0 disables the guard.",
+    )
+    ap.add_argument(
         "--alignment",
         choices=("none", "translation", "similarity", "first_frame_similarity"),
         default="none",
@@ -139,7 +163,7 @@ def dynamic_metadata_names(root: Path) -> list[str]:
     return []
 
 
-def two_ball_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]]]:
+def metadata_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]]]:
     """Return GT object tracks from raw renderer outputs.
 
     Raw synthetic GT stores canonical meshes as meshes/<object>.glb and per-frame
@@ -178,8 +202,8 @@ def frame_paths(root: Path, pattern: str) -> dict[int, Path]:
     return paths
 
 
-def two_ball_gt_scene_frames(root: Path) -> dict[int, list[tuple[Path, Path, str]]]:
-    tracks = two_ball_gt_tracks(root)
+def metadata_gt_scene_frames(root: Path) -> dict[int, list[tuple[Path, Path, str]]]:
+    tracks = metadata_gt_tracks(root)
     frames: dict[int, list[tuple[Path, Path, str]]] = {}
     for frame_map in tracks.values():
         for frame, spec in frame_map.items():
@@ -200,7 +224,17 @@ def transform_matrix_from_json(transform_path: Path, ball_key: str) -> np.ndarra
 
 
 def load_transformed_mesh(mesh_path: Path, transform_path: Path, ball_key: str) -> trimesh.Trimesh:
-    mesh = scene_to_single_mesh(load_mesh_or_scene(mesh_path)).copy()
+    loaded = load_mesh_or_scene(mesh_path)
+    if isinstance(loaded, trimesh.Trimesh):
+        mesh = loaded.copy()
+    else:
+        meshes = [item.copy() for item in loaded.geometry.values() if isinstance(item, trimesh.Trimesh)]
+        mesh = trimesh.util.concatenate(meshes)
+    gltf_to_blender = np.asarray(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    mesh.apply_transform(gltf_to_blender)
     mesh.apply_transform(transform_matrix_from_json(transform_path, ball_key))
     return mesh
 
@@ -249,7 +283,7 @@ def first_common_frame(left: set[int], right: set[int]) -> int | None:
 def collect_first_frame_point_clouds(
     pred_scenes: dict[int, Path],
     gt_scenes: dict[int, Path],
-    gt_two_ball_scenes: dict[int, list[tuple[Path, Path, str]]],
+    gt_metadata_scenes: dict[int, list[tuple[Path, Path, str]]],
     pred_tracks: dict[str, dict[int, Path]],
     gt_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]],
     assignment: dict[str, str],
@@ -259,9 +293,9 @@ def collect_first_frame_point_clouds(
     if frame is not None:
         return mesh_points_from_path(pred_scenes[frame], max_points), mesh_points_from_path(gt_scenes[frame], max_points)
 
-    frame = first_common_frame(set(pred_scenes), set(gt_two_ball_scenes))
+    frame = first_common_frame(set(pred_scenes), set(gt_metadata_scenes))
     if frame is not None:
-        gt_mesh = load_gt_scene(gt_two_ball_scenes[frame])
+        gt_mesh = load_gt_scene(gt_metadata_scenes[frame])
         return mesh_points_from_path(pred_scenes[frame], max_points), deterministic_mesh_points(gt_mesh, max_points)
 
     pred_points = []
@@ -347,7 +381,7 @@ def collect_object_center_pairs(
 def collect_scene_center_pairs(
     pred_scenes: dict[int, Path],
     gt_scenes: dict[int, Path],
-    gt_two_ball_scenes: dict[int, list[tuple[Path, Path, str]]],
+    gt_metadata_scenes: dict[int, list[tuple[Path, Path, str]]],
 ) -> tuple[np.ndarray, np.ndarray]:
     pred_centers = []
     gt_centers = []
@@ -356,9 +390,9 @@ def collect_scene_center_pairs(
         gt_mesh = scene_to_single_mesh(load_mesh_or_scene(gt_scenes[frame]))
         pred_centers.append(mesh_center(pred_mesh))
         gt_centers.append(mesh_center(gt_mesh))
-    for frame in sorted(set(pred_scenes).intersection(gt_two_ball_scenes)):
+    for frame in sorted(set(pred_scenes).intersection(gt_metadata_scenes)):
         pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_scenes[frame]))
-        gt_mesh = load_gt_scene(gt_two_ball_scenes[frame])
+        gt_mesh = load_gt_scene(gt_metadata_scenes[frame])
         pred_centers.append(mesh_center(pred_mesh))
         gt_centers.append(mesh_center(gt_mesh))
     return np.asarray(pred_centers, dtype=np.float64), np.asarray(gt_centers, dtype=np.float64)
@@ -414,10 +448,45 @@ def best_object_assignment(
     return dict(zip(pred_ids, best_perm))
 
 
-def voxel_iou_or_nan(pred_mesh: trimesh.Trimesh, gt_mesh: trimesh.Trimesh, num_grids: int, scale: float) -> float:
+def estimated_voxel_cells(mesh: trimesh.Trimesh, pitch: float) -> int:
+    if pitch <= 0.0 or mesh.is_empty:
+        return 0
+    extents = np.maximum(np.asarray(mesh.extents, dtype=np.float64), 0.0)
+    grid_shape = np.maximum(np.ceil(extents / pitch).astype(np.int64) + 1, 1)
+    return int(grid_shape[0]) * int(grid_shape[1]) * int(grid_shape[2])
+
+
+def voxel_iou_or_nan(
+    pred_mesh: trimesh.Trimesh,
+    gt_mesh: trimesh.Trimesh,
+    num_grids: int,
+    scale: float,
+    *,
+    skip: bool = False,
+    max_vertices: int = 0,
+    max_faces: int = 0,
+    max_cells: int = 0,
+) -> float:
+    if skip:
+        return float("nan")
+    if num_grids <= 0 or scale <= 0.0:
+        print("[warn] skipped voxel IoU: --iou-num-grids and --iou-scale must be positive", flush=True)
+        return float("nan")
+    for label, mesh in (("prediction", pred_mesh), ("ground truth", gt_mesh)):
+        if max_vertices > 0 and len(mesh.vertices) > max_vertices:
+            print(f"[warn] skipped voxel IoU: {label} has {len(mesh.vertices)} vertices (limit {max_vertices})", flush=True)
+            return float("nan")
+        if max_faces > 0 and len(mesh.faces) > max_faces:
+            print(f"[warn] skipped voxel IoU: {label} has {len(mesh.faces)} faces (limit {max_faces})", flush=True)
+            return float("nan")
+        cells = estimated_voxel_cells(mesh, scale / num_grids)
+        if max_cells > 0 and cells > max_cells:
+            print(f"[warn] skipped voxel IoU: {label} bounding grid has about {cells} cells (limit {max_cells})", flush=True)
+            return float("nan")
     try:
         return float(compute_IoU(pred_mesh, gt_mesh, num_grids=num_grids, scale=scale))
-    except Exception:
+    except Exception as exc:
+        print(f"[warn] voxel IoU failed: {exc}", flush=True)
         return float("nan")
 
 
@@ -430,6 +499,7 @@ def mesh_metrics(
     iou_num_grids: int,
     iou_scale: float,
     pred_transform: np.ndarray | None = None,
+    **voxel_options: Any,
 ) -> dict[str, Any]:
     pred_geom = load_mesh_or_scene(pred_path)
     gt_geom = load_mesh_or_scene(gt_path)
@@ -443,7 +513,7 @@ def mesh_metrics(
     return {
         "chamfer_distance": float(cd),
         "f_score": float(f_score),
-        "voxel_iou": voxel_iou_or_nan(pred_mesh, gt_mesh, iou_num_grids, iou_scale),
+        "voxel_iou": voxel_iou_or_nan(pred_mesh, gt_mesh, iou_num_grids, iou_scale, **voxel_options),
         "bbox_iou_3d": bbox_iou_3d(pred_bounds, gt_bounds),
         "bbox_overlap_volume": bbox_overlap_volume(pred_bounds, gt_bounds),
         "pred_path": str(pred_path),
@@ -461,6 +531,7 @@ def mesh_metrics_for_gt_mesh(
     iou_num_grids: int,
     iou_scale: float,
     pred_transform: np.ndarray | None = None,
+    **voxel_options: Any,
 ) -> dict[str, Any]:
     pred_geom = load_mesh_or_scene(pred_path)
     pred_mesh = scene_to_single_mesh(pred_geom).copy()
@@ -472,7 +543,7 @@ def mesh_metrics_for_gt_mesh(
     return {
         "chamfer_distance": float(cd),
         "f_score": float(f_score),
-        "voxel_iou": voxel_iou_or_nan(pred_mesh, gt_mesh, iou_num_grids, iou_scale),
+        "voxel_iou": voxel_iou_or_nan(pred_mesh, gt_mesh, iou_num_grids, iou_scale, **voxel_options),
         "bbox_iou_3d": bbox_iou_3d(pred_bounds, gt_bounds),
         "bbox_overlap_volume": bbox_overlap_volume(pred_bounds, gt_bounds),
         "pred_path": str(pred_path),
@@ -488,9 +559,13 @@ def add_metric_family(row: dict[str, Any], family: str, metrics: dict[str, Any])
         row[f"{family}_{key}"] = metrics[key]
 
 
-def combined_metric_row(raw_metrics: dict[str, Any], aligned_metrics: dict[str, Any] | None) -> dict[str, Any]:
-    row = dict(raw_metrics)
-    add_metric_family(row, "raw", raw_metrics)
+def combined_metric_row(raw_metrics: dict[str, Any] | None, aligned_metrics: dict[str, Any] | None) -> dict[str, Any]:
+    primary_metrics = raw_metrics if raw_metrics is not None else aligned_metrics
+    if primary_metrics is None:
+        raise ValueError("At least one metric family must be computed")
+    row = dict(primary_metrics)
+    if raw_metrics is not None:
+        add_metric_family(row, "raw", raw_metrics)
     if aligned_metrics is not None:
         add_metric_family(row, "aligned", aligned_metrics)
     return row
@@ -537,11 +612,11 @@ def main() -> None:
     scene_rows = []
     pred_scenes = frame_paths(pred_dir, args.pred_scene_glob)
     gt_scenes = frame_paths(gt_dir, args.gt_scene_glob)
-    gt_two_ball_scenes = {} if gt_scenes else two_ball_gt_scene_frames(gt_dir)
+    gt_metadata_scenes = {} if gt_scenes else metadata_gt_scene_frames(gt_dir)
 
     pred_tracks = dynamic_object_paths(pred_dir)
     gt_file_tracks = dynamic_object_paths(gt_dir)
-    gt_object_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]] = gt_file_tracks or two_ball_gt_tracks(gt_dir)
+    gt_object_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]] = gt_file_tracks or metadata_gt_tracks(gt_dir)
 
     object_assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_object_tracks))}
 
@@ -549,7 +624,7 @@ def main() -> None:
         alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
             pred_scenes,
             gt_scenes,
-            gt_two_ball_scenes,
+            gt_metadata_scenes,
             pred_tracks,
             gt_object_tracks,
             object_assignment,
@@ -559,7 +634,7 @@ def main() -> None:
     else:
         alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks)
         if len(alignment_pred_points) == 0:
-            alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(pred_scenes, gt_scenes, gt_two_ball_scenes)
+            alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(pred_scenes, gt_scenes, gt_metadata_scenes)
         pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
 
     if args.object_assignment == "best" and gt_object_tracks:
@@ -568,7 +643,7 @@ def main() -> None:
             alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
                 pred_scenes,
                 gt_scenes,
-                gt_two_ball_scenes,
+                gt_metadata_scenes,
                 pred_tracks,
                 gt_object_tracks,
                 object_assignment,
@@ -580,8 +655,24 @@ def main() -> None:
             pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
 
     aligned_transform = None if args.alignment == "none" else pred_to_gt_transform
-    for frame in sorted(set(pred_scenes).intersection(gt_scenes)):
-        raw_metrics = mesh_metrics(
+    skip_raw_metrics = bool(args.skip_raw_metrics and aligned_transform is not None)
+    if args.skip_raw_metrics and aligned_transform is None:
+        print("[warn] --skip-raw-metrics ignored because --alignment=none", flush=True)
+    voxel_options = {
+        "skip": args.skip_voxel_iou,
+        "max_vertices": args.max_voxel_vertices,
+        "max_faces": args.max_voxel_faces,
+        "max_cells": args.max_voxel_cells,
+    }
+
+    scene_file_frames = sorted(set(pred_scenes).intersection(gt_scenes))
+    scene_metadata_frames = sorted(set(pred_scenes).intersection(gt_metadata_scenes))
+    total_scene_frames = len(scene_file_frames) + len(scene_metadata_frames)
+    scene_progress = 0
+    for frame in scene_file_frames:
+        scene_progress += 1
+        print(f"[scene {scene_progress}/{total_scene_frames}] frame {frame}", flush=True)
+        raw_metrics = None if skip_raw_metrics else mesh_metrics(
             pred_scenes[frame],
             gt_scenes[frame],
             args.num_samples,
@@ -589,6 +680,7 @@ def main() -> None:
             args.metric,
             args.iou_num_grids,
             args.iou_scale,
+            **voxel_options,
         )
         aligned_metrics = None if aligned_transform is None else mesh_metrics(
             pred_scenes[frame],
@@ -599,15 +691,19 @@ def main() -> None:
             args.iou_num_grids,
             args.iou_scale,
             pred_transform=aligned_transform,
+            **voxel_options,
         )
         row = combined_metric_row(raw_metrics, aligned_metrics)
         row.update({"level": "scene", "frame": frame})
         scene_rows.append(row)
-    for frame in sorted(set(pred_scenes).intersection(gt_two_ball_scenes)):
-        specs = gt_two_ball_scenes[frame]
+
+    for frame in scene_metadata_frames:
+        scene_progress += 1
+        print(f"[scene {scene_progress}/{total_scene_frames}] frame {frame}", flush=True)
+        specs = gt_metadata_scenes[frame]
         gt_mesh = load_gt_scene(specs)
         gt_label = "+".join(f"{mesh_path}@{transform_path}:{ball_key}" for mesh_path, transform_path, ball_key in specs)
-        raw_metrics = mesh_metrics_for_gt_mesh(
+        raw_metrics = None if skip_raw_metrics else mesh_metrics_for_gt_mesh(
             pred_scenes[frame],
             gt_mesh,
             gt_label,
@@ -616,6 +712,7 @@ def main() -> None:
             args.metric,
             args.iou_num_grids,
             args.iou_scale,
+            **voxel_options,
         )
         aligned_metrics = None if aligned_transform is None else mesh_metrics_for_gt_mesh(
             pred_scenes[frame],
@@ -627,6 +724,7 @@ def main() -> None:
             args.iou_num_grids,
             args.iou_scale,
             pred_transform=aligned_transform,
+            **voxel_options,
         )
         row = combined_metric_row(raw_metrics, aligned_metrics)
         row.update({"level": "scene", "frame": frame})
@@ -636,42 +734,52 @@ def main() -> None:
     if not args.skip_object_level:
         if args.object_assignment == "fixed":
             object_assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_object_tracks))}
-        for pred_object_id, gt_object_id in sorted(object_assignment.items()):
+        object_pairs = [
+            (pred_object_id, gt_object_id, frame)
+            for pred_object_id, gt_object_id in sorted(object_assignment.items())
+            for frame in sorted(set(pred_tracks.get(pred_object_id, {})).intersection(gt_object_tracks.get(gt_object_id, {})))
+        ]
+        for object_progress, (pred_object_id, gt_object_id, frame) in enumerate(object_pairs, start=1):
+            print(
+                f"[object {object_progress}/{len(object_pairs)}] {pred_object_id}->{gt_object_id} frame {frame}",
+                flush=True,
+            )
             pred_frames = pred_tracks.get(pred_object_id, {})
             gt_frames = gt_object_tracks.get(gt_object_id, {})
-            for frame in sorted(set(pred_frames).intersection(gt_frames)):
-                gt_spec = gt_frames[frame]
-                gt_mesh = gt_track_mesh(gt_spec)
-                gt_label = gt_track_label(gt_spec)
-                raw_metrics = mesh_metrics_for_gt_mesh(
-                    pred_frames[frame],
-                    gt_mesh,
-                    gt_label,
-                    args.num_samples,
-                    args.threshold,
-                    args.metric,
-                    args.iou_num_grids,
-                    args.iou_scale,
-                )
-                aligned_metrics = None if aligned_transform is None else mesh_metrics_for_gt_mesh(
-                    pred_frames[frame],
-                    gt_mesh,
-                    gt_label,
-                    args.num_samples,
-                    args.threshold,
-                    args.metric,
-                    args.iou_num_grids,
-                    args.iou_scale,
-                    pred_transform=aligned_transform,
-                )
-                row = combined_metric_row(raw_metrics, aligned_metrics)
-                row.update({
-                    "level": "object",
-                    "object_id": pred_object_id,
-                    "gt_object_id": gt_object_id,
-                    "frame": frame,
-                })
-                object_rows.append(row)
+            gt_spec = gt_frames[frame]
+            gt_mesh = gt_track_mesh(gt_spec)
+            gt_label = gt_track_label(gt_spec)
+            raw_metrics = None if skip_raw_metrics else mesh_metrics_for_gt_mesh(
+                pred_frames[frame],
+                gt_mesh,
+                gt_label,
+                args.num_samples,
+                args.threshold,
+                args.metric,
+                args.iou_num_grids,
+                args.iou_scale,
+                **voxel_options,
+            )
+            aligned_metrics = None if aligned_transform is None else mesh_metrics_for_gt_mesh(
+                pred_frames[frame],
+                gt_mesh,
+                gt_label,
+                args.num_samples,
+                args.threshold,
+                args.metric,
+                args.iou_num_grids,
+                args.iou_scale,
+                pred_transform=aligned_transform,
+                **voxel_options,
+            )
+            row = combined_metric_row(raw_metrics, aligned_metrics)
+            row.update({
+                "level": "object",
+                "object_id": pred_object_id,
+                "gt_object_id": gt_object_id,
+                "frame": frame,
+            })
+            object_rows.append(row)
 
     if not args.allow_empty and not scene_rows and not object_rows:
         raise RuntimeError(
@@ -689,6 +797,11 @@ def main() -> None:
         "threshold": args.threshold,
         "iou_num_grids": args.iou_num_grids,
         "iou_scale": args.iou_scale,
+        "skip_raw_metrics": skip_raw_metrics,
+        "skip_voxel_iou": args.skip_voxel_iou,
+        "max_voxel_vertices": args.max_voxel_vertices,
+        "max_voxel_faces": args.max_voxel_faces,
+        "max_voxel_cells": args.max_voxel_cells,
         "alignment": args.alignment,
         "object_assignment": args.object_assignment,
         "alignment_num_points": int(len(alignment_pred_points)),

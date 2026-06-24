@@ -209,6 +209,24 @@ def create_box(position, half_extents, color=[0.4, 0.4, 0.4, 1.0]):
     )
 
 
+def dynamic_bounds_ok(frames, dynamic_names, max_abs_xy=None, max_z=None):
+    if (max_abs_xy is None or max_abs_xy <= 0) and (max_z is None or max_z <= 0):
+        return True, None
+    for frame in frames:
+        frame_idx = frame.get("frame")
+        objects = frame.get("objects", {})
+        for name in dynamic_names:
+            state = objects.get(name, {})
+            pos = state.get("position")
+            if pos is None:
+                continue
+            if max_abs_xy is not None and max_abs_xy > 0 and (abs(float(pos[0])) > max_abs_xy or abs(float(pos[1])) > max_abs_xy):
+                return False, {"frame": frame_idx, "object": name, "position": pos, "reason": "xy_bound"}
+            if max_z is not None and max_z > 0 and float(pos[2]) > max_z:
+                return False, {"frame": frame_idx, "object": name, "position": pos, "reason": "z_bound"}
+    return True, None
+
+
 def simulate(config, out_dir, use_gui=False):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -359,6 +377,17 @@ def simulate(config, out_dir, use_gui=False):
     if "occluder_half_extents" in config:
         object_properties["occluder_box_half_extents"] = config["occluder_half_extents"]
 
+    dynamic_names = [name for name, spec in object_specs_from_config(config).items() if bool(spec.get("dynamic", name.startswith("ball_")))]
+    bounds_ok, bounds_failure = dynamic_bounds_ok(
+        frames,
+        dynamic_names,
+        config.get("max_dynamic_abs_xy"),
+        config.get("max_dynamic_z"),
+    )
+    if not bounds_ok:
+        p.disconnect()
+        raise RuntimeError(f"Dynamic object left training bounds: {bounds_failure}")
+
     metadata = {
         "scenario": config["scenario"],
         "fps": fps,
@@ -373,6 +402,11 @@ def simulate(config, out_dir, use_gui=False):
         "object_properties": object_properties,
         "first_contact_frame": first_contact_frame,
         "collision_frame": first_contact_frame,
+        "training_bounds": {
+            "max_dynamic_abs_xy": config.get("max_dynamic_abs_xy"),
+            "max_dynamic_z": config.get("max_dynamic_z"),
+            "ok": bounds_ok,
+        },
         "frames": frames,
     }
 
@@ -411,6 +445,8 @@ def main():
     parser.add_argument("--wall-half-extents", type=float, nargs=3)
     parser.add_argument("--occluder-position", type=float, nargs=3)
     parser.add_argument("--occluder-half-extents", type=float, nargs=3)
+    parser.add_argument("--max-dynamic-abs-xy", type=float)
+    parser.add_argument("--max-dynamic-z", type=float)
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -422,6 +458,10 @@ def main():
     if args.num_frames is not None:
         config["num_frames"] = args.num_frames
     apply_overrides(config, args)
+    if args.max_dynamic_abs_xy is not None:
+        config["max_dynamic_abs_xy"] = args.max_dynamic_abs_xy
+    if args.max_dynamic_z is not None:
+        config["max_dynamic_z"] = args.max_dynamic_z
 
     out_dir = args.out or f"outputs/{args.scenario}_test"
     simulate(config, out_dir, use_gui=args.gui)

@@ -6,11 +6,12 @@ calls to lower-level helpers.
 
 ## Physics Evaluation
 
-- `eval/run_two_ball_comparison.py`: run COM4D comparisons on two-ball cases.
-- `eval/prepare_two_ball_inference_input.py`: convert a generated two-ball
-  sample into an inference input folder.
+- `eval/run_physics_comparison.py`: run a base-vs-physics comparison on one synthetic physics case.
+- `eval/run_physics_statistical_eval.py`: run multi-sample, multi-model physics/reconstruction evaluation.
+- `eval/prepare_physics_inference_input.py`: convert a generated physics sample into an inference input folder.
 - `eval/evaluate_physics.py`: compute physics metrics for generated outputs.
 - `eval/evaluate_reconstruction.py`: reconstruction metrics.
+- `eval/render_prediction_gifs.py`: backfill prediction GIFs; with GT camera/alignment metadata it also writes three-panel diagnostic, aligned-orbit, and faded-prediction + GT-wireframe artifacts.
 - `eval/run_benchmark.py`: combine reconstruction and physics evaluation.
 
 ## Room/Layout Priors
@@ -39,7 +40,6 @@ These scripts bridge COM4D inputs to separate environments/repos:
   - run with `micromamba run -n hyworld2`
   - writes HY-World/WorldMirror priors
 - `inference/export_vggt_previews.py`: preview/export helper for VGGT outputs.
-- `inference/export_ball_collision_gt.py`: export GT two-ball collision previews.
 
 These files intentionally stay under `scripts/inference/` because they prepare
 inference inputs or priors. They should not be mixed into the training dataset

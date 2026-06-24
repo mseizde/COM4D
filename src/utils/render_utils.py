@@ -1,7 +1,9 @@
 from src.utils.typing_utils import *
 
+import atexit
 import ctypes.util
 import glob
+import json
 import os
 
 
@@ -56,6 +58,31 @@ from diffusers.utils import export_to_video
 from diffusers.utils.loading_utils import load_video
 import torch
 from torchvision.utils import make_grid
+
+_OFFSCREEN_RENDERERS: Dict[Tuple[int, int], pyrender.OffscreenRenderer] = {}
+
+
+def get_offscreen_renderer(width: int, height: int) -> pyrender.OffscreenRenderer:
+    """Reuse one GL context per viewport; GLX/pyglet cannot reliably recreate it after delete()."""
+    key = (int(width), int(height))
+    renderer = _OFFSCREEN_RENDERERS.get(key)
+    if renderer is None:
+        renderer = pyrender.OffscreenRenderer(*key)
+        _OFFSCREEN_RENDERERS[key] = renderer
+    return renderer
+
+
+def _delete_offscreen_renderers() -> None:
+    for renderer in _OFFSCREEN_RENDERERS.values():
+        try:
+            renderer.delete()
+        except Exception:
+            pass
+    _OFFSCREEN_RENDERERS.clear()
+
+
+atexit.register(_delete_offscreen_renderers)
+
 
 def render(
     scene: pyrender.Scene,
@@ -232,7 +259,7 @@ def render_views_around_mesh(
         znear=znear,
         zfar=zfar
     )
-    renderer = pyrender.OffscreenRenderer(*image_size)
+    renderer = get_offscreen_renderer(*image_size)
 
     camera_poses = create_circular_camera_poses(
         num_views, 
@@ -253,7 +280,6 @@ def render_views_around_mesh(
         images.append(image)
         depths.append(depth)
 
-    renderer.delete()
 
     if return_depth:
         return images, depths
@@ -399,7 +425,7 @@ def render_single_view(
         znear=znear,
         zfar=zfar
     )
-    renderer = pyrender.OffscreenRenderer(*image_size)
+    renderer = get_offscreen_renderer(*image_size)
 
     target_vec: Optional[np.ndarray]
     if target is not None:
@@ -446,7 +472,6 @@ def render_single_view(
         flags=flags,
         return_type=return_type
     )
-    renderer.delete()
 
     if return_depth:
         return image, depth
@@ -565,6 +590,88 @@ def compute_global_center_and_radius(meshes: List[Union[trimesh.Trimesh, trimesh
     radius = float(max(radius, 1e-4))
     return center, radius
 
+def load_camera_metadata(path: Union[str, os.PathLike]) -> Dict[str, Any]:
+    """Load and validate a camera block from physics metadata or a camera JSON file."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    camera = payload.get("camera", payload)
+    if not isinstance(camera, dict):
+        raise ValueError(f"Camera metadata in {path} is not an object")
+    for key in ("camera_to_world", "intrinsics", "resolution"):
+        if key not in camera:
+            raise ValueError(f"Camera metadata in {path} is missing {key!r}")
+    pose = np.asarray(camera["camera_to_world"], dtype=np.float64)
+    intrinsics = np.asarray(camera["intrinsics"], dtype=np.float64)
+    resolution = np.asarray(camera["resolution"], dtype=np.int64)
+    if pose.shape != (4, 4) or not np.isfinite(pose).all():
+        raise ValueError(f"camera_to_world in {path} must be a finite 4x4 matrix")
+    if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
+        raise ValueError(f"intrinsics in {path} must be a finite 3x3 matrix")
+    if resolution.shape != (2,) or np.any(resolution <= 0):
+        raise ValueError(f"resolution in {path} must be [width, height]")
+    return camera
+
+def load_pred_to_gt_transform(path: Union[str, os.PathLike]) -> np.ndarray:
+    """Load evaluate_reconstruction.py's prediction-to-GT similarity transform."""
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    summary = payload.get("summary", payload)
+    raw_transform = summary.get("pred_to_gt_transform") if isinstance(summary, dict) else None
+    if raw_transform is None:
+        raise ValueError(f"Alignment metadata in {path} has no pred_to_gt_transform")
+    transform = np.asarray(raw_transform, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError(f"pred_to_gt_transform in {path} must be a finite 4x4 matrix")
+    return transform
+
+def render_sequence_from_camera_metadata(
+    meshes: List[Union[trimesh.Trimesh, trimesh.Scene]],
+    camera_metadata: Dict[str, Any],
+    pred_to_gt_transform: np.ndarray,
+    image_size: tuple = (512, 512),
+    light_intensity: Optional[float] = 5.0,
+    flags: int = pyrender.constants.RenderFlags.NONE,
+    bg_color: Optional[Tuple[float, float, float, float]] = None,
+    return_type: Literal['pil', 'ndarray'] = 'pil',
+) -> List[Union[Image.Image, np.ndarray]]:
+    """Render prediction-space meshes through a Blender-world GT camera."""
+    if not meshes:
+        return []
+    transform = np.asarray(pred_to_gt_transform, dtype=np.float64)
+    if transform.shape != (4, 4) or not np.isfinite(transform).all():
+        raise ValueError("pred_to_gt_transform must be a finite 4x4 matrix")
+
+    source_width, source_height = (int(v) for v in camera_metadata["resolution"])
+    target_width, target_height = (int(v) for v in image_size)
+    intrinsics = np.asarray(camera_metadata["intrinsics"], dtype=np.float64).copy()
+    intrinsics[0, :] *= target_width / source_width
+    intrinsics[1, :] *= target_height / source_height
+    camera = pyrender.IntrinsicsCamera(
+        fx=float(intrinsics[0, 0]),
+        fy=float(intrinsics[1, 1]),
+        cx=float(intrinsics[0, 2]),
+        cy=float(intrinsics[1, 2]),
+        znear=float(camera_metadata.get("clip_start", 0.1)),
+        zfar=float(camera_metadata.get("clip_end", 1000.0)),
+    )
+    camera_pose = np.asarray(camera_metadata["camera_to_world"], dtype=np.float64)
+    renderer = get_offscreen_renderer(target_width, target_height)
+    light = pyrender.DirectionalLight(color=np.ones(3), intensity=light_intensity) if light_intensity is not None else None
+
+    output = []
+    for mesh in meshes:
+        scene_trimesh = mesh.copy() if isinstance(mesh, trimesh.Scene) else trimesh.Scene(mesh.copy())
+        scene_trimesh.apply_transform(transform)
+        scene = pyrender.Scene.from_trimesh_scene(scene_trimesh)
+        if bg_color is not None:
+            scene.bg_color = np.array(bg_color)
+        image, _ = render(
+            scene, renderer, camera, camera_pose, light,
+            normalize_depth=False, flags=flags, return_type=return_type,
+        )
+        output.append(image)
+    return output
+
 def render_sequence_fixed_camera(
     meshes: List[Union[trimesh.Trimesh, trimesh.Scene]],
     azimuth: float = 0.0,
@@ -579,6 +686,8 @@ def render_sequence_fixed_camera(
     flags: int = pyrender.constants.RenderFlags.NONE,
     bg_color: Optional[Tuple[float, float, float, float]] = None,
     return_type: Literal['pil', 'ndarray'] = 'pil',
+    camera_metadata: Optional[Dict[str, Any]] = None,
+    pred_to_gt_transform: Optional[np.ndarray] = None,
 ) -> List[Union[Image.Image, np.ndarray]]:
     """Render a list of meshes from a single, fixed camera across frames.
     - Computes a global center/radius across all meshes
@@ -587,6 +696,19 @@ def render_sequence_fixed_camera(
     """
     if len(meshes) == 0:
         return []
+    if (camera_metadata is None) != (pred_to_gt_transform is None):
+        raise ValueError("camera_metadata and pred_to_gt_transform must be provided together")
+    if camera_metadata is not None and pred_to_gt_transform is not None:
+        return render_sequence_from_camera_metadata(
+            meshes,
+            camera_metadata=camera_metadata,
+            pred_to_gt_transform=pred_to_gt_transform,
+            image_size=image_size,
+            light_intensity=light_intensity,
+            flags=flags,
+            bg_color=bg_color,
+            return_type=return_type,
+        )
 
     center, rad = compute_global_center_and_radius(meshes)
     cam_radius = float(distance) if (distance is not None and distance > 0) else float(fit_scale * rad)
@@ -599,7 +721,7 @@ def render_sequence_fixed_camera(
         znear=znear,
         zfar=zfar,
     )
-    renderer = pyrender.OffscreenRenderer(*image_size)
+    renderer = get_offscreen_renderer(*image_size)
 
     # Prepare fixed camera pose looking at origin, placed on sphere at distance
     cam_pose = create_camera_pose_on_sphere(azimuth=azimuth, elevation=elevation, radius=cam_radius)
@@ -623,7 +745,6 @@ def render_sequence_fixed_camera(
         img, _ = render(scene, renderer, camera, cam_pose, light, normalize_depth=False, flags=flags, return_type=return_type)
         out_frames.append(img)
 
-    renderer.delete()
     return out_frames
 
 def make_grid_for_images_or_videos(

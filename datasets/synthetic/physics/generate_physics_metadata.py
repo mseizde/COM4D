@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
-"""Generate two-ball PyBullet trajectory metadata for Blender rendering.
+"""Generate PyBullet trajectory metadata for Blender rendering.
 
 Cluster/headless example:
-  micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_physics_metadata.py \
-    --output-dir outputs/two_ball_test \
+  micromamba run -n com4d python datasets/synthetic/physics/generate_physics_metadata.py \
+    --output-dir outputs/physics \
     --num-frames 32
 """
 
@@ -21,7 +21,7 @@ import pybullet_data
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "two_ball_test"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "physics"
 
 
 def initial_position(
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=DEFAULT_OUTPUT_DIR,
-        help="Directory for physics_metadata.json. Defaults to COM4D/outputs/two_ball_test.",
+        help="Directory for physics_metadata.json. Defaults to COM4D/outputs/physics.",
     )
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--num-frames", type=int, default=32)
@@ -127,6 +127,8 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Uniform mass jitter applied independently to each ball.",
     )
+    parser.add_argument("--max-dynamic-abs-xy", type=float)
+    parser.add_argument("--max-dynamic-z", type=float)
     parser.add_argument(
         "--gui",
         action="store_true",
@@ -280,6 +282,21 @@ def main() -> None:
             if args.gui and args.realtime_sleep:
                 time.sleep(dt)
 
+        bounds_failure = None
+        for frame in frames:
+            for name in ("ball_0", "ball_1"):
+                pos = frame[name]["position"]
+                if args.max_dynamic_abs_xy is not None and args.max_dynamic_abs_xy > 0 and (
+                    abs(float(pos[0])) > args.max_dynamic_abs_xy or abs(float(pos[1])) > args.max_dynamic_abs_xy
+                ):
+                    bounds_failure = {"frame": frame["frame"], "object": name, "position": pos, "reason": "xy_bound"}
+                    break
+                if args.max_dynamic_z is not None and args.max_dynamic_z > 0 and float(pos[2]) > args.max_dynamic_z:
+                    bounds_failure = {"frame": frame["frame"], "object": name, "position": pos, "reason": "z_bound"}
+                    break
+            if bounds_failure is not None:
+                raise RuntimeError(f"Dynamic object left training bounds: {bounds_failure}")
+
         metadata = {
             "scenario": "two_ball_collision",
             "fps": args.fps,
@@ -336,6 +353,11 @@ def main() -> None:
                 },
             },
             "collision_frame": collision_frame,
+            "training_bounds": {
+                "max_dynamic_abs_xy": args.max_dynamic_abs_xy,
+                "max_dynamic_z": args.max_dynamic_z,
+                "ok": bounds_failure is None,
+            },
             "frames": frames,
         }
 

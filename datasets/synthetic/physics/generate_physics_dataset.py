@@ -17,7 +17,7 @@ The generated points.npy files include explicit per-ball entries under the
 spatio-temporal mixing over [frame x object] instances.
 
 Example:
-  micromamba run -n com4d python datasets/synthetic/two_ball_test/generate_physics_dataset.py \
+  micromamba run -n com4d python datasets/synthetic/physics/generate_physics_dataset.py \
     --num-samples 1000 \
     --num-frames 32 \
     --workers 4 \
@@ -45,84 +45,86 @@ from tqdm.auto import tqdm
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = Path(__file__).resolve().parent
 DATA_ROOT = Path("/data/mseizde/com4d/datasets/processed")
-DEFAULT_RAW_ROOT = DATA_ROOT / "physics" / "two_ball_raw"
-DEFAULT_PROCESSED_ROOT = DATA_ROOT / "physics" / "two_ball"
+DEFAULT_RAW_ROOT = DATA_ROOT / "physics" / "raw"
+DEFAULT_PROCESSED_ROOT = DATA_ROOT / "physics" / "processed"
 DEFAULT_JSON_OUTPUT = PROJECT_ROOT / "dataset_json" / "physics.json"
 RUN_ONE = SCRIPT_DIR / "run_physics_pipeline.py"
 PREPROCESS = SCRIPT_DIR / "preprocess_physics_outputs.py"
 
 
 SCENARIO_SAMPLING_DEFAULTS = {
+    # Training defaults intentionally keep interactions close, level, and in-frame.
+    # The evaluation generator keeps wider edge-case ranges separately.
     "two_ball_collision": {
-        "radius_range": [0.18, 0.38],
-        "mass_range": [0.6, 1.8],
-        "height_range": [0.0, 0.12],
-        "x_extent_range": [0.65, 0.95],
-        "y_offset_range": [-0.18, 0.18],
-        "speed_range": [1.6, 2.8],
-        "lateral_speed_range": [-0.35, 0.35],
-        "vertical_speed_range": [0.0, 0.35],
-        "restitution_range": [0.65, 0.98],
-        "friction_range": [0.05, 0.45],
-        "camera_target": [0.0, 0.0, 0.35],
-        "camera_focal_length": 35.0,
-        "camera_distance_range": [3.4, 5.4],
-        "camera_height_range": [0.8, 4.8],
+        "radius_range": [0.20, 0.32],
+        "mass_range": [0.7, 1.5],
+        "height_range": [0.0, 0.06],
+        "x_extent_range": [0.55, 0.75],
+        "y_offset_range": [-0.08, 0.08],
+        "speed_range": [1.2, 2.0],
+        "lateral_speed_range": [-0.18, 0.18],
+        "vertical_speed_range": [0.0, 0.12],
+        "restitution_range": [0.70, 0.92],
+        "friction_range": [0.08, 0.32],
+        "camera_target": [0.0, 0.0, 0.32],
+        "camera_focal_length": 38.0,
+        "camera_distance_range": [2.6, 3.4],
+        "camera_height_range": [0.45, 1.25],
         "camera_azimuth_range": [0.0, 360.0],
     },
     "ball_drop": {
-        "radius_range": [0.20, 0.32],
-        "mass_range": [0.7, 1.6],
-        "height_range": [0.0, 0.08],
-        "drop_height_range": [1.25, 1.85],
-        "x_extent_range": [0.0, 0.45],
-        "y_offset_range": [-0.10, 0.10],
-        "speed_range": [0.25, 1.6],
-        "lateral_speed_range": [-0.08, 0.08],
-        "vertical_speed_range": [-0.03, 0.08],
-        "restitution_range": [0.65, 0.95],
-        "friction_range": [0.03, 0.22],
-        "camera_target": [0.0, 0.0, 0.8],
-        "camera_focal_length": 28.0,
-        "camera_distance_range": [3.8, 5.8],
-        "camera_height_range": [0.8, 5.0],
+        "radius_range": [0.20, 0.30],
+        "mass_range": [0.8, 1.4],
+        "height_range": [0.0, 0.04],
+        "drop_height_range": [1.10, 1.55],
+        "x_extent_range": [0.0, 0.25],
+        "y_offset_range": [-0.06, 0.06],
+        "speed_range": [0.15, 0.80],
+        "lateral_speed_range": [-0.12, 0.12],
+        "vertical_speed_range": [-0.02, 0.04],
+        "restitution_range": [0.65, 0.88],
+        "friction_range": [0.05, 0.20],
+        "camera_target": [0.15, 0.0, 0.75],
+        "camera_focal_length": 35.0,
+        "camera_distance_range": [2.8, 3.7],
+        "camera_height_range": [0.45, 1.35],
         "camera_azimuth_range": [0.0, 360.0],
     },
     "rolling_occluder": {
-        "radius_range": [0.20, 0.32],
-        "mass_range": [0.7, 1.6],
-        "height_range": [0.0, 0.05],
-        "x_extent_range": [2.2, 2.8],
-        "y_offset_range": [-0.10, 0.10],
-        "speed_range": [3.4, 4.8],
-        "lateral_speed_range": [-0.18, 0.18],
-        "vertical_speed_range": [0.0, 0.08],
-        "restitution_range": [0.25, 0.65],
-        "friction_range": [0.35, 0.85],
-        "occluder_y_range": [-1.35, -1.05],
-        "occluder_size_range": [0.40, 0.58],
-        "camera_target": [0.0, -0.4, 0.5],
-        "camera_focal_length": 35.0,
-        "camera_distance_range": [4.0, 6.2],
-        "camera_height_range": [0.25, 4.4],
+        "radius_range": [0.20, 0.30],
+        "mass_range": [0.8, 1.4],
+        "height_range": [0.0, 0.04],
+        "x_extent_range": [1.30, 1.70],
+        "y_offset_range": [-0.06, 0.06],
+        "speed_range": [1.6, 2.8],
+        "lateral_speed_range": [-0.08, 0.08],
+        "vertical_speed_range": [0.0, 0.04],
+        "restitution_range": [0.25, 0.55],
+        "friction_range": [0.45, 0.80],
+        "occluder_y_range": [-1.05, -0.85],
+        "occluder_size_range": [0.34, 0.48],
+        "camera_target": [0.0, -0.35, 0.45],
+        "camera_focal_length": 38.0,
+        "camera_distance_range": [3.2, 4.0],
+        "camera_height_range": [0.35, 1.25],
         "camera_azimuth_range": [-25.0, 25.0],
     },
     "wall_impact": {
-        "radius_range": [0.20, 0.32],
-        "mass_range": [0.7, 1.6],
-        "height_range": [0.0, 0.06],
-        "x_extent_range": [0.8, 1.6],
-        "y_offset_range": [-0.18, 0.18],
-        "speed_range": [2.6, 5.0],
-        "lateral_speed_range": [-0.65, 0.65],
-        "vertical_speed_range": [0.0, 0.08],
-        "restitution_range": [0.55, 0.95],
-        "friction_range": [0.03, 0.25],
-        "wall_distance_range": [1.2, 2.8],
-        "camera_target": [0.8, 0.0, 0.5],
-        "camera_focal_length": 30.0,
-        "camera_distance_range": [4.0, 7.0],
-        "camera_height_range": [0.8, 5.2],
+        "radius_range": [0.20, 0.30],
+        "mass_range": [0.8, 1.4],
+        "height_range": [0.0, 0.12],
+        "x_extent_range": [0.60, 1.00],
+        "y_offset_range": [-0.10, 0.10],
+        "speed_range": [1.8, 3.0],
+        "lateral_speed_range": [-0.28, 0.28],
+        "vertical_speed_range": [0.0, 0.04],
+        "restitution_range": [0.60, 0.88],
+        "friction_range": [0.05, 0.20],
+        "wall_distance_range": [1.20, 1.80],
+        "camera_target": [0.45, 0.0, 0.45],
+        "camera_focal_length": 38.0,
+        "camera_distance_range": [3.0, 4.2],
+        "camera_height_range": [0.45, 1.35],
         "camera_azimuth_range": [-180.0, 0.0],
     },
 }
@@ -169,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--json-output", type=Path, default=DEFAULT_JSON_OUTPUT)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--keep-raw", action="store_true")
+    parser.add_argument("--no-save-camera-metadata", action="store_true", help="Do not persist camera metadata in raw physics_metadata.json files.")
     parser.add_argument("--retries", type=int, default=0, help="Retry failed sample generation commands.")
 
     parser.add_argument("--blender-bin", default="blender")
@@ -209,19 +212,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-distance-range", type=float, nargs=2, default=None)
     parser.add_argument("--camera-height-range", type=float, nargs=2, default=None)
     parser.add_argument("--camera-azimuth-range", type=float, nargs=2, default=None)
-    parser.add_argument("--light-energy-range", type=float, nargs=2, default=[350.0, 750.0])
-    parser.add_argument("--light-size-range", type=float, nargs=2, default=[2.0, 6.0])
-    parser.add_argument("--light-distance-range", type=float, nargs=2, default=[3.0, 5.5])
-    parser.add_argument("--light-height-range", type=float, nargs=2, default=[3.0, 6.0])
+    parser.add_argument("--light-energy-range", type=float, nargs=2, default=[320.0, 520.0])
+    parser.add_argument("--light-size-range", type=float, nargs=2, default=[4.0, 7.0])
+    parser.add_argument("--light-distance-range", type=float, nargs=2, default=[2.5, 3.5])
+    parser.add_argument("--light-height-range", type=float, nargs=2, default=[2.8, 3.8])
+    parser.add_argument(
+        "--random-light",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Randomize light azimuth. Disabled by default for clean training data.",
+    )
+    parser.add_argument(
+        "--max-dynamic-abs-xy",
+        type=float,
+        default=2.35,
+        help="Reject generated training samples when any dynamic object center leaves this |x|/|y| bound. Use <=0 to disable.",
+    )
+    parser.add_argument(
+        "--max-dynamic-z",
+        type=float,
+        default=2.20,
+        help="Reject generated training samples when any dynamic object center exceeds this z bound. Use <=0 to disable.",
+    )
     parser.add_argument(
         "--looks",
-        default="red,blue,green,orange,white,black,basketball,football",
+        default="red,blue,green,orange,white",
         help="Comma-separated material look choices to sample.",
     )
     parser.add_argument(
         "--floor-looks",
-        default="gray,light_gray,dark_gray,blue_gray,green_gray",
+        default="gray,light_gray,blue_gray",
         help="Comma-separated floor material look choices to sample.",
+    )
+    parser.add_argument(
+        "--world-color",
+        type=float,
+        nargs=3,
+        default=[1.0, 1.0, 1.0],
+        help="Renderer world background color as RGB. Defaults to white for neutral training data.",
+    )
+    parser.add_argument(
+        "--floor-color",
+        type=float,
+        nargs=4,
+        default=None,
+        help="Optional fixed floor color as RGBA. If omitted, --floor-looks is sampled.",
     )
     return parser.parse_args()
 
@@ -364,8 +399,8 @@ def sample_params(args: argparse.Namespace, sample_idx: int, scenario: str) -> d
         "light_size": sample_range(rng, light_size_range),
         "light_distance": sample_range(rng, light_distance_range),
         "light_height": sample_range(rng, light_height_range),
-        "ball_0_look": rng.choice(looks),
-        "ball_1_look": rng.choice(looks),
+        "ball_0_look": (ball_0_look := rng.choice(looks)),
+        "ball_1_look": rng.choice([look for look in looks if look != ball_0_look] or looks),
         "floor_look": rng.choice(floor_looks),
     }
 
@@ -429,7 +464,6 @@ def build_sample_command(args: argparse.Namespace, sample_idx: int, sample_dir: 
         str(params["camera_azimuth"]),
         "--camera-focal-length",
         str(params["camera_focal_length"]),
-        "--random-light",
         "--light-seed",
         str(params["seed"]),
         "--light-energy",
@@ -440,15 +474,31 @@ def build_sample_command(args: argparse.Namespace, sample_idx: int, sample_dir: 
         str(params["light_distance"]),
         "--light-height",
         str(params["light_height"]),
+        "--light-location",
+        "0.0",
+        "-2.7",
+        "3.3",
+        "--max-dynamic-abs-xy",
+        str(args.max_dynamic_abs_xy),
+        "--max-dynamic-z",
+        str(args.max_dynamic_z),
         "--ball-0-look",
         str(params["ball_0_look"]),
         "--ball-1-look",
         str(params["ball_1_look"]),
         "--floor-look",
         str(params["floor_look"]),
+        "--world-color",
+        *(str(value) for value in args.world_color),
         "--skip-transforms",
         "--skip-canonical-meshes",
     ]
+    if args.no_save_camera_metadata:
+        cmd.append("--skip-camera-metadata")
+    if args.floor_color is not None:
+        extend_vec(cmd, "--floor-color", args.floor_color)
+    if args.random_light:
+        cmd.append("--random-light")
     if not args.write_masks:
         cmd.append("--skip-masks")
     cmd.extend(["--drop-height", str(params["drop_height"])])

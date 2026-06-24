@@ -3,8 +3,8 @@
 """Run synthetic physics generation and Blender rendering in one command.
 
 Example:
-  micromamba run -n com4d python datasets/synthetic/two_ball_test/run_physics_pipeline.py \
-    --output-dir outputs/two_ball_test/seed_0001 \
+  micromamba run -n com4d python datasets/synthetic/physics/run_physics_pipeline.py \
+    --output-dir outputs/physics/seed_0001 \
     --num-frames 96 \
     --seed 1 \
     --position-jitter 0.08 \
@@ -28,18 +28,18 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "two_ball_test"
-DEFAULT_BLEND_FILE = SCRIPT_DIR / "physics_scene.blend" if (SCRIPT_DIR / "physics_scene.blend").exists() else SCRIPT_DIR / "two_ball_scene.blend"
+DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "physics"
+DEFAULT_BLEND_FILE = SCRIPT_DIR / "physics_scene.blend" 
 GENERATOR = SCRIPT_DIR / "generate_physics_metadata.py"
 SCENARIO_GENERATOR = SCRIPT_DIR / "simulate_physics_scenario.py"
 RENDERER = SCRIPT_DIR / "render_physics_outputs.py"
 
 
 SCENARIO_CAMERA_DEFAULTS = {
-    "two_ball_collision": {"target": [0.0, 0.0, 0.35], "distance": 5.0, "height": 2.0, "azimuth": 0.0, "focal_length": 35.0},
-    "ball_drop": {"target": [0.6, 0.0, 1.1], "distance": 6.05, "height": 1.5, "azimuth": 7.6, "focal_length": 28.0},
-    "rolling_occluder": {"target": [0.0, -0.4, 0.5], "distance": 5.5, "height": 1.1, "azimuth": 0.0, "focal_length": 35.0},
-    "wall_impact": {"target": [0.8, 0.0, 0.5], "distance": 6.05, "height": 1.3, "azimuth": -4.8, "focal_length": 30.0},
+    "two_ball_collision": {"target": [0.0, 0.0, 0.32], "distance": 3.0, "height": 0.85, "azimuth": 0.0, "focal_length": 38.0},
+    "ball_drop": {"target": [0.15, 0.0, 0.75], "distance": 3.2, "height": 0.9, "azimuth": 8.0, "focal_length": 35.0},
+    "rolling_occluder": {"target": [0.0, -0.35, 0.45], "distance": 3.5, "height": 0.8, "azimuth": 0.0, "focal_length": 38.0},
+    "wall_impact": {"target": [0.45, 0.0, 0.45], "distance": 3.5, "height": 0.9, "azimuth": -10.0, "focal_length": 38.0},
 }
 
 
@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
         "--scenario",
         choices=("two_ball_collision", "ball_drop", "rolling_occluder", "wall_impact"),
         default="two_ball_collision",
-        help="Physics test to generate. two_ball_collision keeps the legacy randomized two-ball generator.",
+        help="Physics test to generate.",
     )
 
     parser.add_argument("--fps", type=int, default=30)
@@ -131,14 +131,15 @@ def parse_args() -> argparse.Namespace:
         default="gray",
     )
     parser.add_argument("--floor-color", type=float, nargs=4)
+    parser.add_argument("--world-color", type=float, nargs=3)
     parser.add_argument("--material-roughness", type=float, default=0.45)
     parser.add_argument("--light-seed", type=int)
     add_vec3_arg(parser, "--light-location")
-    parser.add_argument("--light-energy", type=float, default=500.0)
-    parser.add_argument("--light-size", type=float, default=4.0)
+    parser.add_argument("--light-energy", type=float, default=420.0)
+    parser.add_argument("--light-size", type=float, default=5.5)
     parser.add_argument("--random-light", action="store_true")
-    parser.add_argument("--light-distance", type=float, default=4.0)
-    parser.add_argument("--light-height", type=float, default=5.0)
+    parser.add_argument("--light-distance", type=float, default=3.0)
+    parser.add_argument("--light-height", type=float, default=3.3)
     parser.add_argument("--light-energy-jitter", type=float, default=0.0)
     parser.add_argument("--light-size-jitter", type=float, default=0.0)
     parser.add_argument("--skip-masks", action="store_true")
@@ -146,6 +147,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-normals", action="store_true")
     parser.add_argument("--skip-transforms", action="store_true")
     parser.add_argument("--skip-canonical-meshes", action="store_true")
+    parser.add_argument("--skip-camera-metadata", action="store_true")
+    parser.add_argument("--max-dynamic-abs-xy", type=float, default=0.0)
+    parser.add_argument("--max-dynamic-z", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -211,6 +215,8 @@ def build_generator_cmd(args: argparse.Namespace) -> list[str]:
         append_vec(cmd, "--wall-half-extents", args.wall_half_extents)
         append_vec(cmd, "--occluder-position", args.occluder_position)
         append_vec(cmd, "--occluder-half-extents", args.occluder_half_extents)
+        append_optional(cmd, "--max-dynamic-abs-xy", args.max_dynamic_abs_xy if args.max_dynamic_abs_xy > 0 else None)
+        append_optional(cmd, "--max-dynamic-z", args.max_dynamic_z if args.max_dynamic_z > 0 else None)
         return cmd
 
     cmd = [
@@ -266,6 +272,8 @@ def build_generator_cmd(args: argparse.Namespace) -> list[str]:
     append_optional(cmd, "--ball-0-radius", args.ball_0_radius)
     append_optional(cmd, "--ball-1-radius", args.ball_1_radius)
     append_optional(cmd, "--seed", args.seed)
+    append_optional(cmd, "--max-dynamic-abs-xy", args.max_dynamic_abs_xy if args.max_dynamic_abs_xy > 0 else None)
+    append_optional(cmd, "--max-dynamic-z", args.max_dynamic_z if args.max_dynamic_z > 0 else None)
     append_vec(cmd, "--ball-0-position", args.ball_0_position)
     append_vec(cmd, "--ball-1-position", args.ball_1_position)
     return cmd
@@ -332,6 +340,7 @@ def build_renderer_cmd(args: argparse.Namespace) -> list[str]:
     append_vec(cmd, "--ball-0-color", args.ball_0_color)
     append_vec(cmd, "--ball-1-color", args.ball_1_color)
     append_vec(cmd, "--floor-color", args.floor_color)
+    append_vec(cmd, "--world-color", args.world_color)
     if args.random_view:
         cmd.append("--random-view")
     if args.random_light:
@@ -346,6 +355,8 @@ def build_renderer_cmd(args: argparse.Namespace) -> list[str]:
         cmd.append("--skip-transforms")
     if args.skip_canonical_meshes:
         cmd.append("--skip-canonical-meshes")
+    if args.skip_camera_metadata:
+        cmd.append("--skip-camera-metadata")
     return cmd
 
 

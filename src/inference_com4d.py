@@ -4,6 +4,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from glob import glob
 import time
@@ -26,7 +27,13 @@ from src.pipelines.pipeline_partcrafter import (
     PartCrafter3D4DInferencePipeline,
 )
 from src.utils.data_utils import get_colored_mesh_composition
-from src.utils.render_utils import export_renderings, render_sequence_fixed_camera, render_views_around_mesh
+from src.utils.render_utils import (
+    export_renderings,
+    load_camera_metadata,
+    load_pred_to_gt_transform,
+    render_sequence_fixed_camera,
+    render_views_around_mesh,
+)
 
 
 class RoomLayoutAuxiliaryHead(nn.Module):
@@ -230,6 +237,7 @@ def _render_room_animation_gif(scenes: List[trimesh.Scene], path: Path, args: ar
         image_size=(int(args.render_size), int(args.render_size)),
         light_intensity=5.0,
         return_type="pil",
+        **_gt_camera_render_overrides(args),
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     export_renderings(frames, str(path), fps=int(args.animation_fps))
@@ -267,6 +275,25 @@ def _to_pil_rgb(image) -> Image.Image:
     raise TypeError(f"Unsupported image type for conversion: {type(image)!r}")
 
 
+def _gt_camera_render_overrides(args: argparse.Namespace) -> dict:
+    camera_path = getattr(args, "camera_metadata", None)
+    alignment_path = getattr(args, "alignment_metadata", None)
+    if camera_path is None and alignment_path is None:
+        return {}
+    if camera_path is None or alignment_path is None:
+        raise ValueError("--camera-metadata and --alignment-metadata must be provided together")
+    camera_path = Path(camera_path).expanduser().resolve()
+    alignment_path = Path(alignment_path).expanduser().resolve()
+    if not camera_path.is_file():
+        raise FileNotFoundError(f"Camera metadata not found: {camera_path}")
+    if not alignment_path.is_file():
+        raise FileNotFoundError(f"Alignment metadata not found: {alignment_path}")
+    return {
+        "camera_metadata": load_camera_metadata(camera_path),
+        "pred_to_gt_transform": load_pred_to_gt_transform(alignment_path),
+    }
+
+
 def _compose_side_by_side(left: Image.Image, right: Image.Image, target_size: tuple[int, int]) -> Image.Image:
     if left.size != target_size:
         left = left.resize(target_size, Image.LANCZOS)
@@ -292,6 +319,7 @@ def _render_room_augmented_animations(
         "light_intensity": 5.0,
         "return_type": "pil",
         "bg_color": (255, 255, 255, 255),
+        **_gt_camera_render_overrides(args),
     }
     scene_frames = render_sequence_fixed_camera(scenes, **render_kwargs)
     scene_images = [_to_pil_rgb(frame).resize(target_size, Image.LANCZOS) for frame in scene_frames]
@@ -307,7 +335,12 @@ def _render_room_augmented_animations(
             last_gt = scene_img
         comparison_frames.append(_compose_side_by_side(last_gt, scene_img, target_size))
 
-        if args.insert_rotation_every and args.insert_rotation_every > 0 and (idx + 1) % int(args.insert_rotation_every) == 0:
+        if (
+            not args.camera_metadata
+            and args.insert_rotation_every
+            and args.insert_rotation_every > 0
+            and (idx + 1) % int(args.insert_rotation_every) == 0
+        ):
             rotation_frames = render_views_around_mesh(
                 scenes[idx],
                 num_views=int(args.predicted_room_num_views),
@@ -421,6 +454,32 @@ def _predict_room_shell(
     }
     return room_shell, metadata
 
+
+
+def _render_gt_diagnostic_gifs(export_dir: Path, args: argparse.Namespace) -> None:
+    if not args.gt_diagnostic_gifs or args.camera_metadata is None or args.alignment_metadata is None:
+        return
+    renderer_script = Path(__file__).resolve().parents[1] / "scripts" / "eval" / "render_prediction_gifs.py"
+    command = [
+        sys.executable,
+        str(renderer_script),
+        "--export-dir", str(export_dir),
+        "--camera-metadata", str(Path(args.camera_metadata).expanduser().resolve()),
+        "--alignment-metadata", str(Path(args.alignment_metadata).expanduser().resolve()),
+        "--output-name", "animation_gt_camera.gif",
+        "--render-size", str(int(args.render_size)),
+        "--fps", str(int(args.animation_fps)),
+        "--orbit-frames", str(int(args.gt_orbit_frames)),
+        "--prediction-overlay-alpha", str(float(args.gt_prediction_overlay_alpha)),
+        "--overwrite",
+    ]
+    source_dir = args.frames_original_dir or args.frames_dir
+    if source_dir:
+        command.extend(["--source-frames-dir", str(Path(source_dir).expanduser().resolve())])
+    if args.gt_geometry_root is not None:
+        command.extend(["--gt-geometry-root", str(Path(args.gt_geometry_root).expanduser().resolve())])
+    print("+", " ".join(command), flush=True)
+    subprocess.run(command, cwd=str(Path(__file__).resolve().parents[1]), check=True)
 
 
 def main():
@@ -597,6 +656,32 @@ def main():
         default=1024,
         help="Render resolution (square)",
     )
+    parser.add_argument(
+        "--camera-metadata",
+        type=Path,
+        default=None,
+        help="Optional physics_metadata.json (or camera JSON) for GT-view animation rendering; requires --alignment-metadata.",
+    )
+    parser.add_argument(
+        "--alignment-metadata",
+        type=Path,
+        default=None,
+        help="Optional reconstruction metrics JSON containing pred_to_gt_transform; requires --camera-metadata.",
+    )
+    parser.add_argument(
+        "--gt-geometry-root",
+        type=Path,
+        default=None,
+        help="Optional GT case directory with meshes/ and transforms/. Defaults to the camera metadata parent.",
+    )
+    parser.add_argument(
+        "--gt-diagnostic-gifs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With GT camera/alignment inputs, write animation_diagnostic.gif, animation_orbit.gif, and animation_gt_overlay.gif.",
+    )
+    parser.add_argument("--gt-orbit-frames", type=int, default=36)
+    parser.add_argument("--gt-prediction-overlay-alpha", type=float, default=0.48)
     parser.add_argument(
         "--image_size",
         type=int,
@@ -813,6 +898,10 @@ def main():
             "room_augment_animations": "room_augment_animations",
             "predicted_room_num_views": "predicted_room_num_views",
             "predicted_room_camera_radius": "predicted_room_camera_radius",
+            "gt_diagnostic_gifs": "gt_diagnostic_gifs",
+            "gt_orbit_frames": "gt_orbit_frames",
+            "gt_prediction_overlay_alpha": "gt_prediction_overlay_alpha",
+            "gt_geometry_root": "gt_geometry_root",
             "room_layout_aux_path": "room_layout_aux_path",
             "room_layout_hidden_dim": "room_layout_hidden_dim",
             "room_alpha": "room_alpha",
@@ -838,6 +927,10 @@ def main():
         parser.error("--image_size must be a positive integer")
     if not 0.0 <= args.room_alpha <= 1.0:
         parser.error("--room_alpha must be in [0, 1]")
+    if args.gt_orbit_frames <= 0:
+        parser.error("--gt-orbit-frames must be positive")
+    if not 0.0 <= args.gt_prediction_overlay_alpha <= 1.0:
+        parser.error("--gt-prediction-overlay-alpha must be in [0, 1]")
     if args.room_extent_min <= 0.0 or args.room_extent_max <= 0.0 or args.room_extent_max < args.room_extent_min:
         parser.error("--room_extent_min/--room_extent_max must be positive and max >= min")
 
@@ -998,7 +1091,11 @@ def main():
 
     render_kwargs = {
         "image_size": (args.render_size, args.render_size),
+        **_gt_camera_render_overrides(args),
     }
+    if args.camera_metadata is not None and args.insert_rotation_every:
+        print("Warning: --insert_rotation_every is disabled for GT-camera rendering.")
+        args.insert_rotation_every = 0
 
     scene_attn_ids = _parse_id_string(args.scene_attn_ids)
     dynamic_attn_ids = _parse_id_string(args.dynamic_attn_ids)
@@ -1208,6 +1305,11 @@ def main():
                     print(f"Wrote room-augmented animation GIFs to {export_dir / 'animation.gif'} and {export_dir / 'animation_scene.gif'}")
                 except Exception as exc:
                     print(f"Warning: failed to render room-augmented animation GIFs: {exc}")
+
+    try:
+        _render_gt_diagnostic_gifs(export_dir, args)
+    except Exception as exc:
+        print(f"Warning: failed to render GT diagnostic GIFs: {exc}")
 
     try:
         with open(export_dir / "args.json", "w") as f:

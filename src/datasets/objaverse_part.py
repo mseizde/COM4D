@@ -375,7 +375,12 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.data_configs = data_configs
         image_load_size = int(configs["train"].get("image_load_size", 512))
         self.image_size = (image_load_size, image_load_size)
-        self.surface_num_points = int(configs["train"].get("surface_num_points", 204800))
+        self.surface_num_points = int(
+            configs.get("dataset", {}).get(
+                "surface_num_points",
+                configs["train"].get("surface_num_points", 204800),
+            )
+        )
         geometry_image_cfg = configs["train"].get("geometry_image_auxiliary", {})
         self.load_geometry_image_supervision = bool(
             hasattr(geometry_image_cfg, "get") and geometry_image_cfg.get("enabled", False)
@@ -588,7 +593,12 @@ class ObjaversePartDatasetOriginal(torch.utils.data.Dataset):
         self.data_configs = data_configs
         image_load_size = int(configs["train"].get("image_load_size", 512))
         self.image_size = (image_load_size, image_load_size)
-        self.surface_num_points = int(configs["train"].get("surface_num_points", 204800))
+        self.surface_num_points = int(
+            configs.get("dataset", {}).get(
+                "surface_num_points",
+                configs["train"].get("surface_num_points", 204800),
+            )
+        )
 
     def __len__(self) -> int:
         return len(self.data_configs)

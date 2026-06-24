@@ -14,9 +14,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT.parent
-RUN_ONE = REPO_ROOT / "datasets" / "synthetic" / "two_ball_test" / "run_physics_pipeline.py"
+RUN_ONE = REPO_ROOT / "datasets" / "synthetic" / "physics" / "run_physics_pipeline.py"
 PREPARE_INPUT = REPO_ROOT / "scripts" / "eval" / "prepare_physics_inference_input.py"
-DEFAULT_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/two_ball_compare")
+DEFAULT_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/physics_compare")
 DEFAULT_BLENDER = PROJECT_ROOT / "tools" / "blender-3.6.5-linux-x64" / "blender"
 
 
@@ -62,7 +62,7 @@ SCENARIO_SAMPLING_DEFAULTS = {
         "height_range": [0.0, 0.05],
         "x_extent_range": [2.2, 2.8],
         "y_offset_range": [-0.10, 0.10],
-        "speed_range": [3.4, 4.8],
+        "speed_range": [3.7, 4.8],
         "lateral_speed_range": [-0.18, 0.18],
         "vertical_speed_range": [0.0, 0.08],
         "restitution_range": [0.25, 0.65],
@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dataset-root", type=Path, default=DEFAULT_ROOT)
     ap.add_argument("--start-index", type=int, default=1)
     ap.add_argument("--num-samples", type=int, default=9)
-    ap.add_argument("--name-template", default="two_ball_eval_{index:03d}")
+    ap.add_argument("--name-template", default="physics_eval_{index:03d}")
     ap.add_argument("--seed", type=int, default=124)
     ap.add_argument("--num-frames", type=int, default=32)
     ap.add_argument(
@@ -140,6 +140,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--no-save-depth", action="store_true")
     ap.add_argument("--no-save-normals", action="store_true")
+    ap.add_argument("--no-save-camera-metadata", action="store_true", help="Do not persist camera metadata in generated physics_metadata.json files.")
 
     ap.add_argument("--radius-range", type=float, nargs=2, default=None)
     ap.add_argument("--mass-range", type=float, nargs=2, default=None)
@@ -372,6 +373,8 @@ def build_pipeline_cmd(args: argparse.Namespace, raw_dir: Path, params: dict[str
         cmd.append("--save-depth")
     if not args.no_save_normals:
         cmd.append("--save-normals")
+    if args.no_save_camera_metadata:
+        cmd.append("--skip-camera-metadata")
     cmd.extend(["--drop-height", str(params["drop_height"])])
     extend_vec(cmd, "--wall-position", [params["wall_distance"], 0.0, 1.0])  # type: ignore[list-item]
     extend_vec(cmd, "--wall-half-extents", [0.05, 2.5, 1.0])

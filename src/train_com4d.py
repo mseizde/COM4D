@@ -1305,6 +1305,24 @@ def main():
             physics_dataset_num_spatial_parts = [cfgs_physics['dataset'].get('num_spatial_parts', None)] * len(physics_dataset_jsons)
 
         physics_dataset_spatiotemporal_grid = _config_list(configs["train"].get("physics_dataset_spatiotemporal_grid", None))
+
+        physics_dataset_surface_num_points = _config_list(
+            configs["train"].get("physics_dataset_surface_num_points", None)
+        )
+        if physics_dataset_surface_num_points:
+            physics_dataset_surface_num_points = [int(value) for value in physics_dataset_surface_num_points]
+            if len(physics_dataset_surface_num_points) != len(physics_dataset_jsons):
+                raise ValueError(
+                    "train.physics_dataset_surface_num_points must have the same length as "
+                    "train.physics_dataset_jsons."
+                )
+        else:
+            physics_dataset_surface_num_points = [
+                cfgs_physics['dataset'].get(
+                    'surface_num_points',
+                    configs["train"].get("surface_num_points", 204800),
+                )
+            ] * len(physics_dataset_jsons)
         if physics_dataset_spatiotemporal_grid:
             physics_dataset_spatiotemporal_grid = [_bool_value(value) for value in physics_dataset_spatiotemporal_grid]
             if len(physics_dataset_spatiotemporal_grid) != len(physics_dataset_jsons):
@@ -1333,12 +1351,14 @@ def main():
         for source_idx, (
             physics_dataset_json,
             source_prob,
+            source_surface_num_points,
             source_num_spatial_parts,
             source_spatiotemporal_grid,
         ) in enumerate(
             zip(
                 physics_dataset_jsons,
                 physics_dataset_probs,
+                physics_dataset_surface_num_points,
                 physics_dataset_num_spatial_parts,
                 physics_dataset_spatiotemporal_grid,
             )
@@ -1350,6 +1370,7 @@ def main():
                     "Set train.physics_dataset_json or train.physics_dataset_jsons to existing dataset_json/*.json files."
                 )
             source_cfgs_physics = copy.deepcopy(cfgs_physics)
+            source_cfgs_physics['dataset']['surface_num_points'] = int(source_surface_num_points)
             source_cfgs_physics['dataset']['config'] = [str(physics_dataset_path)]
             source_cfgs_physics['dataset']['spatiotemporal_grid'] = bool(source_spatiotemporal_grid)
             if source_spatiotemporal_grid:
@@ -1367,6 +1388,7 @@ def main():
                     "spatiotemporal_grid": bool(source_spatiotemporal_grid),
                     "num_spatial_parts": source_num_spatial_parts,
                     "configs": source_cfgs_physics,
+                    "surface_num_points": int(source_surface_num_points),
                 }
             )
 
@@ -2011,6 +2033,27 @@ def main():
     temporal_geometry_aux_decoder_num_chunks = int(temporal_geometry_aux_cfg.get("decoder_num_chunks", 8192))
     temporal_geometry_aux_fallback_consecutive = bool(temporal_geometry_aux_cfg.get("fallback_consecutive", False))
     temporal_geometry_aux_skip_first_spatial_parts = int(temporal_geometry_aux_cfg.get("skip_first_spatial_parts", 0))
+    temporal_geometry_aux_physics_skip_first_spatial_parts = None
+    physics_skip_first_spatial_parts_cfg = temporal_geometry_aux_cfg.get("physics_skip_first_spatial_parts", None)
+    if physics_skip_first_spatial_parts_cfg is not None:
+        def _int_config_list(value):
+            if isinstance(value, (list, tuple, ListConfig)):
+                return [int(item) for item in value]
+            text = str(value).strip()
+            if text.startswith("[") and text.endswith("]"):
+                text = text[1:-1]
+            if "," in text:
+                return [int(item.strip()) for item in text.split(",") if item.strip()]
+            return [int(text)]
+
+        temporal_geometry_aux_physics_skip_first_spatial_parts = _int_config_list(
+            physics_skip_first_spatial_parts_cfg
+        )
+        if physics_dataset_specs and len(temporal_geometry_aux_physics_skip_first_spatial_parts) != len(physics_dataset_specs):
+            raise ValueError(
+                "train.temporal_geometry_auxiliary.physics_skip_first_spatial_parts must have the same length as "
+                "train.physics_dataset_jsons."
+            )
     temporal_geometry_aux_active = temporal_geometry_aux_enabled and (
         temporal_geometry_aux_latent_weight > 0.0
         or temporal_geometry_aux_surface_weight > 0.0
@@ -2027,7 +2070,8 @@ def main():
             f"accel_weight={temporal_geometry_aux_accel_weight}, "
             f"num_surface_points={temporal_geometry_aux_num_surface_points}, "
             f"fallback_consecutive={temporal_geometry_aux_fallback_consecutive}, "
-            f"skip_first_spatial_parts={temporal_geometry_aux_skip_first_spatial_parts}. "
+            f"skip_first_spatial_parts={temporal_geometry_aux_skip_first_spatial_parts}, "
+            f"physics_skip_first_spatial_parts={temporal_geometry_aux_physics_skip_first_spatial_parts}. "
             "Pairs are adjacent same spatial-part frames for frame-major physics grids; "
             "the surface term uses bbox-aligned implicit SDF cross-consistency, so global motion is not penalized.\n"
         )
@@ -3175,6 +3219,15 @@ def main():
                         finally:
                             for param, requires_grad in zip(layout_pose_aux_head.parameters(), aux_param_requires_grad):
                                 param.requires_grad_(requires_grad)
+                temporal_geometry_skip_first_spatial_parts = temporal_geometry_aux_skip_first_spatial_parts
+                if (
+                    mode == "physics"
+                    and temporal_geometry_aux_physics_skip_first_spatial_parts is not None
+                    and "physics_source_index" in mode_choice
+                ):
+                    temporal_geometry_skip_first_spatial_parts = temporal_geometry_aux_physics_skip_first_spatial_parts[
+                        int(mode_choice["physics_source_index"])
+                    ]
                 temporal_geometry_loss, temporal_geometry_terms = _compute_temporal_geometry_auxiliary_loss(
                     vae=vae,
                     clean_latents=clean_latents_for_aux,
@@ -3191,7 +3244,7 @@ def main():
                     decoder_num_chunks=temporal_geometry_aux_decoder_num_chunks,
                     decoder_dtype=weight_dtype,
                     fallback_consecutive=temporal_geometry_aux_fallback_consecutive,
-                    skip_first_spatial_parts=temporal_geometry_aux_skip_first_spatial_parts,
+                    skip_first_spatial_parts=temporal_geometry_skip_first_spatial_parts,
                 )
                 temporal_geometry_latent_loss = temporal_geometry_terms["latent"]
                 temporal_geometry_surface_loss = temporal_geometry_terms["surface"]

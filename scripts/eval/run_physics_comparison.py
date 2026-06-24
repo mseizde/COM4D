@@ -18,13 +18,13 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT.parent
 SCRIPT_DIR = Path(__file__).resolve().parent
-TWO_BALL_PIPELINE = REPO_ROOT / "datasets" / "synthetic" / "two_ball_test" / "run_physics_pipeline.py"
+PHYSICS_PIPELINE = REPO_ROOT / "datasets" / "synthetic" / "physics" / "run_physics_pipeline.py"
 PREPARE_INPUT = SCRIPT_DIR / "prepare_physics_inference_input.py"
 EVALUATE_PHYSICS = SCRIPT_DIR / "evaluate_physics.py"
 EVALUATE_RECONSTRUCTION = SCRIPT_DIR / "evaluate_reconstruction.py"
 
-DEFAULT_DATASET_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/two_ball_compare")
-DEFAULT_EVAL_ROOT = PROJECT_ROOT / "outputs" / "evaluation" / "two_ball_compare"
+DEFAULT_DATASET_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/physics_compare")
+DEFAULT_EVAL_ROOT = PROJECT_ROOT / "outputs" / "evaluation" / "physics_compare"
 DEFAULT_BLENDER = PROJECT_ROOT / "tools" / "blender-3.6.5-linux-x64" / "blender"
 DEFAULT_BASE_TRANSFORMER = REPO_ROOT / "pretrained_weights" / "COM4D" / "transformer_ema"
 DEFAULT_PHYSICS_TRANSFORMER = PROJECT_ROOT / "outputs" / "ckpts" / "com4d_sdemb_mf8_mp8_nt512_30400" / "checkpoints" / "003000"
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     ap.add_argument("--eval-root", type=Path, default=DEFAULT_EVAL_ROOT)
-    ap.add_argument("--sample-name", default="two_ball_eval_000")
+    ap.add_argument("--sample-name", default="physics_eval_000")
     ap.add_argument("--num-frames", type=int, default=32)
     ap.add_argument(
         "--scenario",
@@ -161,7 +161,7 @@ def generate_gt(args: argparse.Namespace, raw_dir: Path) -> None:
     raw_dir.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         sys.executable,
-        TWO_BALL_PIPELINE,
+        PHYSICS_PIPELINE,
         "--output-dir",
         raw_dir,
         "--blender-bin",
@@ -400,9 +400,9 @@ def main() -> None:
     row.update({f"physics_reconstruction_{key}": value for key, value in physics_reconstruction_summary.items()})
     row.update({f"base_physics_{key}": value for key, value in base_physics_summary.items()})
     row.update({f"physics_physics_{key}": value for key, value in physics_physics_summary.items()})
-    append_row(eval_root / "two_ball_comparison.csv", row)
+    append_row(eval_root / "physics_comparison.csv", row)
     append_rows(
-        eval_root / "two_ball_per_frame_metrics.csv",
+        eval_root / "physics_per_frame_metrics.csv",
         per_frame_rows(base_reconstruction_dir / "metrics.json", args.sample_name, args.base_tag, base_pred, args.base_transformer)
         + per_frame_rows(
             physics_reconstruction_dir / "metrics.json",
@@ -418,8 +418,8 @@ def main() -> None:
     print(f"Base prediction: {base_pred}")
     print(f"Physics prediction: {physics_pred}")
     print(f"Metrics: {metrics_dir}")
-    print(f"Comparison CSV: {eval_root / 'two_ball_comparison.csv'}")
-    print(f"Per-frame metrics CSV: {eval_root / 'two_ball_per_frame_metrics.csv'}")
+    print(f"Comparison CSV: {eval_root / 'physics_comparison.csv'}")
+    print(f"Per-frame metrics CSV: {eval_root / 'physics_per_frame_metrics.csv'}")
 
 
 if __name__ == "__main__":

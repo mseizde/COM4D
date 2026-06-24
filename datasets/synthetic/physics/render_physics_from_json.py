@@ -10,7 +10,7 @@ import mathutils
 if "--" not in sys.argv:
     raise RuntimeError(
         "No BASE_DIR provided. Run Blender like:\n"
-        "blender -b two_ball_scene.blend -P render_physics_from_json.py -- outputs/ball_drop_test"
+        "blender -b physics_scene.blend -P render_physics_from_json.py -- outputs/ball_drop_test"
     )
 
 args = sys.argv[sys.argv.index("--") + 1:]
@@ -18,7 +18,7 @@ args = sys.argv[sys.argv.index("--") + 1:]
 if len(args) < 1:
     raise RuntimeError(
         "Missing BASE_DIR after '--'. Example:\n"
-        "blender -b two_ball_scene.blend -P render_physics_from_json.py -- outputs/ball_drop_test"
+        "blender -b physics_scene.blend -P render_physics_from_json.py -- outputs/ball_drop_test"
     )
 
 BASE_DIR = Path(args[0])

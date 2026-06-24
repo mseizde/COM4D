@@ -240,6 +240,11 @@ def process_sequence(
     with metadata_path.open("r") as f:
         metadata = json.load(f)
 
+    processed_metadata_path = output_root / "metadata" / sequence_name / "physics_metadata.json"
+    processed_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    if overwrite or not processed_metadata_path.exists():
+        shutil.copy2(metadata_path, processed_metadata_path)
+
     frames = metadata["frames"]
     if frame_limit is not None:
         frames = frames[:frame_limit]
@@ -280,7 +285,7 @@ def process_sequence(
                         "num_parts": len(part_meshes),
                         "part_names": [part_name for part_name, _ in named_part_meshes],
                         "mesh_path": str((glb_dir / f"{name}.glb").resolve()) if write_glb else None,
-                        "source_metadata": str(metadata_path.resolve()),
+                        "source_metadata": str(processed_metadata_path.resolve()),
                     },
                     f,
                     separators=(",", ":"),
