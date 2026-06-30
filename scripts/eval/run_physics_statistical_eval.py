@@ -47,6 +47,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PREPARE_INPUT = SCRIPT_DIR / "prepare_physics_inference_input.py"
 EVALUATE_PHYSICS = SCRIPT_DIR / "evaluate_physics.py"
 EVALUATE_RECONSTRUCTION = SCRIPT_DIR / "evaluate_reconstruction.py"
+RENDER_PREDICTION_GIFS = SCRIPT_DIR / "render_prediction_gifs.py"
 
 DEFAULT_DATASET_ROOT = Path("/mnt/mocap_b/work/com4d/datasets/synthetic/physics_compare")
 DEFAULT_EVAL_ROOT = PROJECT_ROOT / "outputs" / "evaluation" / "physics_compare"
@@ -136,6 +137,12 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dataset-root", type=Path, default=DEFAULT_DATASET_ROOT)
     ap.add_argument("--eval-root", type=Path, default=DEFAULT_EVAL_ROOT)
+    ap.add_argument(
+        "--frames-dir",
+        type=Path,
+        default=None,
+        help="Optional RGB frame directory for one selected sample; masks and GT still come from --dataset-root.",
+    )
     ap.add_argument("--sample-glob", default="*_eval_*")
     ap.add_argument("--sample", action="append", default=None, help="Specific sample name. Can be repeated.")
     ap.add_argument(
@@ -184,6 +191,14 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--num-tokens", type=int, default=1024)
     ap.add_argument("--dynamic-ar-block-size", type=int, default=4)
     ap.add_argument("--dynamic-max-memory-frames", type=int, default=8)
+    ap.add_argument(
+        "--dynamic-mix-cutoff",
+        "--dynamic_mix_cutoff",
+        dest="dynamic_mix_cutoff",
+        type=int,
+        default=None,
+        help="Forwarded to inference_com4d.py --dynamic_mix_cutoff; e.g. 49 keeps dynamic mixing active for 50 denoising steps.",
+    )
     ap.add_argument("--image-size", type=int, default=518)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", choices=("float16", "float32", "bfloat16"), default="float16")
@@ -192,6 +207,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Render animation.gif during inference. Metrics only need exported GLBs, so this is off by default.",
     )
+    ap.add_argument(
+        "--render-diagnostic-gifs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "After reconstruction metrics are available, render only animation_fixed_regenerated.gif, "
+            "animation_diagnostic.gif, and animation_gt_overlay.gif for each run."
+        ),
+    )
+    ap.add_argument(
+        "--force-diagnostic-gifs",
+        action="store_true",
+        help="Overwrite existing statistical-evaluation diagnostic GIFs.",
+    )
+    ap.add_argument("--diagnostic-gif-render-size", type=int, default=512, help="Square render size for statistical-evaluation GIFs.")
+    ap.add_argument("--diagnostic-gif-fps", type=int, default=0, help="GIF FPS; 0 uses the GT metadata FPS.")
     ap.add_argument("--input-mode", choices=("symlink", "copy"), default="copy")
     ap.add_argument("--skip-prepare-input", action="store_true")
     ap.add_argument("--reuse-predictions", action="store_true", help="Reuse newest prediction matching <model>_<sample>_* if present.")
@@ -513,11 +544,17 @@ def run_inference(
             if 0 <= gpu_index < len(parent_visible):
                 gpu_id_str = parent_visible[gpu_index]
         env["CUDA_VISIBLE_DEVICES"] = gpu_id_str
+    frames_dir = args.frames_dir if args.frames_dir is not None else input_dir / "frames"
+    frame_paths = sorted(frames_dir.glob("*.png"))
+    if not frame_paths:
+        raise FileNotFoundError(f"No PNG frames found in {frames_dir}")
+    if args.frames_dir is not None:
+        print(f"Using frame override for {sample}: {frames_dir}", flush=True)
     cmd = [
         sys.executable,
         "src/inference_com4d.py",
         "--frames_dir",
-        input_dir / "frames",
+        frames_dir,
         "--masks_dir",
         input_dir / "masks",
         "--masks_static_dir",
@@ -538,7 +575,7 @@ def run_inference(
         "--frames_start_idx",
         0,
         "--frames_end_idx",
-        len(sorted((input_dir / "frames").glob("*.png"))) if input_dir.is_dir() else 32,
+        len(frame_paths),
         "--frame_stride",
         1,
         "--scene_num_parts",
@@ -559,6 +596,8 @@ def run_inference(
         "--no-render_predicted_room",
         "--no-room_augment_animations",
     ]
+    if args.dynamic_mix_cutoff is not None:
+        cmd.extend(["--dynamic_mix_cutoff", args.dynamic_mix_cutoff])
     if args.render_animations:
         cmd.append("--animation")
     run(
@@ -757,6 +796,55 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
     return dict(recon.get("summary", {})), dict(physics.get("summary", {})), per_frame
 
 
+def render_statistical_diagnostic_gifs(
+    args: argparse.Namespace,
+    sample: str,
+    model_tag: str,
+    pred_dir: Path,
+    raw_dir: Path,
+    input_dir: Path,
+    metrics_dir: Path,
+) -> None:
+    if not args.render_diagnostic_gifs:
+        return
+    recon_json = metrics_dir / sample / model_tag / "reconstruction" / "metrics.json"
+    metadata = raw_dir / "physics_metadata.json"
+    if not recon_json.is_file():
+        print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: missing {recon_json}", flush=True)
+        return
+    if not metadata.is_file():
+        print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: missing {metadata}", flush=True)
+        return
+    frames_dir = args.frames_dir if args.frames_dir is not None else input_dir / "frames"
+    cmd = [
+        sys.executable,
+        RENDER_PREDICTION_GIFS,
+        "--export-dir",
+        pred_dir,
+        "--camera-metadata",
+        metadata,
+        "--alignment-metadata",
+        recon_json,
+        "--gt-geometry-root",
+        raw_dir,
+        "--source-frames-dir",
+        frames_dir,
+        "--output-name",
+        "animation_fixed_regenerated.gif",
+        "--diagnostic-output-name",
+        "animation_diagnostic.gif",
+        "--gt-overlay-output-name",
+        "animation_gt_overlay.gif",
+        "--no-default-orbit-artifact",
+        "--render-size",
+        args.diagnostic_gif_render_size,
+    ]
+    if args.diagnostic_gif_fps and args.diagnostic_gif_fps > 0:
+        cmd.extend(["--fps", args.diagnostic_gif_fps])
+    if args.force_diagnostic_gifs or args.force:
+        cmd.append("--overwrite")
+    run(cmd, dry_run=args.dry_run)
+
 
 def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, transformer: Path | None, dataset_root: Path, eval_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     metrics_dir = eval_root / "metrics"
@@ -777,6 +865,9 @@ def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, t
         "transformer": model_path_for_log(transformer),
         "pred_dir": pred_dir,
         "animation_gif": str(Path(pred_dir) / "animation.gif") if pred_dir else "",
+        "animation_fixed_regenerated_gif": str(Path(pred_dir) / "animation_fixed_regenerated.gif") if pred_dir else "",
+        "animation_diagnostic_gif": str(Path(pred_dir) / "animation_diagnostic.gif") if pred_dir else "",
+        "animation_gt_overlay_gif": str(Path(pred_dir) / "animation_gt_overlay.gif") if pred_dir else "",
         "raw_dir": str(dataset_root / "gt_raw" / sample),
         "input_dir": str(dataset_root / "inference_input" / sample),
     }
@@ -839,7 +930,9 @@ def run_one_job(
             "input_dir": str(input_dir),
         }
         return row, []
-    recon_summary, physics_summary, per_frame = evaluate_run(args, sample, model_tag, pred_dir, raw_dir, eval_root / "metrics")
+    metrics_dir = eval_root / "metrics"
+    recon_summary, physics_summary, per_frame = evaluate_run(args, sample, model_tag, pred_dir, raw_dir, metrics_dir)
+    render_statistical_diagnostic_gifs(args, sample, model_tag, pred_dir, raw_dir, input_dir, metrics_dir)
     row: dict[str, Any] = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "sample_name": sample,
@@ -847,6 +940,9 @@ def run_one_job(
         "transformer": model_path_for_log(transformer),
         "pred_dir": str(pred_dir),
         "animation_gif": str(pred_dir / "animation.gif"),
+        "animation_fixed_regenerated_gif": str(pred_dir / "animation_fixed_regenerated.gif"),
+        "animation_diagnostic_gif": str(pred_dir / "animation_diagnostic.gif"),
+        "animation_gt_overlay_gif": str(pred_dir / "animation_gt_overlay.gif"),
         "raw_dir": str(raw_dir),
         "input_dir": str(input_dir),
     }
@@ -1396,6 +1492,14 @@ def main() -> None:
     metrics_dir.mkdir(parents=True, exist_ok=True)
 
     samples = discover_samples(dataset_root, args.sample_glob, args.sample)
+    if args.frames_dir is not None:
+        args.frames_dir = args.frames_dir.expanduser().resolve()
+        if len(samples) != 1:
+            raise SystemExit("--frames-dir requires exactly one selected sample")
+        if not args.frames_dir.is_dir():
+            raise SystemExit(f"--frames-dir does not exist or is not a directory: {args.frames_dir}")
+        print(f"Frame override: {args.frames_dir}", flush=True)
+
     models: list[tuple[str, Path | None]] = []
     if not args.no_discover_prediction_models:
         discovered_tags = discover_prediction_model_tags(predictions_dir, samples)
@@ -1453,6 +1557,17 @@ def main() -> None:
                 existing = None if args.force else existing_metric_row(args, sample, model_tag, transformer, dataset_root, eval_root)
                 if existing is not None and (args.skip_existing_metrics or args.reuse_predictions) and not args.force_metrics:
                     row, per_frame = existing
+                    pred_dir_value = row.get("pred_dir")
+                    if pred_dir_value:
+                        render_statistical_diagnostic_gifs(
+                            args,
+                            sample,
+                            model_tag,
+                            Path(str(pred_dir_value)),
+                            raw_dir,
+                            input_dir,
+                            eval_root / "metrics",
+                        )
                     model_rows.append(row)
                     run_rows.append(row)
                     per_frame_rows.extend(per_frame)

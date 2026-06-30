@@ -188,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-points", type=int, default=8192)
     parser.add_argument("--sphere-subdivisions", type=int, default=4)
     parser.add_argument(
+        "--include-static-parts",
+        action="store_true",
+        help="Include floor/wall/occluder static interaction geometry as supervised physics parts during preprocessing.",
+    )
+    parser.add_argument("--floor-size", type=float, default=5.0, help="Side length for generated floor plane static parts.")
+    parser.add_argument(
         "--write-masks",
         action="store_true",
         help="Keep Blender object-mask PNG outputs in the raw sample folders.",
@@ -589,6 +595,9 @@ def run_preprocess(args: argparse.Namespace) -> None:
         "--include-parts",
         "--overwrite",
     ]
+    if args.include_static_parts:
+        cmd.append("--include-static-parts")
+        cmd.extend(["--floor-size", str(args.floor_size)])
     run_command(cmd)
 
 

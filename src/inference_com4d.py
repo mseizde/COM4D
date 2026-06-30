@@ -22,6 +22,7 @@ from accelerate.utils import set_seed
 from PIL import Image
 
 from src.utils.inference import (_gather_images, _gather_all_masks, _combine_masks, _resolve_repo_or_dir, _parse_id_string, build_pipeline, _invert_mask)
+from src.utils.super_resolution import run_rvrt_super_resolution
 from src.models.transformers import PartFrameCrafterDiTModel
 from src.pipelines.pipeline_partcrafter import (
     PartCrafter3D4DInferencePipeline,
@@ -691,6 +692,13 @@ def main():
             "Use 518 to match training config image_load_size/dino_preprocess_size."
         ),
     )
+    parser.add_argument("--super_resolution", action=argparse.BooleanOptionalAction, default=False, help="Run RVRT x4 video super-resolution before COM4D's image_size resize.")
+    parser.add_argument("--rvrt_repo", type=str, default=None, help="Path to a checkout of https://github.com/JingyunLiang/RVRT.")
+    parser.add_argument("--rvrt_python", type=str, default=sys.executable, help="Python executable for RVRT; may use a separate environment.")
+    parser.add_argument("--rvrt_task", type=str, default="001_RVRT_videosr_bi_REDS_30frames", help="Official RVRT task/checkpoint name.")
+    parser.add_argument("--rvrt_tile", type=int, nargs=3, default=[100, 128, 128], metavar=("T", "H", "W"))
+    parser.add_argument("--rvrt_tile_overlap", type=int, nargs=3, default=[2, 20, 20], metavar=("T", "H", "W"))
+    parser.add_argument("--save_super_resolved_frames", action=argparse.BooleanOptionalAction, default=True, help="Save raw RVRT outputs in the inference result.")
     parser.add_argument(
         "--base_weights_dir",
         type=str,
@@ -893,6 +901,13 @@ def main():
             "base_weights_dir": "base_weights_dir",
             "frame_stride": "frame_stride",
             "image_size": "image_size",
+            "super_resolution": "super_resolution",
+            "rvrt_repo": "rvrt_repo",
+            "rvrt_python": "rvrt_python",
+            "rvrt_task": "rvrt_task",
+            "rvrt_tile": "rvrt_tile",
+            "rvrt_tile_overlap": "rvrt_tile_overlap",
+            "save_super_resolved_frames": "save_super_resolved_frames",
             "render_predicted_room": "render_predicted_room",
             "render_predicted_room_gifs": "render_predicted_room_gifs",
             "room_augment_animations": "room_augment_animations",
@@ -925,6 +940,10 @@ def main():
         parser.error("--frame_stride must be a positive integer")
     if args.image_size <= 0:
         parser.error("--image_size must be a positive integer")
+    if args.super_resolution and not args.rvrt_repo:
+        parser.error("--rvrt_repo is required when --super_resolution is enabled")
+    if any(value < 0 for value in [*args.rvrt_tile, *args.rvrt_tile_overlap]):
+        parser.error("--rvrt_tile and --rvrt_tile_overlap values must be non-negative")
     if not 0.0 <= args.room_alpha <= 1.0:
         parser.error("--room_alpha must be in [0, 1]")
     if args.gt_orbit_frames <= 0:
@@ -963,6 +982,22 @@ def main():
     masks_static: List[List[Image.Image]] = _gather_all_masks(masks_static_dir, scene_num_parts) if masks_static_dir else []
     print(f"Loaded {len(frames)} frames from {frames_dir}")
     print(f"Loaded {len(masks)} sets of masks from {masks_dir} each with {len(masks[0])} masks." if masks_dir else "No masks loaded")
+
+    super_resolved_frames: Optional[List[Image.Image]] = None
+    if args.super_resolution:
+        input_size = frames[0].size if frames else None
+        super_resolved_frames = run_rvrt_super_resolution(
+            frames_dir, rvrt_repo=Path(args.rvrt_repo),
+            python_executable=args.rvrt_python, task=args.rvrt_task,
+            tile=args.rvrt_tile, tile_overlap=args.rvrt_tile_overlap,
+        )
+        if len(super_resolved_frames) != len(frames):
+            raise RuntimeError("RVRT output is not frame-aligned with the COM4D input")
+        frames = super_resolved_frames
+        print(
+            f"RVRT super-resolution: {input_size} -> {frames[0].size}; "
+            f"COM4D conditioning size is {args.image_size}x{args.image_size}."
+        )
 
     reverse_sequence = False
 
@@ -1038,6 +1073,12 @@ def main():
 
     export_dir = output_root / tag
     export_dir.mkdir(parents=True, exist_ok=True)
+
+    if super_resolved_frames is not None and args.save_super_resolved_frames:
+        refined_dir = export_dir / "super_resolution" / "frames"
+        refined_dir.mkdir(parents=True, exist_ok=True)
+        for index, frame in enumerate(super_resolved_frames):
+            frame.save(refined_dir / f"{index:08d}.png")
 
     if args.seed is not None:
         set_seed(args.seed)

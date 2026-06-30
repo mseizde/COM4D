@@ -76,7 +76,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gt-geometry-root", type=Path, default=None, help="GT case directory containing meshes/, transforms/, and physics_metadata.json. Defaults to the camera metadata parent.")
     ap.add_argument("--diagnostic-output-name", default="animation_diagnostic.gif")
     ap.add_argument("--gt-overlay-output-name", default="animation_gt_overlay.gif")
+    ap.add_argument("--default-orbit-output-name", default="animation_default_orbit.gif")
+    ap.add_argument("--no-default-orbit-artifact", action="store_true", help="Do not write the standalone default-view orbit GIF.")
     ap.add_argument("--rotation-step-degrees", type=float, default=5.0, help="Viewpoint rotation per frame for rotating diagnostic and GT-overlay views.")
+    ap.add_argument("--insert-orbit-first-frame", action="store_true", help="Insert a frozen 360-degree prediction-space azimuth orbit after the first temporal frame.")
+    ap.add_argument("--insert-orbit-last-frame", action="store_true", help="Insert a frozen 360-degree prediction-space azimuth orbit after the last temporal frame.")
+    ap.add_argument("--insert-orbit-every", type=int, default=0, help="Insert a frozen prediction-space azimuth orbit after every N temporal frames; 0 disables periodic insertion.")
     ap.add_argument("--prediction-overlay-alpha", type=float, default=0.48, help="Prediction opacity in the GT-wireframe overlay GIF.")
     ap.add_argument("--no-diagnostic-artifacts", action="store_true", help="Only write --output-name, without diagnostic or GT-overlay artifacts.")
     ap.add_argument("--max-frames", type=int, default=0, help="Optional cap on rendered frames per GIF; 0 renders all frames.")
@@ -223,6 +228,15 @@ def compose_panels(images: list[Image.Image], labels: list[str], size: tuple[int
     return canvas
 
 
+def compose_side_by_side_images(left: Image.Image, right: Image.Image, size: tuple[int, int]) -> Image.Image:
+    left = left.convert("RGB").resize(size, Image.LANCZOS)
+    right = right.convert("RGB").resize(size, Image.LANCZOS)
+    canvas = Image.new("RGB", (size[0] * 2, size[1]))
+    canvas.paste(left, (0, 0))
+    canvas.paste(right, (size[0], 0))
+    return canvas
+
+
 def compose_side_by_side(
     rendered_frames: list[Image.Image],
     frame_paths: list[Path],
@@ -352,11 +366,41 @@ def transformed_scene(scene: trimesh.Scene, transform: np.ndarray) -> trimesh.Sc
     return output
 
 
-def rotate_scene_about(scene: trimesh.Scene, center: np.ndarray, angle_degrees: float) -> trimesh.Scene:
+def rotate_scene_about(
+    scene: trimesh.Scene,
+    center: np.ndarray,
+    angle_degrees: float,
+    axis: np.ndarray = np.asarray([0.0, 0.0, 1.0]),
+) -> trimesh.Scene:
     rotation = trimesh.transformations.rotation_matrix(
-        np.deg2rad(float(angle_degrees)), np.asarray([0.0, 0.0, 1.0]), point=np.asarray(center, dtype=np.float64),
+        np.deg2rad(float(angle_degrees)), np.asarray(axis, dtype=np.float64), point=np.asarray(center, dtype=np.float64),
     )
     return transformed_scene(scene, rotation)
+
+
+def prediction_azimuth_orbit_scenes(scene: trimesh.Scene, step_degrees: float) -> list[trimesh.Scene]:
+    """Orbit an unaligned Y-up prediction as though camera azimuth increases."""
+    orbit_count = max(1, int(np.ceil(360.0 / float(step_degrees))))
+    center = np.asarray(scene.bounds, dtype=np.float64).mean(axis=0)
+    return [
+        rotate_scene_about(
+            scene, center, -index * step_degrees, axis=np.asarray([0.0, 1.0, 0.0]),
+        )
+        for index in range(orbit_count)
+    ]
+
+
+def orbit_insertion_indices(num_frames: int, args: argparse.Namespace) -> set[int]:
+    indices: set[int] = set()
+    if num_frames <= 0:
+        return indices
+    if args.insert_orbit_first_frame:
+        indices.add(0)
+    if args.insert_orbit_last_frame:
+        indices.add(num_frames - 1)
+    if args.insert_orbit_every > 0:
+        indices.update(index for index in range(num_frames) if (index + 1) % args.insert_orbit_every == 0)
+    return indices
 
 
 def sequence_bounds_center(scenes: list[trimesh.Scene]) -> np.ndarray:
@@ -403,6 +447,9 @@ def render_export_dir(export_dir: Path, args: argparse.Namespace) -> str:
     camera_metadata, pred_to_gt_transform, gt_root = resolve_gt_render_inputs(export_dir, args)
     gt_mode = camera_metadata is not None and pred_to_gt_transform is not None
     artifact_paths = [output_path]
+    default_orbit_path = export_dir / args.default_orbit_output_name
+    if not args.no_diagnostic_artifacts and not args.no_default_orbit_artifact:
+        artifact_paths.append(default_orbit_path)
     if gt_mode and not args.no_diagnostic_artifacts:
         artifact_paths += [export_dir / args.diagnostic_output_name, export_dir / args.gt_overlay_output_name]
     pending_paths = [path for path in artifact_paths if args.overwrite or not path.exists()]
@@ -430,6 +477,21 @@ def render_export_dir(export_dir: Path, args: argparse.Namespace) -> str:
         scenes, azimuth=float(args.azimuth), elevation=float(args.elevation), fit_scale=float(args.fit_scale),
         image_size=size, light_intensity=5.0, return_type="pil", bg_color=(255, 255, 255, 255),
     )
+    if default_orbit_path in pending_paths:
+        default_orbit_scenes = prediction_azimuth_orbit_scenes(scenes[-1], args.rotation_step_degrees)
+        default_orbit_frames = render_sequence_fixed_camera(
+            default_orbit_scenes,
+            azimuth=float(args.azimuth),
+            elevation=float(args.elevation),
+            fit_scale=float(args.fit_scale),
+            image_size=size,
+            light_intensity=5.0,
+            return_type="pil",
+            bg_color=(255, 255, 255, 255),
+        )
+        default_orbit_path.parent.mkdir(parents=True, exist_ok=True)
+        export_renderings(default_orbit_frames, str(default_orbit_path), fps=output_fps)
+
     primary_frames = fitted_frames
     gt_view_frames = None
     if gt_mode:
@@ -439,7 +501,35 @@ def render_export_dir(export_dir: Path, args: argparse.Namespace) -> str:
         )
         primary_frames = gt_view_frames
     source_dir = discover_source_frames_dir(export_dir, args, gt_root if gt_mode else None)
-    if not args.no_side_by_side:
+    insertion_indices = orbit_insertion_indices(len(frame_paths), args)
+    if gt_mode and insertion_indices:
+        raise ValueError("Frozen prediction-space orbit insertion is only supported without GT camera/alignment metadata")
+    if insertion_indices:
+        source_images = source_images_for_paths(frame_paths, source_dir)
+        augmented_frames: list[Image.Image] = []
+        for index, (frame, scene) in enumerate(zip(primary_frames, scenes)):
+            source = source_images[index]
+            if not args.no_side_by_side and source is not None:
+                augmented_frames.append(compose_side_by_side_images(source, frame, size))
+            else:
+                augmented_frames.append(frame)
+            if index not in insertion_indices:
+                continue
+            orbit_scenes = prediction_azimuth_orbit_scenes(scene, args.rotation_step_degrees)
+            orbit_frames = render_sequence_fixed_camera(
+                orbit_scenes, azimuth=float(args.azimuth), elevation=float(args.elevation),
+                fit_scale=float(args.fit_scale), image_size=size, light_intensity=5.0,
+                return_type="pil", bg_color=(255, 255, 255, 255),
+            )
+            if not args.no_side_by_side and source is not None:
+                augmented_frames.extend(
+                    compose_side_by_side_images(source, orbit, size)
+                    for orbit in orbit_frames
+                )
+            else:
+                augmented_frames.extend(orbit_frames)
+        primary_frames = augmented_frames
+    elif not args.no_side_by_side:
         primary_frames = compose_side_by_side(
             primary_frames, frame_paths, source_dir,
             expected_num_frames=gt_num_frames, required=gt_mode,
@@ -526,6 +616,8 @@ def main() -> None:
         raise SystemExit("--prediction-overlay-alpha must be in [0, 1]")
     if not 0.0 < args.rotation_step_degrees <= 360.0:
         raise SystemExit("--rotation-step-degrees must be in (0, 360]")
+    if args.insert_orbit_every < 0:
+        raise SystemExit("--insert-orbit-every must be >= 0")
     samples = set(args.sample) if args.sample else None
     models = set(args.model) if args.model else None
     excluded = set(args.exclude_sample or [])

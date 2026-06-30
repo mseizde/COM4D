@@ -74,16 +74,16 @@ dataset_4d:
   temporal_stride_choices: [1, 2, 3, 4]
 
 dataset_physics:
-  surface_num_points: 204800 # 32768
+  surface_num_points: 8192
   config:
-    - '/data/mseizde/com4d/COM4D/dataset_json/humoto.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static.json'
   min_num_frames: 2
   max_num_frames: 2
   max_num_spatial_parts: 6
   training_ratio: 0.9
   min_num_parts: 2
   max_num_parts: 8
-  num_spatial_parts: 2
+  num_spatial_parts: null
   max_iou_mean: 0.5
   max_iou_max: 0.5
   shuffle_parts: false
@@ -125,10 +125,13 @@ train:
   surface_num_points: 204800 # 8192
   debug_step_timing: true
   physics_data_prob: 0.25
-  physics_dataset_json: /data/mseizde/com4d/COM4D/dataset_json/humoto.json
-  physics_dataset_spatiotemporal_grid: [true]
-  physics_dataset_num_spatial_parts: [null]
-  physics_dataset_surface_num_points: [204800] # [32768]
+  physics_dataset_jsons:
+    - /data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static.json
+    - /data/mseizde/com4d/COM4D/dataset_json/humoto.json
+  physics_dataset_probs: [0.5, 0.5]
+  physics_dataset_spatiotemporal_grid: [true, true]
+  physics_dataset_num_spatial_parts: [null, null]
+  physics_dataset_surface_num_points: [8192, 204800]
   dino_preprocess_size: 518
   # Physics sampling settings are defined above.
   advanced_image_masking:

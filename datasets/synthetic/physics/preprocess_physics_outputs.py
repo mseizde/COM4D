@@ -20,7 +20,8 @@ The JSON format matches src/datasets/animated_frame.py.
 The preprocessor is backward-compatible with the legacy two-ball metadata, and
 also supports generalized metadata with an ``objects`` dictionary. In generalized
 metadata, all objects with ``dynamic: true`` are reconstructed as parts. Static
-objects can appear in RGB renders without becoming dynamic training targets.
+objects can optionally be included as interaction parts for physics-focused
+training.
 """
 
 from __future__ import annotations
@@ -74,6 +75,17 @@ def parse_args() -> argparse.Namespace:
         "--include-parts",
         action="store_true",
         help="Also store per-ball surface samples under the points.npy 'parts' key.",
+    )
+    parser.add_argument(
+        "--include-static-parts",
+        action="store_true",
+        help="Include interaction-relevant static geometry after dynamic parts: floor, wall, and occluder_box when present.",
+    )
+    parser.add_argument(
+        "--floor-size",
+        type=float,
+        default=5.0,
+        help="Side length for generated floor plane when --include-static-parts is enabled.",
     )
     return parser.parse_args()
 
@@ -148,6 +160,18 @@ def dynamic_object_specs(metadata: dict) -> dict[str, dict]:
     }
 
 
+def interaction_static_object_specs(metadata: dict) -> dict[str, dict]:
+    specs = object_specs(metadata)
+    render_order = metadata.get("render_objects")
+    names = [name for name in render_order if isinstance(name, str)] if isinstance(render_order, list) else list(specs)
+    wanted = {"floor", "wall", "occluder_box"}
+    return {
+        name: specs[name]
+        for name in names
+        if name in wanted and name in specs and not bool(specs[name].get("dynamic", name.startswith("ball_")))
+    }
+
+
 def transform_matrix(position: list[float], quat_xyzw: list[float]) -> np.ndarray:
     rotation = np.eye(4)
     rotation[:3, :3] = Rotation.from_quat(quat_xyzw).as_matrix()
@@ -180,22 +204,54 @@ def make_box_mesh(spec: dict, position: list[float], quat_xyzw: list[float]) -> 
     return mesh
 
 
-def make_object_mesh(name: str, spec: dict, frame: dict, sphere_subdivisions: int) -> trimesh.Trimesh:
+def make_floor_mesh(size: float) -> trimesh.Trimesh:
+    half = float(size) * 0.5
+    return trimesh.Trimesh(
+        vertices=[
+            [-half, -half, 0.0],
+            [half, -half, 0.0],
+            [half, half, 0.0],
+            [-half, half, 0.0],
+        ],
+        faces=[[0, 1, 2], [0, 2, 3]],
+        process=False,
+    )
+
+
+def make_object_mesh(
+    name: str,
+    spec: dict,
+    frame: dict,
+    sphere_subdivisions: int,
+    floor_size: float,
+) -> trimesh.Trimesh:
     position, quat_xyzw = object_pose(name, spec, frame)
     object_type = str(spec.get("type", "sphere")).lower()
     if object_type in {"sphere", "ball"}:
         return make_sphere_mesh(spec, position, quat_xyzw, sphere_subdivisions)
     if object_type in {"box", "cube", "cuboid"}:
         return make_box_mesh(spec, position, quat_xyzw)
+    if object_type in {"plane", "floor"}:
+        mesh = make_floor_mesh(floor_size)
+        mesh.apply_transform(transform_matrix(position, quat_xyzw))
+        return mesh
     raise ValueError(f"Unsupported object type for {name}: {object_type!r}")
 
 
-def build_frame_meshes(metadata: dict, frame: dict, subdivisions: int) -> list[tuple[str, trimesh.Trimesh]]:
-    specs = dynamic_object_specs(metadata)
+def build_frame_meshes(
+    metadata: dict,
+    frame: dict,
+    subdivisions: int,
+    include_static_parts: bool,
+    floor_size: float,
+) -> list[tuple[str, trimesh.Trimesh]]:
+    specs = dict(dynamic_object_specs(metadata))
+    if include_static_parts:
+        specs.update(interaction_static_object_specs(metadata))
     if not specs:
         raise ValueError("Metadata does not define any dynamic objects.")
     return [
-        (name, make_object_mesh(name, spec, frame, subdivisions))
+        (name, make_object_mesh(name, spec, frame, subdivisions, floor_size))
         for name, spec in specs.items()
     ]
 
@@ -234,6 +290,8 @@ def process_sequence(
     copy_rgb: bool,
     write_glb: bool,
     include_parts: bool,
+    include_static_parts: bool,
+    floor_size: float,
 ) -> tuple[str, list[dict]]:
     sequence_name = sequence_dir.name
     metadata_path = sequence_dir / "physics_metadata.json"
@@ -268,7 +326,13 @@ def process_sequence(
         frame_preproc_dir.mkdir(parents=True, exist_ok=True)
 
         if overwrite or not points_path.exists():
-            named_part_meshes = build_frame_meshes(metadata, frame, sphere_subdivisions)
+            named_part_meshes = build_frame_meshes(
+                metadata,
+                frame,
+                sphere_subdivisions,
+                include_static_parts=include_static_parts,
+                floor_size=floor_size,
+            )
             part_meshes = [mesh for _, mesh in named_part_meshes]
             object_mesh = trimesh.util.concatenate(part_meshes) if len(part_meshes) > 1 else part_meshes[0].copy()
             write_points(
@@ -344,6 +408,8 @@ def main() -> None:
                 copy_rgb=args.copy_rgb,
                 write_glb=args.write_glb,
                 include_parts=args.include_parts,
+                include_static_parts=args.include_static_parts,
+                floor_size=args.floor_size,
             )
             for sequence_dir in tqdm(sequence_dirs, desc="Preprocessing synthetic physics sequences")
         ]
@@ -362,6 +428,8 @@ def main() -> None:
                     args.copy_rgb,
                     args.write_glb,
                     args.include_parts,
+                    args.include_static_parts,
+                    args.floor_size,
                 )
                 for sequence_dir in sequence_dirs
             ]

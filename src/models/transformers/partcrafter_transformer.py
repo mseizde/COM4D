@@ -122,6 +122,8 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
 
+from ..object_memory import CanonicalObjectMemory, ObjectMemoryState
+
 from ..attention_processor import (
     FusedTripoSGAttnProcessor2_0,
     TripoSGAttnProcessor2_0,
@@ -410,6 +412,9 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         enable_camera_time_conditioning: bool = False,
         camera_condition_dim: int = 25,
         physics_condition_dim: int = 8,
+        enable_object_memory: bool = False,
+        object_memory_block_ids: Optional[List[int]] = None,
+        object_memory_num_heads: Optional[int] = None,
     ):
         super().__init__()
 
@@ -447,6 +452,16 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.num_heads = num_attention_heads
         self.inner_dim = width
         self.mlp_ratio = 4.0
+
+        self.enable_object_memory = bool(enable_object_memory)
+        if object_memory_block_ids is None:
+            object_memory_block_ids = sorted({num_layers // 3, (2 * num_layers) // 3})
+        self.object_memory_block_ids = [
+            int(layer) for layer in object_memory_block_ids if 0 <= int(layer) < num_layers
+        ]
+        if self.enable_object_memory:
+            memory_heads = object_memory_num_heads or num_attention_heads
+            self.object_memory = CanonicalObjectMemory(width, memory_heads)
 
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             "positional",
@@ -1060,6 +1075,83 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if phase == "temporal":
             return _temporal_phase()
         raise ValueError(f"Unsupported inference-emulation phase: {phase}")
+    def initialize_object_memory(
+        self,
+        canonical_tokens: torch.Tensor,
+        confidence: float = 0.0,
+    ) -> ObjectMemoryState:
+        """Project canonical [B,O,M,in_channels] tokens into persistent memory."""
+        if not self.enable_object_memory:
+            raise ValueError("enable_object_memory=True is required to initialize memory")
+        if canonical_tokens.ndim != 4:
+            raise ValueError("canonical_tokens must have shape [B,O,M,C]")
+        projected = self.proj_in(canonical_tokens)
+        return self.object_memory.initialize(projected, confidence)
+
+    def _project_memory_evidence(self, evidence: torch.Tensor) -> torch.Tensor:
+        if evidence.ndim != 5:
+            raise ValueError("memory_evidence must have shape [B,T,O,E,C]")
+        if evidence.shape[-1] == self.config.in_channels:
+            return self.proj_in(evidence)
+        if evidence.shape[-1] == self.inner_dim:
+            return evidence
+        raise ValueError(
+            "memory_evidence channels must match either transformer in_channels "
+            f"({self.config.in_channels}) or width ({self.inner_dim})"
+        )
+
+
+
+
+    def _apply_object_memory_read(
+        self,
+        hidden_states: torch.Tensor,
+        object_memory: ObjectMemoryState,
+        num_frames: Union[int, torch.Tensor],
+        num_parts: Union[int, torch.Tensor],
+        layout: str,
+    ) -> torch.Tensor:
+        """Read padded per-object memory into flattened frame-major states."""
+        if layout != "frame_major":
+            raise NotImplementedError(f"Unsupported object-memory layout: {layout}")
+        frame_counts = self._as_count_list(num_frames)
+        part_counts = self._as_count_list(num_parts, len(frame_counts))
+        if len(part_counts) == 1 and len(frame_counts) > 1:
+            part_counts = part_counts * len(frame_counts)
+        if len(frame_counts) != len(part_counts):
+            raise ValueError("num_frames and num_parts must describe the same groups")
+        if object_memory.tokens.shape[0] != len(frame_counts):
+            raise ValueError(
+                "object_memory batch axis must equal the number of frame/part groups, "
+                f"got {object_memory.tokens.shape[0]} and {len(frame_counts)}"
+            )
+
+        chunks = []
+        offset = 0
+        for group, (frame_count, part_count) in enumerate(zip(frame_counts, part_counts)):
+            if part_count > object_memory.tokens.shape[1]:
+                raise ValueError(
+                    f"group {group} needs {part_count} memory objects, but only "
+                    f"{object_memory.tokens.shape[1]} are available"
+                )
+            total = frame_count * part_count
+            group_state = hidden_states[offset:offset + total].reshape(
+                1, frame_count, part_count, *hidden_states.shape[1:]
+            )
+            group_memory = ObjectMemoryState(
+                tokens=object_memory.tokens[group:group + 1, :part_count],
+                confidence=object_memory.confidence[group:group + 1, :part_count],
+            )
+            # Token zero is the diffusion-timestep token, not an object-state token.
+            state_tokens = self.object_memory.read(group_state[..., 1:, :], group_memory)
+            group_state = torch.cat((group_state[..., :1, :], state_tokens), dim=-2)
+            chunks.append(group_state.reshape(total, *hidden_states.shape[1:]))
+            offset += total
+        if offset != hidden_states.shape[0]:
+            raise ValueError(
+                f"frame/part counts describe {offset} states, got {hidden_states.shape[0]}"
+            )
+        return torch.cat(chunks, dim=0)
 
     def forward(
         self,
@@ -1072,6 +1164,11 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         frame_time: Optional[torch.Tensor] = None,
         has_camera: Optional[torch.Tensor] = None,
         physics_context: Optional[torch.Tensor] = None,
+        object_memory: Optional[ObjectMemoryState] = None,
+        memory_evidence: Optional[torch.Tensor] = None,
+        memory_visibility: Optional[torch.Tensor] = None,
+        memory_confidence: Optional[torch.Tensor] = None,
+        update_object_memory: bool = False,
         force_add_static_embedding: bool = False,
         force_add_dynamic_embedding: bool = False,
         return_dict: bool = True,
@@ -1131,6 +1228,28 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             and self._is_mixing_count(num_frames_kw)
             and self._is_mixing_count(num_parts_kw)
         )
+        active_object_memory = object_memory
+        if active_object_memory is not None and not self.enable_object_memory:
+            raise ValueError(
+                "object_memory was provided, but this model was created with "
+                "enable_object_memory=False"
+            )
+        if active_object_memory is not None and update_object_memory:
+            if memory_evidence is None or memory_visibility is None:
+                raise ValueError(
+                    "memory_evidence and memory_visibility are required when "
+                    "update_object_memory=True"
+                )
+            active_object_memory, _ = self.object_memory.update(
+                active_object_memory,
+                self._project_memory_evidence(memory_evidence),
+                memory_visibility,
+                memory_confidence,
+            )
+        elif update_object_memory:
+            raise ValueError("object_memory is required when update_object_memory=True")
+
+
         use_frame_embed = self.enable_frame_embedding and (num_frames_kw is not None) and (
             (isinstance(num_frames_kw, int) and num_frames_kw > 1) or (isinstance(num_frames_kw, torch.Tensor) and (num_frames_kw > 1).any())
         )
@@ -1482,6 +1601,20 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     attention_kwargs=input_attention_kwargs,
                 )  # (N, T+1, D)
 
+            if active_object_memory is not None and layer in self.object_memory_block_ids:
+                if num_frames_kw is None or num_parts_kw is None:
+                    raise ValueError(
+                        "object-memory reads require attention_kwargs with num_frames and num_parts"
+                    )
+                hidden_states = self._apply_object_memory_read(
+                    hidden_states,
+                    active_object_memory,
+                    num_frames_kw,
+                    num_parts_kw,
+                    mixing_layout,
+                )
+
+
             if layer < self.config.num_layers // 2:
                 skips.append(hidden_states)
 
@@ -1495,9 +1628,13 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
+            if active_object_memory is not None:
+                return hidden_states, active_object_memory
             return (hidden_states,)
 
-        return Transformer1DModelOutput(sample=hidden_states)
+        return Transformer1DModelOutput(
+            sample=hidden_states, object_memory=active_object_memory
+        )
     
     def forward_1(
         self,
