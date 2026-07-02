@@ -78,6 +78,7 @@ def parse_args() -> argparse.Namespace:
         help="Do not auto-open physics_scene.blend when Blender was launched without a .blend.",
     )
     parser.add_argument("--resolution", type=int, default=512)
+    parser.add_argument("--frame-limit", type=int, default=None)
     parser.add_argument("--samples", type=int, default=32)
     parser.add_argument(
         "--view-seed",
@@ -143,7 +144,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--light-height", type=float, default=5.0)
     parser.add_argument("--light-energy-jitter", type=float, default=0.0)
     parser.add_argument("--light-size-jitter", type=float, default=0.0)
+    parser.add_argument("--skip-rgb", action="store_true", help="Skip the expensive RGB render pass.")
     parser.add_argument("--skip-masks", action="store_true")
+    parser.add_argument(
+        "--write-amodal-masks",
+        action="store_true",
+        help="Additionally render each mask object in isolation under masks_amodal/.",
+    )
     parser.add_argument(
         "--mask-mode",
         choices=("material", "compositor"),
@@ -389,6 +396,7 @@ def render_material_masks(
     render_names: list[str],
     dynamic_names: list[str],
     mask_dirs: dict[str, Path],
+    amodal_mask_dirs: dict[str, Path] | None,
     frame_idx: int,
 ) -> None:
     if not dynamic_names:
@@ -429,6 +437,19 @@ def render_material_masks(
             replace_materials(target, white)
             scene.render.filepath = str(mask_dirs[target_name] / f"frame_{frame_idx:04d}.png")
             bpy.ops.render.render(write_still=True)
+            if amodal_mask_dirs is not None and target_name in amodal_mask_dirs:
+                for name in render_names:
+                    obj = objects.get(name)
+                    if obj is not None:
+                        obj.hide_render = name != target_name
+                scene.render.filepath = str(
+                    amodal_mask_dirs[target_name] / f"frame_{frame_idx:04d}.png"
+                )
+                bpy.ops.render.render(write_still=True)
+                for name in render_names:
+                    obj = objects.get(name)
+                    if obj is not None:
+                        obj.hide_render = False
             replace_materials(target, black)
     finally:
         for name, materials in original_materials.items():
@@ -493,7 +514,7 @@ def static_mask_object_names(data: dict) -> list[str]:
     return [
         name
         for name in render_object_names(data)
-        if name != "floor" and not bool(specs.get(name, {}).get("dynamic", name.startswith("ball_")))
+        if not bool(specs.get(name, {}).get("dynamic", name.startswith("ball_")))
     ]
 
 
@@ -798,10 +819,16 @@ def main() -> None:
     dynamic_names = dynamic_object_names(data)
     mask_names = dynamic_names + static_mask_object_names(data)
     mask_dirs = {name: base_dir / "masks" / name for name in mask_names}
+    amodal_mask_dirs = (
+        {name: base_dir / "masks_amodal" / name for name in mask_names}
+        if args.write_amodal_masks else None
+    )
 
-    output_dirs = [rgb_dir]
+    output_dirs = [] if args.skip_rgb else [rgb_dir]
     if not args.skip_masks:
         output_dirs.extend(mask_dirs.values())
+        if amodal_mask_dirs is not None:
+            output_dirs.extend(amodal_mask_dirs.values())
     if args.save_depth:
         output_dirs.append(depth_dir)
     if args.save_normals:
@@ -857,6 +884,8 @@ def main() -> None:
             obj = objects.get(name)
             if obj is not None and name != "floor":
                 export_selected_glb(obj, mesh_dir / f"{name}.glb")
+    if args.write_amodal_masks and args.mask_mode != "material":
+        raise ValueError("--write-amodal-masks requires --mask-mode material")
     compositor_mask_dirs = mask_dirs if (not args.skip_masks and args.mask_mode == "compositor") else {}
     if compositor_mask_dirs or args.save_depth or args.save_normals:
         configure_compositor_outputs(
@@ -867,7 +896,8 @@ def main() -> None:
     else:
         disable_compositor_outputs()
 
-    for frame in data["frames"]:
+    render_frames = data["frames"] if args.frame_limit is None else data["frames"][:args.frame_limit]
+    for frame in render_frames:
         idx = frame["frame"]
         states = frame_state_map(frame)
         for name, state in states.items():
@@ -901,11 +931,15 @@ def main() -> None:
             with (transform_dir / f"frame_{idx:04d}.json").open("w") as f:
                 json.dump(transform_data, f, indent=2)
 
-        scene.render.filepath = str(rgb_dir / f"frame_{idx:04d}.png")
-        bpy.ops.render.render(write_still=True)
+        if not args.skip_rgb:
+            scene.render.filepath = str(rgb_dir / f"frame_{idx:04d}.png")
+            bpy.ops.render.render(write_still=True)
 
         if not args.skip_masks and args.mask_mode == "material":
-            render_material_masks(scene, objects, render_names, mask_names, mask_dirs, idx)
+            render_material_masks(
+                scene, objects, render_names, mask_names, mask_dirs,
+                amodal_mask_dirs, idx,
+            )
 
     print(f"Finished rendering outputs under: {base_dir}")
 

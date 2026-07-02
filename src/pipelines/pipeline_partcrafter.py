@@ -30,6 +30,7 @@ from ..utils.inference_utils import field_to_mesh
 
 from ..schedulers import RectifiedFlowScheduler
 from ..models.autoencoders import TripoSGVAEModel
+from ..models.object_memory import ObjectMemoryState
 from ..models.transformers import PartCrafterDiTModel
 from ..models.transformers import PartFrameCrafterDiTModel
 from ..models.attention_processor import PartFrameCrafterAttnProcessor, TripoSGAttnProcessor2_0
@@ -40,6 +41,46 @@ from ..utils.inference import _apply_mask, _combine_masks
 from ..utils.render_utils import export_renderings, render_sequence_fixed_camera, render_views_around_mesh
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def memory_visibility_from_masks(
+    visible_masks,
+    amodal_masks=None,
+    trusted_full_mask_areas=None,
+    *,
+    device=None,
+    dtype=torch.float32,
+):
+    """Compute visible/full area ratios; return None when no trusted full extent exists."""
+    if not visible_masks:
+        return None
+    object_count = len(visible_masks)
+    frame_count = len(visible_masks[0])
+    if any(len(frames) != frame_count for frames in visible_masks):
+        raise ValueError("visible mask sequences must have equal frame counts")
+    if amodal_masks is not None:
+        if len(amodal_masks) != object_count or any(
+            len(frames) != frame_count for frames in amodal_masks
+        ):
+            raise ValueError("amodal masks must match visible masks by object and frame")
+    elif trusted_full_mask_areas is None:
+        return None
+    elif len(trusted_full_mask_areas) != object_count:
+        raise ValueError("trusted_full_mask_areas must have one value per object")
+
+    result = torch.zeros((object_count, frame_count), device=device, dtype=dtype)
+    for object_index, object_masks in enumerate(visible_masks):
+        for frame_index, mask in enumerate(object_masks):
+            visible = float((np.asarray(mask.convert("L"), dtype=np.uint8) > 127).sum())
+            if amodal_masks is not None:
+                full = float((
+                    np.asarray(amodal_masks[object_index][frame_index].convert("L"), dtype=np.uint8) > 127
+                ).sum())
+            else:
+                full = float(trusted_full_mask_areas[object_index])
+            if full > 0:
+                result[object_index, frame_index] = min(max(visible / full, 0.0), 1.0)
+    return result
 
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
@@ -3380,6 +3421,10 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         dynamic_num_parts: Optional[int] = None,
         dynamic_mix_cutoff: int = 10,
         dynamic_max_memory_frames: int = 6,
+        initial_object_memory: Optional[ObjectMemoryState] = None,
+        amodal_masks=None,
+        trusted_full_mask_areas=None,
+        object_relative_poses: Optional[torch.Tensor] = None,
     ):
 
         foreground_frames_per_object: List[List[PipelineImageInput]] = []
@@ -3483,6 +3528,34 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         )
 
         static_count = static_latents_all.shape[0]
+
+        object_memory = (
+            initial_object_memory.to(device=device, dtype=latents.dtype)
+            if initial_object_memory is not None else None
+        )
+        memory_enabled = bool(getattr(self.transformer, "enable_object_memory", False))
+        visible_area = memory_visibility_from_masks(
+            masks[:N] if masks is not None else None,
+            amodal_masks[:N] if amodal_masks is not None else None,
+            trusted_full_mask_areas,
+            device=device,
+            dtype=latents.dtype,
+        )
+        if visible_area is None:
+            visible_area = latents.new_zeros((N, F))
+            if memory_enabled:
+                logger.warning(
+                    "No amodal masks or trusted full-mask areas were provided; "
+                    "dynamic object memory will be read-only to avoid corrupting it."
+                )
+        if memory_enabled and history_latents_first_block is not None:
+            canonical_parts = [static_latents_all]
+            canonical_parts.append(history_latents_first_block[:, 0])
+            canonical = torch.cat(canonical_parts, dim=0).unsqueeze(0)
+            object_memory = self.transformer.initialize_object_memory(canonical, confidence=0.0)
+            initial_confidence = latents.new_ones((1, static_count + N))
+            initial_confidence[:, static_count:] = visible_area[:, 0]
+            object_memory.confidence.copy_(initial_confidence)
 
         base_attention_kwargs = dict(attention_kwargs or {})
         base_attention_kwargs = base_attention_kwargs or None
@@ -3608,6 +3681,24 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                     # print(f"   static_latents_all {static_latents_all.shape}, dynamic_latents {dynamic_latents.shape}")
                     # print(f"   encoder_hidden_states_static {encoder_hidden_states_static.shape}, encoder_hidden_states_dynamic {encoder_hidden_states_dynamic.shape}")
 
+                    memory_relative_pose = None
+                    if object_relative_poses is not None:
+                        relative_poses = object_relative_poses.to(device=device, dtype=latents.dtype)
+                        if relative_poses.shape != (F, N, 7):
+                            raise ValueError(
+                                f"object_relative_poses must have shape [F,N,7], got {tuple(relative_poses.shape)}"
+                            )
+                        pose_slices = []
+                        if use_initial_history:
+                            pose_slices.append(relative_poses[:1])
+                        if history_indices:
+                            pose_slices.append(relative_poses[history_indices])
+                        pose_slices.append(relative_poses[block_indices])
+                        dynamic_pose = torch.cat(pose_slices, dim=0)
+                        static_pose = latents.new_zeros((dynamic_frame_len, static_count, 7))
+                        static_pose[..., 6] = 1
+                        memory_relative_pose = torch.cat((static_pose, dynamic_pose), dim=1).unsqueeze(0)
+
                     transformer_output = self.transformer.forward_matrix(
                         latents_matrix,
                         timestep,
@@ -3616,7 +3707,9 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                         static_count=static_count,
                         dynamic_count=block_dynamic_history_count + block_dynamic_count,
                         return_dict=False,
-                        cutoff=cutoff
+                        cutoff=cutoff,
+                        object_memory=object_memory,
+                        memory_relative_pose=memory_relative_pose,
                     )[0]
 
                     transformer_output_uncond = self.transformer.forward_matrix(
@@ -3627,7 +3720,9 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                         static_count=static_count,
                         dynamic_count=block_dynamic_history_count + block_dynamic_count,
                         return_dict=False,
-                        cutoff=cutoff
+                        cutoff=cutoff,
+                        object_memory=object_memory,
+                        memory_relative_pose=memory_relative_pose,
                     )[0] if do_cfg else None
 
                     if do_cfg:
@@ -3654,6 +3749,46 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                     
                     latents[:, block_indices] = latents_next[:, -block_dynamic_count:]
                     progress_bar.update()
+
+                if memory_enabled:
+                    clean_dynamic = latents[:, block_indices]
+                    clean_static = static_latents_all[:, None].expand(
+                        static_count, len(block_indices), T, C
+                    )
+                    clean_matrix = torch.cat((clean_static, clean_dynamic), dim=0)
+                    evidence = clean_matrix.permute(1, 0, 2, 3).unsqueeze(0)
+                    visibility = latents.new_ones((1, len(block_indices), static_count + N))
+                    dynamic_visibility = visible_area[:, block_indices].transpose(0, 1)
+                    dynamic_visibility = torch.where(
+                        dynamic_visibility < 0.2, torch.zeros_like(dynamic_visibility),
+                        dynamic_visibility,
+                    )
+                    visibility[:, :, static_count:] = dynamic_visibility.unsqueeze(0)
+                    if object_memory is None:
+                        canonical = evidence[:, 0]
+                        object_memory = self.transformer.initialize_object_memory(canonical)
+                        object_memory.confidence.copy_(visibility[:, 0])
+                    else:
+                        update_relative_pose = None
+                        if object_relative_poses is not None:
+                            dynamic_update_pose = object_relative_poses[block_indices].to(
+                                device=device, dtype=latents.dtype
+                            )
+                            static_update_pose = latents.new_zeros(
+                                (len(block_indices), static_count, 7)
+                            )
+                            static_update_pose[..., 6] = 1
+                            update_relative_pose = torch.cat(
+                                (static_update_pose, dynamic_update_pose), dim=1
+                            ).unsqueeze(0)
+                        object_memory, _ = self.transformer.object_memory.update(
+                            object_memory,
+                            self.transformer._project_memory_evidence(evidence),
+                            visibility,
+                            torch.ones_like(visibility),
+                            relative_pose=update_relative_pose,
+                        )
+                    object_memory = object_memory.detached()
 
                 if use_initial_history:
                     initial_history_consumed = True
@@ -3749,7 +3884,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                 ))
             dynamic_meshes_per_frame.append(frame_dynamic_meshes)
 
-        return static_meshes_per_frame, dynamic_meshes_per_frame
+        return static_meshes_per_frame, dynamic_meshes_per_frame, object_memory
 
     def _render_views_around_mesh(
         self,
@@ -4007,6 +4142,9 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         masks: Optional[List[PipelineImageInput]] = None,
         masks_static: Optional[List[PipelineImageInput]] = None,
         all_masks: Optional[List[PipelineImageInput]] = None,
+        amodal_masks: Optional[List[PipelineImageInput]] = None,
+        trusted_full_mask_areas: Optional[List[float]] = None,
+        object_relative_poses: Optional[torch.Tensor] = None,
         num_tokens: int = 2048,
         scene_inference_steps: int = 50,
         dynamic_inference_steps: int = 50,
@@ -4034,6 +4172,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         scene_mix_cutoff: int = 10,
         dynamic_mix_cutoff: int = 10,
         dynamic_max_memory_frames: int = 6,
+        object_memory: Optional[ObjectMemoryState] = None,
         image_size: Optional[int] = None,
 
     ):
@@ -4109,7 +4248,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         dynamic_attention_kwargs = dict({})
         dynamic_attention_kwargs.setdefault("num_parts", scene_part_count + 1)
         dynamic_attention_kwargs.setdefault("num_frames", len(frames))
-        static_meshes_per_frame, dynamic_meshes_per_frame = self._run_dynamic_stage(
+        static_meshes_per_frame, dynamic_meshes_per_frame, object_memory = self._run_dynamic_stage(
             frames,
             masks,
             masks_static,
@@ -4130,6 +4269,10 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
             dynamic_num_parts=dynamic_num_parts,
             dynamic_mix_cutoff=dynamic_mix_cutoff,
             dynamic_max_memory_frames=dynamic_max_memory_frames,
+            initial_object_memory=object_memory,
+            amodal_masks=amodal_masks,
+            trusted_full_mask_areas=trusted_full_mask_areas,
+            object_relative_poses=object_relative_poses,
         )
         animation_file = self._render_animation(
             scene_meshes,
@@ -4148,6 +4291,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
             animation_path=animation_file,
             scene_latents=static_latents,
             dynamic_latents=dynamic_latents,
+            object_memory=object_memory,
         )
         if not return_dict:
             return output.scene_meshes, output.dynamic_meshes

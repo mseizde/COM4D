@@ -36,7 +36,10 @@ import torch.nn.functional as tF
 import accelerate
 from accelerate import Accelerator
 from accelerate.logging import get_logger as get_accelerate_logger
-from accelerate import DataLoaderConfiguration, DeepSpeedPlugin, InitProcessGroupKwargs
+from accelerate import (
+    DataLoaderConfiguration, DeepSpeedPlugin, DistributedDataParallelKwargs,
+    InitProcessGroupKwargs,
+)
 from diffusers.training_utils import (
     compute_density_for_timestep_sampling,
     compute_loss_weighting_for_sd3
@@ -49,6 +52,10 @@ from transformers import (
 from src.schedulers import RectifiedFlowScheduler
 from src.models.autoencoders import TripoSGVAEModel
 from src.models.transformers import PartFrameCrafterDiTModel
+from src.models.object_memory import (
+    ObjectMemoryState, canonical_tokens_from_context, frame_major_tensor,
+    relative_object_pose,
+)
 from src.pipelines.pipeline_partcrafter import PartCrafterPipeline, FourDCrafterPipeline
 
 # Datasets: 3D parts and 4D frames (frames-as-parts)
@@ -1213,6 +1220,12 @@ def main():
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     ddp_timeout_minutes = int(os.environ.get("COM4D_DDP_TIMEOUT_MINUTES", "180"))
     process_group_kwargs = InitProcessGroupKwargs(timeout=timedelta(minutes=ddp_timeout_minutes))
+    memory_mixed_batches = bool(
+        configs["model"]["transformer"].get("enable_object_memory", False)
+    )
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=memory_mixed_batches
+    )
     accelerator = Accelerator(
         project_dir=exp_dir,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -1220,7 +1233,7 @@ def main():
         split_batches=False,  # batch size per GPU
         dataloader_config=DataLoaderConfiguration(non_blocking=args.pin_memory),
         deepspeed_plugin=deepspeed_plugin,
-        kwargs_handlers=[process_group_kwargs],
+        kwargs_handlers=[process_group_kwargs, ddp_kwargs],
     )
     if torch.cuda.is_available():
         torch.cuda.set_device(accelerator.local_process_index)
@@ -1306,6 +1319,33 @@ def main():
 
         physics_dataset_spatiotemporal_grid = _config_list(configs["train"].get("physics_dataset_spatiotemporal_grid", None))
 
+        def _per_source_string_lists(key, default):
+            configured = configs["train"].get(key, None)
+            if configured is None:
+                return [list(default)] * len(physics_dataset_jsons)
+            values = list(configured)
+            if len(values) != len(physics_dataset_jsons):
+                raise ValueError(
+                    f"train.{key} must have the same length as train.physics_dataset_jsons."
+                )
+            normalized = []
+            for value in values:
+                if value is None:
+                    normalized.append([])
+                elif isinstance(value, (list, tuple, ListConfig)):
+                    normalized.append([str(item) for item in value])
+                else:
+                    normalized.append([str(value)])
+            return normalized
+
+        physics_dataset_include_name_prefixes = _per_source_string_lists(
+            "physics_dataset_include_object_name_prefixes",
+            cfgs_physics["dataset"].get("include_object_name_prefixes", []),
+        )
+        physics_dataset_exclude_names = _per_source_string_lists(
+            "physics_dataset_exclude_object_names",
+            cfgs_physics["dataset"].get("exclude_object_names", []),
+        )
         physics_dataset_surface_num_points = _config_list(
             configs["train"].get("physics_dataset_surface_num_points", None)
         )
@@ -1354,6 +1394,8 @@ def main():
             source_surface_num_points,
             source_num_spatial_parts,
             source_spatiotemporal_grid,
+            source_include_name_prefixes,
+            source_exclude_names,
         ) in enumerate(
             zip(
                 physics_dataset_jsons,
@@ -1361,6 +1403,8 @@ def main():
                 physics_dataset_surface_num_points,
                 physics_dataset_num_spatial_parts,
                 physics_dataset_spatiotemporal_grid,
+                physics_dataset_include_name_prefixes,
+                physics_dataset_exclude_names,
             )
         ):
             physics_dataset_path = Path(str(physics_dataset_json)).expanduser()
@@ -1373,6 +1417,8 @@ def main():
             source_cfgs_physics['dataset']['surface_num_points'] = int(source_surface_num_points)
             source_cfgs_physics['dataset']['config'] = [str(physics_dataset_path)]
             source_cfgs_physics['dataset']['spatiotemporal_grid'] = bool(source_spatiotemporal_grid)
+            source_cfgs_physics['dataset']['include_object_name_prefixes'] = source_include_name_prefixes
+            source_cfgs_physics['dataset']['exclude_object_names'] = source_exclude_names
             if source_spatiotemporal_grid:
                 if source_num_spatial_parts is not None:
                     source_cfgs_physics['dataset']['num_spatial_parts'] = int(source_num_spatial_parts)
@@ -1693,6 +1739,20 @@ def main():
     camera_condition_dim = int(configs["model"]["transformer"].get("camera_condition_dim", 25))
     physics_condition_dim = int(configs["model"]["transformer"].get("physics_condition_dim", 8))
     mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "current"))
+    enable_object_memory = bool(configs["model"]["transformer"].get("enable_object_memory", False))
+    object_memory_block_ids = configs["model"]["transformer"].get("object_memory_block_ids", None)
+    if object_memory_block_ids is not None:
+        object_memory_block_ids = list(object_memory_block_ids)
+    object_memory_num_heads = configs["model"]["transformer"].get("object_memory_num_heads", None)
+    enable_object_pose_prediction = bool(configs["model"]["transformer"].get("enable_object_pose_prediction", False))
+    object_pose_hidden_dim = configs["model"]["transformer"].get("object_pose_hidden_dim", None)
+    object_memory_model_kwargs = {
+        "enable_object_memory": enable_object_memory,
+        "object_memory_block_ids": object_memory_block_ids,
+        "object_memory_num_heads": object_memory_num_heads,
+        "enable_object_pose_prediction": enable_object_pose_prediction,
+        "object_pose_hidden_dim": object_pose_hidden_dim,
+    }
     flash_attention_cfg = configs["model"]["transformer"].get("flash_attention", {}) or {}
     transformer_sdpa_backend = str(flash_attention_cfg.get("backend", "auto")).lower()
     verify_flash_attention_once = bool(flash_attention_cfg.get("verify_once", False))
@@ -1772,6 +1832,7 @@ def main():
             temporal_global_attn_block_ids=temporal_global_attn_block_ids,
             global_attn_block_id_range=None,
             mixing_mode=mixing_mode,
+            **object_memory_model_kwargs,
         )
     elif args.load_pretrained_model is None or args.load_pretrained_model_ckpt is None:
         direct_pretrained_dir = None
@@ -1813,6 +1874,7 @@ def main():
                 global_attn_block_ids=spatial_global_attn_block_ids,
                 global_attn_block_id_range=None,
                 mixing_mode=mixing_mode,
+                **object_memory_model_kwargs,
             )
         else:
             if args.load_pretrained_model is not None and args.load_pretrained_model_ckpt is None:
@@ -1848,6 +1910,7 @@ def main():
                 global_attn_block_ids=spatial_global_attn_block_ids,
                 global_attn_block_id_range=None,
                 mixing_mode=mixing_mode,
+                **object_memory_model_kwargs,
             )
     else:
         transformer_init_source = f"checkpoint_ema:{args.load_pretrained_model}:{args.load_pretrained_model_ckpt:06d}"
@@ -1883,6 +1946,21 @@ def main():
             global_attn_block_ids=spatial_global_attn_block_ids,
             global_attn_block_id_range=None,
             mixing_mode=mixing_mode,
+            **object_memory_model_kwargs,
+        )
+    missing_keys = tuple(loading_info.get("missing_keys", ()))
+    missing_object_memory = any(
+        key.startswith("object_memory.") or ".object_memory." in key
+        for key in missing_keys
+    )
+    if enable_object_memory and missing_object_memory:
+        # The source checkpoint predates object memory. Explicitly reset the
+        # complete newly-added module: missing tensors can otherwise retain
+        # uninitialized storage after from_pretrained, including NaN/Inf.
+        transformer.object_memory.reset_parameters()
+        logger.info(
+            "Source checkpoint has no object-memory weights; explicitly "
+            "initialized the complete object-memory module.\n"
         )
     if not args.from_scratch:
         for v in loading_info.values():
@@ -2245,6 +2323,7 @@ def main():
                             global_attn_block_ids=spatial_global_attn_block_ids,
                             global_attn_block_id_range=None,
                             mixing_mode=mixing_mode,
+                            **object_memory_model_kwargs,
                         )
                         model.register_to_config(**load_model.config)
                         model.load_state_dict(load_model.state_dict())
@@ -2531,6 +2610,16 @@ def main():
     df_context_mode = configs["train"].get("df_context_mode", "prefix_k")  # ["prefix_k", "bernoulli_p"]
     df_context_k = int(configs["train"].get("df_context_k", 1))              # used if prefix_k
     df_context_p = float(configs["train"].get("df_context_p", 0.5))          # used if bernoulli_p (prob a token is HISTORY)
+
+    memory_training_cfg = configs["train"].get("object_memory", {}) or {}
+    memory_training_modes = set(memory_training_cfg.get("modes", ["4d", "physics"]))
+    memory_min_visibility = float(memory_training_cfg.get("min_visibility", 0.2))
+    memory_update_during_training = bool(memory_training_cfg.get("update_memory", False))
+    memory_use_relative_pose = bool(memory_training_cfg.get("use_relative_pose", False))
+    pose_training_cfg = configs["train"].get("object_pose", {}) or {}
+    pose_translation_weight = float(pose_training_cfg.get("translation_weight", 0.0))
+    pose_rotation_weight = float(pose_training_cfg.get("rotation_weight", 0.0))
+    pose_smoothness_weight = float(pose_training_cfg.get("smoothness_weight", 0.0))
 
     # choose the cleanest timestep (min sigma) for "history" tokens
     _sigmas_all = noise_scheduler.sigmas.to(device=accelerator.device)
@@ -3041,8 +3130,93 @@ def main():
             physics_context = _replicate_tensor_from_main_process(batch.get("physics_context", None), active=sequence_parallel_active)
             trace_sequence_parallel_event("train.after_condition_broadcasts", active=sequence_parallel_active)
 
+            memory_forward_kwargs = {}
+            visibility_valid_flat = batch.get("visibility_valid")
+            memory_labels_valid = (
+                visibility_valid_flat is not None
+                and bool(visibility_valid_flat.any().item())
+            )
+            if enable_object_memory and mode in memory_training_modes and memory_labels_valid:
+                memory_frames = attn_kwargs["num_frames"]
+                memory_objects = attn_kwargs["num_parts"]
+                clean_grid, memory_valid = frame_major_tensor(latents, memory_frames, memory_objects)
+                visibility_flat = batch["visibility"].to(
+                    device=accelerator.device, dtype=latents.dtype
+                ).reshape(-1)
+                visibility_valid_flat = visibility_valid_flat.to(
+                    device=accelerator.device, dtype=torch.bool
+                ).reshape(-1)
+                visibility_flat = visibility_flat * visibility_valid_flat.to(latents.dtype)
+                visibility_grid, _ = frame_major_tensor(
+                    visibility_flat, memory_frames, memory_objects
+                )
+                visibility_valid_grid, _ = frame_major_tensor(
+                    visibility_valid_flat, memory_frames, memory_objects
+                )
+                memory_valid = memory_valid & visibility_valid_grid
+                quality_flat = batch.get("observation_quality", visibility_flat).to(
+                    device=accelerator.device, dtype=latents.dtype
+                ).reshape(-1)
+                non_border_flat = batch.get(
+                    "non_border", torch.ones_like(visibility_valid_flat)
+                ).to(device=accelerator.device, dtype=torch.bool).reshape(-1)
+                quality_grid, _ = frame_major_tensor(
+                    quality_flat, memory_frames, memory_objects
+                )
+                non_border_grid, _ = frame_major_tensor(
+                    non_border_flat, memory_frames, memory_objects
+                )
+                context_grid = None
+                if context_mask is not None:
+                    context_grid, _ = frame_major_tensor(
+                        context_mask.to(device=latents.device), memory_frames, memory_objects
+                    )
+                canonical, canonical_confidence, canonical_indices = canonical_tokens_from_context(
+                    clean_grid, visibility_grid, valid=memory_valid, context=context_grid,
+                    quality=quality_grid, non_border=non_border_grid,
+                    min_visibility=memory_min_visibility, return_indices=True,
+                )
+                memory_relative_pose = None
+                if (
+                    memory_use_relative_pose
+                    and "object_translation" in batch
+                    and "object_quaternion_xyzw" in batch
+                    and "object_pose_valid" in batch
+                ):
+                    translation_grid, _ = frame_major_tensor(
+                        batch["object_translation"].to(accelerator.device, torch.float32),
+                        memory_frames, memory_objects,
+                    )
+                    rotation_grid, _ = frame_major_tensor(
+                        batch["object_quaternion_xyzw"].to(accelerator.device, torch.float32),
+                        memory_frames, memory_objects,
+                    )
+                    pose_valid_grid, _ = frame_major_tensor(
+                        batch["object_pose_valid"].to(accelerator.device, torch.bool),
+                        memory_frames, memory_objects,
+                    )
+                    memory_relative_pose = relative_object_pose(
+                        translation_grid, rotation_grid, canonical_indices
+                    ).to(latents.dtype)
+                    memory_relative_pose = torch.where(
+                        pose_valid_grid[..., None],
+                        memory_relative_pose,
+                        torch.zeros_like(memory_relative_pose),
+                    )
+                object_memory = accelerator.unwrap_model(transformer).initialize_object_memory(canonical)
+                object_memory = ObjectMemoryState(object_memory.tokens, canonical_confidence)
+                memory_forward_kwargs = {
+                    "object_memory": object_memory,
+                    "memory_evidence": clean_grid,
+                    "memory_visibility": visibility_grid * memory_valid.to(visibility_grid.dtype),
+                    "memory_confidence": (quality_grid * non_border_grid.to(quality_grid.dtype)
+                                          * memory_valid.to(quality_grid.dtype)),
+                    "memory_relative_pose": memory_relative_pose,
+                    "update_object_memory": memory_update_during_training,
+                }
+
             trace_sequence_parallel_event("train.before_transformer", latent_model_input, active=sequence_parallel_active, mode=mode)
-            model_pred = _profiled_transformer_forward(
+            transformer_output = _profiled_transformer_forward(
                 hidden_states=latent_model_input,
                 timestep=timesteps,
                 encoder_hidden_states=image_embeds,
@@ -3051,7 +3225,9 @@ def main():
                 frame_time=frame_time,
                 has_camera=has_camera,
                 physics_context=physics_context,
-            ).sample
+                **memory_forward_kwargs,
+            )
+            model_pred = transformer_output.sample
             trace_sequence_parallel_event("train.after_transformer", model_pred, active=sequence_parallel_active, mode=mode)
             _debug_timing("transformer")
 
@@ -3306,7 +3482,86 @@ def main():
             else:
                 base_loss = diff_loss.mean()
 
+            pose_translation_loss = torch.tensor(0.0, device=accelerator.device)
+            pose_rotation_loss = torch.tensor(0.0, device=accelerator.device)
+            pose_smoothness_loss = torch.tensor(0.0, device=accelerator.device)
+            predicted_pose = transformer_output.object_pose
+            pose_targets_available = (
+                predicted_pose is not None
+                and "object_translation" in batch
+                and "object_quaternion_xyzw" in batch
+                and "object_pose_valid" in batch
+            )
+            if pose_targets_available:
+                target_translation = batch["object_translation"].to(
+                    device=accelerator.device, dtype=torch.float32
+                )
+                target_quaternion = batch["object_quaternion_xyzw"].to(
+                    device=accelerator.device, dtype=torch.float32
+                )
+                target_quaternion = target_quaternion / target_quaternion.norm(
+                    dim=-1, keepdim=True
+                ).clamp_min(1e-8)
+                pose_valid = batch["object_pose_valid"].to(
+                    device=accelerator.device, dtype=torch.bool
+                )
+                if pose_valid.any():
+                    predicted_translation = predicted_pose.translation.float()
+                    predicted_quaternion = predicted_pose.rotation.float()
+                    pose_translation_loss = tF.mse_loss(
+                        predicted_translation[pose_valid], target_translation[pose_valid]
+                    )
+                    quaternion_dot = (
+                        predicted_quaternion[pose_valid] * target_quaternion[pose_valid]
+                    ).sum(dim=-1).abs().clamp(max=1.0 - 1e-7)
+                    pose_rotation_loss = (2.0 * torch.acos(quaternion_dot)).mean()
+
+                    frame_count = attn_kwargs["num_frames"]
+                    object_count = attn_kwargs["num_parts"]
+                    pred_t_grid, pose_grid_valid = frame_major_tensor(
+                        predicted_translation, frame_count, object_count
+                    )
+                    target_t_grid, _ = frame_major_tensor(
+                        target_translation, frame_count, object_count
+                    )
+                    pred_q_grid, _ = frame_major_tensor(
+                        predicted_quaternion, frame_count, object_count
+                    )
+                    target_q_grid, _ = frame_major_tensor(
+                        target_quaternion, frame_count, object_count
+                    )
+                    label_valid_grid, _ = frame_major_tensor(
+                        pose_valid, frame_count, object_count
+                    )
+                    pose_grid_valid = pose_grid_valid & label_valid_grid
+                    if pred_t_grid.shape[1] >= 3:
+                        triple_valid = (
+                            pose_grid_valid[:, :-2]
+                            & pose_grid_valid[:, 1:-1]
+                            & pose_grid_valid[:, 2:]
+                        )
+                        if triple_valid.any():
+                            pred_t_accel = pred_t_grid[:, 2:] - 2 * pred_t_grid[:, 1:-1] + pred_t_grid[:, :-2]
+                            target_t_accel = target_t_grid[:, 2:] - 2 * target_t_grid[:, 1:-1] + target_t_grid[:, :-2]
+                            # Align quaternion signs to GT before finite differences.
+                            signs = torch.where(
+                                (pred_q_grid * target_q_grid).sum(dim=-1, keepdim=True) < 0,
+                                -torch.ones_like(pred_q_grid[..., :1]),
+                                torch.ones_like(pred_q_grid[..., :1]),
+                            )
+                            pred_q_aligned = pred_q_grid * signs
+                            pred_q_accel = pred_q_aligned[:, 2:] - 2 * pred_q_aligned[:, 1:-1] + pred_q_aligned[:, :-2]
+                            target_q_accel = target_q_grid[:, 2:] - 2 * target_q_grid[:, 1:-1] + target_q_grid[:, :-2]
+                            pose_smoothness_loss = (
+                                tF.mse_loss(pred_t_accel[triple_valid], target_t_accel[triple_valid])
+                                + tF.mse_loss(pred_q_accel[triple_valid], target_q_accel[triple_valid])
+                            )
+
+
             loss = base_loss + cons_weight * consistency_loss
+            loss = loss + pose_translation_weight * pose_translation_loss
+            loss = loss + pose_rotation_weight * pose_rotation_loss
+            loss = loss + pose_smoothness_weight * pose_smoothness_loss
             if layout_pose_step_active:
                 loss = loss + layout_pose_aux_weight * layout_pose_loss
             if room_layout_step_active:
@@ -3371,6 +3626,44 @@ def main():
             if finite_int.item() == 0:
                 nonfinite_retry_count += 1
                 _discard_pending_update()
+                if nonfinite_retry_count == 1 or nonfinite_retry_count >= max_nonfinite_retries:
+                    def _finite_summary(name: str, value: Optional[torch.Tensor]) -> str:
+                        if value is None:
+                            return f"{name}=None"
+                        detached = value.detach().float()
+                        finite = torch.isfinite(detached)
+                        finite_values = detached[finite]
+                        max_abs = (
+                            finite_values.abs().amax().item()
+                            if finite_values.numel() > 0 else float("nan")
+                        )
+                        return (
+                            f"{name}[shape={tuple(detached.shape)},"
+                            f"finite={int(finite.sum().item())}/{detached.numel()},"
+                            f"max_abs_finite={max_abs:.6g}]"
+                        )
+
+                    base_transformer = _unwrap_transformer_for_attn()
+                    memory_diagnostics = getattr(
+                        getattr(base_transformer, "object_memory", None),
+                        "last_read_diagnostics",
+                        None,
+                    )
+                    memory_text = "memory_read=None"
+                    if memory_diagnostics is not None:
+                        memory_text = "memory_read[" + ",".join(
+                            f"{key}={value.item() if torch.is_tensor(value) else value}"
+                            for key, value in memory_diagnostics.items()
+                        ) + "]"
+                    logger.error(
+                        "Non-finite loss diagnostics: "
+                        + "; ".join((
+                            _finite_summary("model_pred", model_pred),
+                            _finite_summary("base_loss", base_loss),
+                            _finite_summary("total_loss", loss),
+                            memory_text,
+                        ))
+                    )
                 if nonfinite_retry_count >= max_nonfinite_retries:
                     raise RuntimeError(
                         f"Non-finite loss persisted for {nonfinite_retry_count} consecutive micro-steps "

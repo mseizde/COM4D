@@ -83,6 +83,76 @@ def _count_surface_parts(surface_path: str) -> int:
     return 1
 
 
+_PART_ALIGNED_FRAME_FIELDS = (
+    "object_names", "object_translation", "object_quaternion_xyzw",
+    "object_linear_velocity", "object_angular_velocity", "visibility",
+    "visibility_valid", "visible_mask_paths", "amodal_mask_paths",
+    "visible_mask_area", "amodal_mask_area", "mask_touches_border",
+    "sensor_coverage_proxy", "observation_quality",
+)
+
+
+def _selected_part_indices(frame: dict, include_name_prefixes: tuple[str, ...],
+                           exclude_names: frozenset[str],
+                           expected_parts: Optional[int] = None) -> list[int]:
+    """Select ordered frame-part indices using manifest object names."""
+    names = frame.get("object_names")
+    filtering = bool(include_name_prefixes or exclude_names)
+    if names is None:
+        if filtering:
+            raise ValueError("Part-name filtering requires object_names in every frame")
+        if expected_parts is None:
+            raise ValueError("expected_parts is required when object_names are absent")
+        return list(range(expected_parts))
+    if not isinstance(names, (list, tuple)):
+        raise ValueError("object_names must be a list")
+    if expected_parts is not None and len(names) != expected_parts:
+        raise ValueError(
+            f"object_names has {len(names)} entries, but the surface has {expected_parts} parts"
+        )
+    selected = [
+        index for index, raw_name in enumerate(names)
+        if ((not include_name_prefixes or str(raw_name).startswith(include_name_prefixes))
+            and str(raw_name) not in exclude_names)
+    ]
+    if not selected:
+        raise ValueError(
+            "Part-name filtering removed every object from frame "
+            f"{frame.get('surface_path', '<unknown>')}"
+        )
+    return selected
+
+
+def _filter_frame_parts(frame: dict, surface_data: dict,
+                        include_name_prefixes: tuple[str, ...],
+                        exclude_names: frozenset[str]) -> tuple[dict, dict]:
+    """Filter surface parts and all manifest fields aligned with those parts."""
+    parts = surface_data.get("parts") if isinstance(surface_data, dict) else None
+    if not isinstance(parts, list) or not parts:
+        if include_name_prefixes or exclude_names:
+            raise ValueError("Part-name filtering requires a non-empty surface parts list")
+        return frame, surface_data
+    indices = _selected_part_indices(
+        frame, include_name_prefixes, exclude_names, expected_parts=len(parts)
+    )
+    if len(indices) == len(parts):
+        return frame, surface_data
+    filtered_frame = dict(frame)
+    for field in _PART_ALIGNED_FRAME_FIELDS:
+        if field not in frame:
+            continue
+        values = frame[field]
+        if not isinstance(values, (list, tuple)) or len(values) != len(parts):
+            raise ValueError(
+                f"{field} must contain one value per surface part before filtering; "
+                f"expected {len(parts)} values"
+            )
+        filtered_frame[field] = [values[index] for index in indices]
+    filtered_surface = dict(surface_data)
+    filtered_surface["parts"] = [parts[index] for index in indices]
+    return filtered_frame, filtered_surface
+
+
 def _is_spatiotemporal_part_count_error(exc: Exception) -> bool:
     return (
         isinstance(exc, ValueError)
@@ -182,6 +252,12 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
         self.training_ratio = configs['dataset']['training_ratio']
         self.balance_object_and_parts = configs['dataset'].get('balance_object_and_parts', False)
         self.spatiotemporal_grid = bool(configs['dataset'].get('spatiotemporal_grid', False))
+        self.include_object_name_prefixes = tuple(
+            str(value) for value in configs['dataset'].get('include_object_name_prefixes', [])
+        )
+        self.exclude_object_names = frozenset(
+            str(value) for value in configs['dataset'].get('exclude_object_names', [])
+        )
         configured_num_spatial_parts = configs['dataset'].get('num_spatial_parts', None)
         self.num_spatial_parts = int(configured_num_spatial_parts) if configured_num_spatial_parts is not None else None
         configured_max_spatial_parts = configs['dataset'].get('max_num_spatial_parts', None)
@@ -274,7 +350,27 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                     continue
                 num_frames_sample = random.randint(lower, upper)
                 if self.spatiotemporal_grid:
-                    if self.num_spatial_parts is None:
+                    if self.include_object_name_prefixes or self.exclude_object_names:
+                        selected_signatures = {
+                            tuple(
+                                str(frame["object_names"][index])
+                                for index in _selected_part_indices(
+                                    frame,
+                                    self.include_object_name_prefixes,
+                                    self.exclude_object_names,
+                                    expected_parts=len(frame.get("object_names", [])),
+                                )
+                            )
+                            for frame in obj["frames"]
+                        }
+                        if len(selected_signatures) != 1:
+                            raise ValueError(
+                                "Part-name filtering must select one stable ordered object set "
+                                f"per sequence; {obj['object_key']} produced "
+                                f"{sorted(selected_signatures)}"
+                            )
+                        spatial_parts = len(next(iter(selected_signatures)))
+                    elif self.num_spatial_parts is None:
                         spatial_parts = _count_surface_parts(obj['frames'][0]['surface_path'])
                     else:
                         spatial_parts = self.num_spatial_parts
@@ -362,10 +458,23 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             camera_list = []
             has_camera_list = []
             frame_time_list = []
+            visibility_list = []
+            visibility_valid_list = []
+            observation_quality_list = []
+            non_border_list = []
+            translation_list = []
+            quaternion_list = []
+            pose_valid_list = []
             for local_idx, fr in enumerate(chosen):
                 surface_path = resolve_path(fr['surface_path'])
                 image_path = resolve_path(fr['image_path'])
                 surface_data = np.load(surface_path, allow_pickle=True).item()
+                fr, surface_data = _filter_frame_parts(
+                    fr,
+                    surface_data,
+                    self.include_object_name_prefixes,
+                    self.exclude_object_names,
+                )
                 camera_condition, has_camera = _camera_condition_from_frame(fr)
                 frame_time = _frame_time_from_frame(fr, s + stride * local_idx, F)
                 if self.spatiotemporal_grid:
@@ -389,6 +498,61 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 camera_list.extend([camera_condition] * repeat_count)
                 has_camera_list.extend([has_camera] * repeat_count)
                 frame_time_list.extend([frame_time] * repeat_count)
+                raw_visibility = fr.get("visibility", 0.0)
+                if isinstance(raw_visibility, (list, tuple)):
+                    if len(raw_visibility) != repeat_count:
+                        raise ValueError(
+                            f"visibility must have {repeat_count} values for {surface_path}"
+                        )
+                    visibility_list.extend(float(value) for value in raw_visibility)
+                else:
+                    visibility_list.extend([float(raw_visibility)] * repeat_count)
+                raw_visibility_valid = fr.get("visibility_valid", False)
+                if isinstance(raw_visibility_valid, (list, tuple)):
+                    if len(raw_visibility_valid) != repeat_count:
+                        raise ValueError(
+                            f"visibility_valid must have {repeat_count} values for {surface_path}"
+                        )
+                    visibility_valid_list.extend(bool(value) for value in raw_visibility_valid)
+                else:
+                    visibility_valid_list.extend([bool(raw_visibility_valid)] * repeat_count)
+
+                raw_quality = fr.get("observation_quality", raw_visibility)
+                if isinstance(raw_quality, (list, tuple)):
+                    if len(raw_quality) != repeat_count:
+                        raise ValueError(
+                            f"observation_quality must have {repeat_count} values for {surface_path}"
+                        )
+                    observation_quality_list.extend(float(value) for value in raw_quality)
+                else:
+                    observation_quality_list.extend([float(raw_quality)] * repeat_count)
+
+                raw_border = fr.get("mask_touches_border", False)
+                if isinstance(raw_border, (list, tuple)):
+                    if len(raw_border) != repeat_count:
+                        raise ValueError(
+                            f"mask_touches_border must have {repeat_count} values for {surface_path}"
+                        )
+                    non_border_list.extend(not bool(value) for value in raw_border)
+                else:
+                    non_border_list.extend([not bool(raw_border)] * repeat_count)
+
+                translations = fr.get("object_translation")
+                quaternions = fr.get("object_quaternion_xyzw")
+                pose_valid = (
+                    isinstance(translations, (list, tuple))
+                    and isinstance(quaternions, (list, tuple))
+                    and len(translations) == repeat_count
+                    and len(quaternions) == repeat_count
+                )
+                if pose_valid:
+                    translation_list.extend(translations)
+                    quaternion_list.extend(quaternions)
+                    pose_valid_list.extend([True] * repeat_count)
+                else:
+                    translation_list.extend([[0.0, 0.0, 0.0]] * repeat_count)
+                    quaternion_list.extend([[0.0, 0.0, 0.0, 1.0]] * repeat_count)
+                    pose_valid_list.extend([False] * repeat_count)
                 # Load image per frame
                 pil_image = Image.open(image_path)
                 if getattr(pil_image, "is_animated", False):
@@ -422,6 +586,13 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
                 "camera_params": torch.stack(camera_list, dim=0),
                 "has_camera": torch.stack(has_camera_list, dim=0).bool(),
                 "frame_time": torch.stack(frame_time_list, dim=0),
+                "visibility": torch.tensor(visibility_list, dtype=torch.float32).clamp_(0, 1),
+                "visibility_valid": torch.tensor(visibility_valid_list, dtype=torch.bool),
+                "observation_quality": torch.tensor(observation_quality_list, dtype=torch.float32).clamp_(0, 1),
+                "non_border": torch.tensor(non_border_list, dtype=torch.bool),
+                "object_translation": torch.tensor(translation_list, dtype=torch.float32),
+                "object_quaternion_xyzw": torch.tensor(quaternion_list, dtype=torch.float32),
+                "object_pose_valid": torch.tensor(pose_valid_list, dtype=torch.bool),
             }
             if self.spatiotemporal_grid:
                 out["num_frames"] = torch.LongTensor([k])
@@ -648,6 +819,15 @@ class BatchedObjaversePartDataset(ObjaversePartDataset):
             out["camera_params"] = torch.cat([data["camera_params"] for data in batch], dim=0)
             out["has_camera"] = torch.cat([data["has_camera"] for data in batch], dim=0)
             out["frame_time"] = torch.cat([data["frame_time"] for data in batch], dim=0)
+        if all("visibility" in data for data in batch):
+            out["visibility"] = torch.cat([data["visibility"] for data in batch], dim=0)
+            out["visibility_valid"] = torch.cat([data["visibility_valid"] for data in batch], dim=0)
+            out["observation_quality"] = torch.cat([data["observation_quality"] for data in batch], dim=0)
+            out["non_border"] = torch.cat([data["non_border"] for data in batch], dim=0)
+        if all("object_translation" in data for data in batch):
+            out["object_translation"] = torch.cat([data["object_translation"] for data in batch], dim=0)
+            out["object_quaternion_xyzw"] = torch.cat([data["object_quaternion_xyzw"] for data in batch], dim=0)
+            out["object_pose_valid"] = torch.cat([data["object_pose_valid"] for data in batch], dim=0)
         if all("num_frames" in data and "num_spatial_parts" in data for data in batch):
             out["num_frames"] = torch.cat([data["num_frames"] for data in batch], dim=0)
             out["num_spatial_parts"] = torch.cat([data["num_spatial_parts"] for data in batch], dim=0)

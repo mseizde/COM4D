@@ -7,6 +7,8 @@ import trimesh
 from diffusers.utils import BaseOutput
 from PIL import Image
 
+from ..models.object_memory import ObjectMemoryState
+
 
 @dataclass
 class PartCrafterPipelineOutput(BaseOutput):
@@ -29,6 +31,7 @@ class PartCrafter3D4DOutput(BaseOutput):
     animation_path: Optional[str] = None
     scene_latents: Optional[torch.Tensor] = None
     dynamic_latents: Optional[torch.Tensor] = None
+    object_memory: Optional[ObjectMemoryState] = None
     scene_renders: Optional[List[Image.Image]] = None
     time: Optional[float] = None
     

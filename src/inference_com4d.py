@@ -528,6 +528,12 @@ def main():
         help="Optional directory containing binary masks aligned with frames",
     )
     parser.add_argument(
+        "--masks_amodal_dir",
+        type=str,
+        default=None,
+        help="Optional trusted amodal masks used only to gate persistent-memory writes.",
+    )
+    parser.add_argument(
         "--masks_static_dir",
         type=str,
         default=None,
@@ -973,12 +979,14 @@ def main():
     frames_dir = Path(args.frames_dir)
     frames_original_dir = Path(args.frames_original_dir) if args.frames_original_dir else None
     masks_dir = Path(args.masks_dir) if args.masks_dir else None
+    masks_amodal_dir = Path(args.masks_amodal_dir) if args.masks_amodal_dir else None
     masks_static_dir = Path(args.masks_static_dir) if args.masks_static_dir else None
     os.makedirs(masks_static_dir, exist_ok=True)
 
     frames: List[Image.Image] = _gather_images(frames_dir)
     frames_original: Optional[List[Image.Image]] = _gather_images(frames_original_dir) if frames_original_dir else None
     masks: List[List[Image.Image]] = _gather_all_masks(masks_dir, dynamic_num_parts) if masks_dir else []
+    masks_amodal: List[List[Image.Image]] = _gather_all_masks(masks_amodal_dir, dynamic_num_parts) if masks_amodal_dir else []
     masks_static: List[List[Image.Image]] = _gather_all_masks(masks_static_dir, scene_num_parts) if masks_static_dir else []
     print(f"Loaded {len(frames)} frames from {frames_dir}")
     print(f"Loaded {len(masks)} sets of masks from {masks_dir} each with {len(masks[0])} masks." if masks_dir else "No masks loaded")
@@ -1011,6 +1019,11 @@ def main():
         masks = [
             [_resize_mask_image(mask, args.image_size) for mask in mask_list]
             for mask_list in masks
+        ]
+    if masks_amodal:
+        masks_amodal = [
+            [_resize_mask_image(mask, args.image_size) for mask in mask_list]
+            for mask_list in masks_amodal
         ]
     if masks_static:
         masks_static = [
@@ -1048,6 +1061,10 @@ def main():
     frames_for_pipeline = [frames[i] for i in selected_indices]
     masks_for_pipeline = (
         [[mask_list[i] for i in selected_indices] for mask_list in masks] if masks else None
+    )
+    masks_amodal_for_pipeline = (
+        [[mask_list[i] for i in selected_indices] for mask_list in masks_amodal]
+        if masks_amodal else None
     )
     masks_static_for_pipeline = (
         [[mask_list[i] for i in selected_indices] for mask_list in masks_static] if masks_static else None
@@ -1170,6 +1187,7 @@ def main():
         masks=masks_for_pipeline,
         masks_static=masks_static_for_pipeline,
         all_masks=masks,
+        amodal_masks=masks_amodal_for_pipeline,
         num_tokens=args.num_tokens,
         scene_inference_steps=args.scene_steps,
         dynamic_inference_steps=args.dynamic_steps,

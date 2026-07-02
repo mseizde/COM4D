@@ -33,6 +33,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from PIL import Image
+
 import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
@@ -64,6 +66,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Copy render_rgb frames into the training render layout.",
+    )
+    parser.add_argument(
+        "--copy-masks",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Clean and copy paired visible/amodal masks when both are present.",
+    )
+    parser.add_argument(
+        "--require-masks",
+        action="store_true",
+        help="Fail if any included part lacks a visible/amodal mask pair.",
     )
     parser.add_argument(
         "--write-glb",
@@ -172,6 +185,21 @@ def interaction_static_object_specs(metadata: dict) -> dict[str, dict]:
     }
 
 
+def part_object_specs(metadata: dict, include_static_parts: bool) -> dict[str, dict]:
+    specs = dict(dynamic_object_specs(metadata))
+    if include_static_parts:
+        specs.update(interaction_static_object_specs(metadata))
+    return specs
+
+
+def clean_binary_mask(source: Path, destination: Path) -> int:
+    values = np.asarray(Image.open(source).convert("L"))
+    binary = np.where(values == 255, 255, 0).astype(np.uint8)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(binary).save(destination)
+    return int(np.count_nonzero(binary))
+
+
 def transform_matrix(position: list[float], quat_xyzw: list[float]) -> np.ndarray:
     rotation = np.eye(4)
     rotation[:3, :3] = Rotation.from_quat(quat_xyzw).as_matrix()
@@ -245,9 +273,7 @@ def build_frame_meshes(
     include_static_parts: bool,
     floor_size: float,
 ) -> list[tuple[str, trimesh.Trimesh]]:
-    specs = dict(dynamic_object_specs(metadata))
-    if include_static_parts:
-        specs.update(interaction_static_object_specs(metadata))
+    specs = part_object_specs(metadata, include_static_parts)
     if not specs:
         raise ValueError("Metadata does not define any dynamic objects.")
     return [
@@ -288,6 +314,8 @@ def process_sequence(
     frame_limit: int | None,
     overwrite: bool,
     copy_rgb: bool,
+    copy_masks: bool,
+    require_masks: bool,
     write_glb: bool,
     include_parts: bool,
     include_static_parts: bool,
@@ -297,6 +325,8 @@ def process_sequence(
     metadata_path = sequence_dir / "physics_metadata.json"
     with metadata_path.open("r") as f:
         metadata = json.load(f)
+    ordered_specs = part_object_specs(metadata, include_static_parts)
+    part_names = list(ordered_specs)
 
     processed_metadata_path = output_root / "metadata" / sequence_name / "physics_metadata.json"
     processed_metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -314,6 +344,8 @@ def process_sequence(
         glb_dir.mkdir(parents=True, exist_ok=True)
     if copy_rgb:
         render_dir.mkdir(parents=True, exist_ok=True)
+    visible_output_root = output_root / "masks_visible" / sequence_name
+    amodal_output_root = output_root / "masks_amodal" / sequence_name
     preproc_root.mkdir(parents=True, exist_ok=True)
 
     entries = []
@@ -361,6 +393,54 @@ def process_sequence(
                     scene.add_geometry(part_mesh, geom_name=part_name)
                 scene.export(glb_dir / f"{name}.glb", file_type="glb")
 
+        object_translation = []
+        object_quaternion = []
+        object_linear_velocity = []
+        object_angular_velocity = []
+        frame_objects = frame.get("objects", {})
+        for part_name in part_names:
+            spec = ordered_specs[part_name]
+            position, quaternion = object_pose(part_name, spec, frame)
+            quaternion_array = np.asarray(quaternion, dtype=np.float64)
+            quaternion_array /= max(float(np.linalg.norm(quaternion_array)), 1e-8)
+            state = frame_objects.get(part_name, {}) if isinstance(frame_objects, dict) else {}
+            object_translation.append([float(value) for value in position])
+            object_quaternion.append(quaternion_array.tolist())
+            object_linear_velocity.append(
+                [float(value) for value in state.get("linear_velocity", [0.0, 0.0, 0.0])]
+            )
+            object_angular_velocity.append(
+                [float(value) for value in state.get("angular_velocity", [0.0, 0.0, 0.0])]
+            )
+
+        visibility = []
+        visibility_valid = []
+        visible_mask_paths = []
+        amodal_mask_paths = []
+        for part_name in part_names:
+            visible_source = sequence_dir / "masks" / part_name / f"{name}.png"
+            amodal_source = sequence_dir / "masks_amodal" / part_name / f"{name}.png"
+            valid_pair = copy_masks and visible_source.is_file() and amodal_source.is_file()
+            if valid_pair:
+                visible_destination = visible_output_root / part_name / f"{name}.png"
+                amodal_destination = amodal_output_root / part_name / f"{name}.png"
+                visible_area = clean_binary_mask(visible_source, visible_destination)
+                amodal_area = clean_binary_mask(amodal_source, amodal_destination)
+                visibility.append(float(np.clip(visible_area / max(amodal_area, 1), 0.0, 1.0)))
+                visibility_valid.append(amodal_area > 0)
+                visible_mask_paths.append(str(visible_destination.resolve()))
+                amodal_mask_paths.append(str(amodal_destination.resolve()))
+            else:
+                if require_masks:
+                    raise FileNotFoundError(
+                        f"Missing visible/amodal mask pair for {sequence_name}/{part_name}/{name}"
+                    )
+                visibility.append(0.0)
+                visibility_valid.append(False)
+                visible_mask_paths.append(None)
+                amodal_mask_paths.append(None)
+
+
         src_rgb = sequence_dir / "render_rgb" / f"{name}.png"
         dst_rgb = render_dir / f"{name}.png"
         if copy_rgb:
@@ -376,6 +456,16 @@ def process_sequence(
             {
                 "surface_path": str(points_path.resolve()),
                 "image_path": str(image_path.resolve()),
+                "object_names": part_names,
+                "object_translation": object_translation,
+                "object_quaternion_xyzw": object_quaternion,
+                "object_linear_velocity": object_linear_velocity,
+                "object_angular_velocity": object_angular_velocity,
+                "visibility": visibility,
+                "visibility_valid": visibility_valid,
+                "visible_mask_paths": visible_mask_paths,
+                "amodal_mask_paths": amodal_mask_paths,
+                "physics_metadata_path": str(processed_metadata_path.resolve()),
                 "iou_mean": 0.0,
                 "iou_max": 0.0,
             }
@@ -406,6 +496,8 @@ def main() -> None:
                 frame_limit=args.frame_limit,
                 overwrite=args.overwrite,
                 copy_rgb=args.copy_rgb,
+                copy_masks=args.copy_masks,
+                require_masks=args.require_masks,
                 write_glb=args.write_glb,
                 include_parts=args.include_parts,
                 include_static_parts=args.include_static_parts,
@@ -426,6 +518,8 @@ def main() -> None:
                     args.frame_limit,
                     args.overwrite,
                     args.copy_rgb,
+                    args.copy_masks,
+                    args.require_masks,
                     args.write_glb,
                     args.include_parts,
                     args.include_static_parts,

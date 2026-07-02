@@ -122,7 +122,9 @@ from diffusers.utils import (
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 from torch import nn
 
-from ..object_memory import CanonicalObjectMemory, ObjectMemoryState
+from ..object_memory import (
+    CanonicalObjectMemory, ObjectMemoryState, ObjectPosePredictionHead,
+)
 
 from ..attention_processor import (
     FusedTripoSGAttnProcessor2_0,
@@ -415,6 +417,8 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         enable_object_memory: bool = False,
         object_memory_block_ids: Optional[List[int]] = None,
         object_memory_num_heads: Optional[int] = None,
+        enable_object_pose_prediction: bool = False,
+        object_pose_hidden_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -459,9 +463,16 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         self.object_memory_block_ids = [
             int(layer) for layer in object_memory_block_ids if 0 <= int(layer) < num_layers
         ]
+        # Diffusers serializes constructor arguments, so replace config-system
+        # sequence types (for example OmegaConf ListConfig) with plain JSON data.
+        self.register_to_config(
+            object_memory_block_ids=list(self.object_memory_block_ids))
         if self.enable_object_memory:
             memory_heads = object_memory_num_heads or num_attention_heads
             self.object_memory = CanonicalObjectMemory(width, memory_heads)
+        self.enable_object_pose_prediction = bool(enable_object_pose_prediction)
+        if self.enable_object_pose_prediction:
+            self.object_pose_head = ObjectPosePredictionHead(width, object_pose_hidden_dim)
 
         time_embed_dim, timestep_input_dim = self._set_time_proj(
             "positional",
@@ -1085,7 +1096,24 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             raise ValueError("enable_object_memory=True is required to initialize memory")
         if canonical_tokens.ndim != 4:
             raise ValueError("canonical_tokens must have shape [B,O,M,C]")
+        # This runs before the autocast-protected transformer forward. Match
+        if not torch.isfinite(canonical_tokens).all().item():
+            raise FloatingPointError(
+                "canonical_tokens contain non-finite values before memory projection"
+            )
+        # projection parameters explicitly so FP16 VAE latents can initialize
+        # a transformer whose checkpoint weights were loaded in FP32.
+        canonical_tokens = canonical_tokens.to(
+            device=self.proj_in.weight.device,
+            dtype=self.proj_in.weight.dtype,
+        )
         projected = self.proj_in(canonical_tokens)
+        if not torch.isfinite(projected).all().item():
+            finite = torch.isfinite(projected)
+            raise FloatingPointError(
+                "Projected canonical memory contains non-finite values: "
+                f"finite={int(finite.sum().item())}/{projected.numel()}"
+            )
         return self.object_memory.initialize(projected, confidence)
 
     def _project_memory_evidence(self, evidence: torch.Tensor) -> torch.Tensor:
@@ -1110,6 +1138,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         num_frames: Union[int, torch.Tensor],
         num_parts: Union[int, torch.Tensor],
         layout: str,
+        relative_pose: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Read padded per-object memory into flattened frame-major states."""
         if layout != "frame_major":
@@ -1143,7 +1172,12 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 confidence=object_memory.confidence[group:group + 1, :part_count],
             )
             # Token zero is the diffusion-timestep token, not an object-state token.
-            state_tokens = self.object_memory.read(group_state[..., 1:, :], group_memory)
+            group_pose = None
+            if relative_pose is not None:
+                group_pose = relative_pose[group:group + 1, :frame_count, :part_count]
+            state_tokens = self.object_memory.read(
+                group_state[..., 1:, :], group_memory, relative_pose=group_pose
+            )
             group_state = torch.cat((group_state[..., :1, :], state_tokens), dim=-2)
             chunks.append(group_state.reshape(total, *hidden_states.shape[1:]))
             offset += total
@@ -1168,6 +1202,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         memory_evidence: Optional[torch.Tensor] = None,
         memory_visibility: Optional[torch.Tensor] = None,
         memory_confidence: Optional[torch.Tensor] = None,
+        memory_relative_pose: Optional[torch.Tensor] = None,
         update_object_memory: bool = False,
         force_add_static_embedding: bool = False,
         force_add_dynamic_embedding: bool = False,
@@ -1245,6 +1280,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 self._project_memory_evidence(memory_evidence),
                 memory_visibility,
                 memory_confidence,
+                relative_pose=memory_relative_pose,
             )
         elif update_object_memory:
             raise ValueError("object_memory is required when update_object_memory=True")
@@ -1612,6 +1648,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     num_frames_kw,
                     num_parts_kw,
                     mixing_layout,
+                    memory_relative_pose,
                 )
 
 
@@ -1621,6 +1658,10 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         # final layer
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states[:, -T:]  # (N, T, D)
+        object_pose = (
+            self.object_pose_head(hidden_states)
+            if self.enable_object_pose_prediction else None
+        )
         hidden_states = self.proj_out(hidden_states)
 
         if USE_PEFT_BACKEND:
@@ -1633,7 +1674,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return (hidden_states,)
 
         return Transformer1DModelOutput(
-            sample=hidden_states, object_memory=active_object_memory
+            sample=hidden_states, object_memory=active_object_memory, object_pose=object_pose
         )
     
     def forward_1(
@@ -1893,6 +1934,8 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         dynamic_count: Optional[int] = None,
         return_dict: bool = True,
         cutoff: Optional[bool] = False,
+        object_memory: Optional[ObjectMemoryState] = None,
+        memory_relative_pose: Optional[torch.Tensor] = None,
     ):
         # M: Spatial dimension, e.g. number of parts
         # N: Temporal dimension, e.g. number of frames
@@ -1965,6 +2008,15 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
                     hidden_states_matrix[:, col, :, :] = hidden_states
 
+                if object_memory is not None and layer in self.object_memory_block_ids:
+                    if not self.enable_object_memory:
+                        raise ValueError("object_memory requires enable_object_memory=True")
+                    state = hidden_states_matrix.permute(1, 0, 2, 3).unsqueeze(0)
+                    state_tokens = self.object_memory.read(
+                        state[..., 1:, :], object_memory, relative_pose=memory_relative_pose
+                    )
+                    state = torch.cat((state[..., :1, :], state_tokens), dim=-2)
+                    hidden_states_matrix = state.squeeze(0).permute(1, 0, 2, 3)
                 continue
 
             # temporal block
@@ -1986,6 +2038,16 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
                 hidden_states_matrix[row, :, :, :] = hidden_states    
 
+            if object_memory is not None and layer in self.object_memory_block_ids:
+                if not self.enable_object_memory:
+                    raise ValueError("object_memory requires enable_object_memory=True")
+                state = hidden_states_matrix.permute(1, 0, 2, 3).unsqueeze(0)
+                state_tokens = self.object_memory.read(
+                    state[..., 1:, :], object_memory, relative_pose=memory_relative_pose
+                )
+                state = torch.cat((state[..., :1, :], state_tokens), dim=-2)
+                hidden_states_matrix = state.squeeze(0).permute(1, 0, 2, 3)
+
         hidden_states_matrix_ = hidden_states_matrix.clone()
         hidden_states_matrix = torch.zeros((M, N, T, self.out_channels), dtype=hidden_states_matrix_.dtype, device=hidden_states_matrix_.device)
 
@@ -1995,9 +2057,11 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             hidden_states_matrix[i] = self.proj_out(hidden_states_matrix_[i][:, -T:])
 
         if not return_dict:
+            if object_memory is not None:
+                return hidden_states_matrix, object_memory
             return (hidden_states_matrix,)
 
-        return Transformer1DModelOutput(sample=hidden_states_matrix)
+        return Transformer1DModelOutput(sample=hidden_states_matrix, object_memory=object_memory)
 
     def forward_spatiotemporal(
         self,

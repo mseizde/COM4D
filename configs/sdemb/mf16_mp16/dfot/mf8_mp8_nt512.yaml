@@ -15,7 +15,7 @@ model:
     enable_object_id_embedding: false
     max_object_ids: 32
     spatial_global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-    temporal_global_attn_block_ids: [0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21]
+    temporal_global_attn_block_ids: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21]
     max_num_frames: 16
     mixing_mode: spatial_temporal # current | spatial_temporal | temporal_spatial | joint | inference_emulation; applied when both frame and part axes are >1
     enable_camera_time_conditioning: false
