@@ -123,6 +123,24 @@ def load_scene(path: Path) -> trimesh.Scene:
     raise TypeError(f"Unsupported GLB load result for {path}: {type(loaded)!r}")
 
 
+def scene_has_mesh_geometry(scene: trimesh.Scene) -> bool:
+    return any(
+        isinstance(mesh, trimesh.Trimesh) and len(mesh.vertices) > 0
+        for mesh in scene.dump(concatenate=False)
+    )
+
+
+def load_nonempty_scene(path: Path) -> trimesh.Scene | None:
+    try:
+        scene = load_scene(path)
+    except Exception as exc:
+        print(f"Warning: failed to load {path}: {exc}", flush=True)
+        return None
+    if not scene_has_mesh_geometry(scene):
+        return None
+    return scene
+
+
 def parse_frame_index(path: Path) -> int | None:
     stem = path.stem
     digits = ""
@@ -304,8 +322,26 @@ def load_gt_scenes(gt_root: Path, frame_paths: list[Path]) -> list[trimesh.Scene
     metadata_path = gt_root / "physics_metadata.json"
     mesh_dir = gt_root / "meshes"
     transform_dir = gt_root / "transforms"
-    if not metadata_path.is_file() or not mesh_dir.is_dir() or not transform_dir.is_dir():
-        raise FileNotFoundError(f"GT geometry requires physics_metadata.json, meshes/, and transforms/ under {gt_root}")
+    if not mesh_dir.is_dir() or not transform_dir.is_dir():
+        direct_scenes = []
+        for frame_path in frame_paths:
+            frame_index = parse_frame_index(frame_path)
+            gt_frame = gt_root / f"frame_{int(frame_index or 0):04d}.glb"
+            if not gt_frame.is_file():
+                raise FileNotFoundError(
+                    f"GT geometry requires either direct frame_*.glb files or physics_metadata.json, "
+                    f"meshes/, and transforms/ under {gt_root}; missing {gt_frame}"
+                )
+            loaded = load_scene(gt_frame)
+            if isinstance(loaded, trimesh.Scene):
+                direct_scenes.append(loaded)
+            else:
+                scene = trimesh.Scene()
+                scene.add_geometry(loaded)
+                direct_scenes.append(scene)
+        return direct_scenes
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"GT geometry requires physics_metadata.json with meshes/ and transforms/ under {gt_root}")
     metadata = json.loads(metadata_path.read_text())
     names = [name for name in gt_geometry_names(metadata) if name == "floor" or (mesh_dir / f"{name}.glb").is_file()]
     if not names:
@@ -435,14 +471,18 @@ def resolve_gt_render_inputs(export_dir: Path, args: argparse.Namespace) -> tupl
     return load_camera_metadata(camera_path), load_pred_to_gt_transform(alignment_path), gt_root
 
 def render_export_dir(export_dir: Path, args: argparse.Namespace) -> str:
-    frame_paths = sorted((export_dir / "dynamic").glob("dynamic_scene_frame_*.glb"))
+    candidate_frame_paths = sorted((export_dir / "dynamic").glob("dynamic_scene_frame_*.glb"))
+    scenes_by_path = [(path, scene) for path in candidate_frame_paths if (scene := load_nonempty_scene(path)) is not None]
     if args.frame_stride > 1:
-        frame_paths = frame_paths[:: args.frame_stride]
+        scenes_by_path = scenes_by_path[:: args.frame_stride]
     if args.max_frames and args.max_frames > 0:
-        frame_paths = frame_paths[: args.max_frames]
+        scenes_by_path = scenes_by_path[: args.max_frames]
+    frame_paths = [path for path, _scene in scenes_by_path]
     output_path = export_dir / args.output_name
-    if not frame_paths:
+    if not candidate_frame_paths:
         return "skip:no_frames"
+    if not frame_paths:
+        return "skip:no_nonempty_frames"
 
     camera_metadata, pred_to_gt_transform, gt_root = resolve_gt_render_inputs(export_dir, args)
     gt_mode = camera_metadata is not None and pred_to_gt_transform is not None
@@ -472,7 +512,7 @@ def render_export_dir(export_dir: Path, args: argparse.Namespace) -> str:
             output_fps = max(1, int(round(gt_fps)))
 
     size = (int(args.render_size), int(args.render_size))
-    scenes = [load_scene(path) for path in frame_paths]
+    scenes = [scene for _path, scene in scenes_by_path]
     fitted_frames = render_sequence_fixed_camera(
         scenes, azimuth=float(args.azimuth), elevation=float(args.elevation), fit_scale=float(args.fit_scale),
         image_size=size, light_intensity=5.0, return_type="pil", bg_color=(255, 255, 255, 255),

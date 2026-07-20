@@ -405,9 +405,12 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         enable_dynamic_embedding_per_block: bool = False,
         global_attn_block_ids: Optional[List[int]] = None,
         global_attn_block_id_range: Optional[List[int]] = None,
-        spatial_global_attn_block_ids: Optional[List[int]] = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20],
-        temporal_global_attn_block_ids: Optional[List[int]] = [0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21],
-        mixing_mode: str = "current",
+        spatial_global_attn_block_ids: Optional[List[int]] = None,
+        temporal_global_attn_block_ids: Optional[List[int]] = None,
+        explicit_axial_roles: Optional[Dict[str, List[int]]] = None,
+        mixing_mode: str = "inference_emulation",
+        enable_joint_relation_bias: bool = False,
+        enable_training_inference_state_emulation: bool = False,
         enable_instance_type_embedding: bool = False,
         enable_object_id_embedding: bool = False,
         max_object_ids: int = 32,
@@ -422,10 +425,14 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
     ):
         super().__init__()
 
+        legacy_roles_provided = (
+            spatial_global_attn_block_ids is not None
+            or temporal_global_attn_block_ids is not None
+        )
         if spatial_global_attn_block_ids is None:
-            spatial_global_attn_block_ids = [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+            spatial_global_attn_block_ids = list(range(0, num_layers, 2))
         if temporal_global_attn_block_ids is None:
-            temporal_global_attn_block_ids = [0, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21]
+            temporal_global_attn_block_ids = list(range(1, num_layers, 2))
 
         print("Initializing PartFrameCrafterDiTModel: ", 
               "num_attention_heads=", num_attention_heads,
@@ -599,13 +606,101 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             spatial_global_attn_block_ids = list(global_attn_block_ids)
         if (not spatial_global_attn_block_ids) and (global_attn_block_id_range is not None):
             spatial_global_attn_block_ids = list(range(global_attn_block_id_range[0], global_attn_block_id_range[1] + 1))
-        
-        self.spatial_global_attn_block_ids = spatial_global_attn_block_ids
-        self.temporal_global_attn_block_ids = temporal_global_attn_block_ids
+
+        if explicit_axial_roles is not None:
+            unknown_roles = set(explicit_axial_roles) - {"spatial", "temporal"}
+            if unknown_roles:
+                raise ValueError(f"Unknown explicit axial roles: {sorted(unknown_roles)}")
+            spatial_global_attn_block_ids = explicit_axial_roles.get("spatial", [])
+            temporal_global_attn_block_ids = explicit_axial_roles.get("temporal", [])
+        elif legacy_roles_provided:
+            logger.warning(
+                "spatial_global_attn_block_ids and temporal_global_attn_block_ids are deprecated; "
+                "use explicit_axial_roles={'spatial': [...], 'temporal': [...]} instead."
+            )
+            # Older released COM4D checkpoints stored temporal roles with layer 0
+            # duplicated from the spatial list and sometimes with num_layers as a
+            # sentinel. Keep those checkpoints loadable while preserving strict
+            # validation for new explicit_axial_roles configs.
+            spatial_legacy = [int(layer) for layer in spatial_global_attn_block_ids]
+            spatial_set = set(spatial_legacy)
+            temporal_legacy = [int(layer) for layer in temporal_global_attn_block_ids]
+            cleaned_temporal = [
+                layer for layer in temporal_legacy
+                if 0 <= layer < num_layers and layer not in spatial_set
+            ]
+            if cleaned_temporal != temporal_legacy:
+                logger.warning(
+                    "Normalized deprecated temporal_global_attn_block_ids from %s to %s "
+                    "for backward-compatible checkpoint loading.",
+                    temporal_legacy,
+                    cleaned_temporal,
+                )
+            spatial_global_attn_block_ids = spatial_legacy
+            temporal_global_attn_block_ids = cleaned_temporal
+
+        def _validated_role_ids(role: str, values: List[int]) -> List[int]:
+            ids = [int(layer) for layer in values]
+            if len(ids) != len(set(ids)):
+                raise ValueError(f"Duplicate layers in {role} axial role: {ids}")
+            invalid = [layer for layer in ids if layer < 0 or layer >= num_layers]
+            if invalid:
+                raise ValueError(
+                    f"{role} axial role contains layers outside [0, {num_layers}): {invalid}"
+                )
+            return ids
+
+        self.spatial_global_attn_block_ids = _validated_role_ids(
+            "spatial", spatial_global_attn_block_ids
+        )
+        spatial_ids = set(self.spatial_global_attn_block_ids)
+        overlapping_ids = spatial_ids.intersection(
+            int(layer) for layer in temporal_global_attn_block_ids
+        )
+        if overlapping_ids:
+            raise ValueError(
+                f"Layers must have exactly one explicit axial role; overlap: {sorted(overlapping_ids)}"
+            )
+        self.temporal_global_attn_block_ids = _validated_role_ids(
+            "temporal", temporal_global_attn_block_ids
+        )
+        self.explicit_axial_roles = {
+            "spatial": list(self.spatial_global_attn_block_ids),
+            "temporal": list(self.temporal_global_attn_block_ids),
+        }
+        self.register_to_config(
+            explicit_axial_roles=dict(self.explicit_axial_roles),
+            spatial_global_attn_block_ids=list(self.spatial_global_attn_block_ids),
+            temporal_global_attn_block_ids=list(self.temporal_global_attn_block_ids),
+        )
+
+        valid_mixing_modes = {"inference_emulation", "joint"}
+        if mixing_mode in {"spatial_temporal", "temporal_spatial"}:
+            raise ValueError(
+                f"mixing_mode={mixing_mode!r} has been removed because it was an alias "
+                "for role-preserving inference emulation. Use 'inference_emulation' "
+                "or the truly joint 'joint' mode."
+            )
+        if mixing_mode not in valid_mixing_modes:
+            raise ValueError(
+                f"Unsupported mixing_mode={mixing_mode!r}; expected one of "
+                f"{sorted(valid_mixing_modes)}."
+            )
 
         self.global_attn_block_ids = []
         self.num_layers = num_layers
         self.mixing_mode = mixing_mode
+        self.enable_training_inference_state_emulation = bool(
+            enable_training_inference_state_emulation
+        )
+        self.enable_joint_relation_bias = bool(enable_joint_relation_bias)
+        if self.enable_joint_relation_bias:
+            # Per-head biases for same-frame, same-part, and unrelated pairs.
+            # Keeping these parameters on the model guarantees optimizer and
+            # checkpoint registration even though attention processors change.
+            self.joint_relation_bias = nn.Parameter(
+                torch.zeros(num_layers, num_attention_heads, 3)
+            )
 
     def _remove_static_dynamic_embedding(self):
         print("!!! Removing static and dynamic embeddings...")
@@ -809,6 +904,17 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             return [int(v) for v in value.detach().cpu().reshape(-1).tolist()]
         raise TypeError(f"Unsupported count type: {type(value)}")
 
+    def _mixing_phase_for_layer(self, layer: int, mixing_mode: str) -> Optional[str]:
+        """Assign one axial role to a block so every DiT block executes once."""
+        if mixing_mode == "inference_emulation":
+            if layer in self.spatial_global_attn_block_ids:
+                return "spatial"
+            if layer in self.temporal_global_attn_block_ids:
+                return "temporal"
+            return None
+
+        return None
+
     def _build_grid_position_embedding(
         self,
         num_frames: Union[int, torch.Tensor],
@@ -898,97 +1004,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         if not role_ids:
             return None
         return self.instance_type_embedding(torch.cat(role_ids, dim=0))
-
-    def _apply_spatial_temporal_mixing(
-        self,
-        block: DiTBlock,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: Optional[torch.Tensor],
-        temb: torch.Tensor,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]],
-        skip: Optional[torch.Tensor],
-        num_frames: Union[int, torch.Tensor],
-        num_parts: Union[int, torch.Tensor],
-        layout: str,
-        order: str,
-    ) -> torch.Tensor:
-        frame_counts = self._as_count_list(num_frames)
-        part_counts = self._as_count_list(num_parts, len(frame_counts))
-        if len(part_counts) == 1 and len(frame_counts) > 1:
-            part_counts = part_counts * len(frame_counts)
-        if len(frame_counts) != len(part_counts):
-            raise ValueError(
-                f"num_frames and num_parts must describe the same number of spatio-temporal objects, "
-                f"got {len(frame_counts)} and {len(part_counts)}"
-            )
-        if layout != "frame_major":
-            raise NotImplementedError(f"Unsupported spatio-temporal layout: {layout}")
-
-        def _slice_optional(tensor: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
-            return None if tensor is None else tensor[start:end]
-
-        def _spatial_pass(state: torch.Tensor) -> torch.Tensor:
-            offset = 0
-            chunks = []
-            for frame_count, part_count in zip(frame_counts, part_counts):
-                total = frame_count * part_count
-                for frame_idx in range(frame_count):
-                    start = offset + frame_idx * part_count
-                    end = start + part_count
-                    chunks.append(block(
-                        state[start:end],
-                        encoder_hidden_states=_slice_optional(encoder_hidden_states, start, end),
-                        temb=temb[start:end],
-                        image_rotary_emb=image_rotary_emb,
-                        skip=_slice_optional(skip, start, end),
-                        attention_kwargs={"num_parts": part_count, "num_frames": 1},
-                    ))
-                offset += total
-            return torch.cat(chunks, dim=0)
-
-        def _temporal_pass(state: torch.Tensor) -> torch.Tensor:
-            offset = 0
-            chunks = []
-            for frame_count, part_count in zip(frame_counts, part_counts):
-                total = frame_count * part_count
-                obj_state = state[offset:offset + total].reshape(frame_count, part_count, *state.shape[1:])
-                obj_temb = temb[offset:offset + total].reshape(frame_count, part_count, *temb.shape[1:])
-                obj_enc = (
-                    None
-                    if encoder_hidden_states is None
-                    else encoder_hidden_states[offset:offset + total].reshape(
-                        frame_count, part_count, *encoder_hidden_states.shape[1:]
-                    )
-                )
-                obj_skip = (
-                    None
-                    if skip is None
-                    else skip[offset:offset + total].reshape(frame_count, part_count, *skip.shape[1:])
-                )
-                part_chunks = []
-                for part_idx in range(part_count):
-                    part_state = obj_state[:, part_idx].contiguous()
-                    part_temb = obj_temb[:, part_idx].contiguous()
-                    part_enc = None if obj_enc is None else obj_enc[:, part_idx].contiguous()
-                    part_skip = None if obj_skip is None else obj_skip[:, part_idx].contiguous()
-                    part_chunks.append(block(
-                        part_state,
-                        encoder_hidden_states=part_enc,
-                        temb=part_temb,
-                        image_rotary_emb=image_rotary_emb,
-                        skip=part_skip,
-                        attention_kwargs={"num_parts": 1, "num_frames": frame_count},
-                    ))
-                mixed_obj = torch.stack(part_chunks, dim=1).reshape(total, *state.shape[1:])
-                chunks.append(mixed_obj)
-                offset += total
-            return torch.cat(chunks, dim=0)
-
-        if order == "spatial_temporal":
-            return _temporal_pass(_spatial_pass(hidden_states))
-        if order == "temporal_spatial":
-            return _spatial_pass(_temporal_pass(hidden_states))
-        raise ValueError(f"Unsupported factorized mixing order: {order}")
 
     def _apply_inference_emulation_mixing(
         self,
@@ -1256,10 +1271,18 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             attention_kwargs = {}
         num_frames_kw = attention_kwargs.get("num_frames", None)
         num_parts_kw = attention_kwargs.get("num_parts", None)
-        mixing_mode = attention_kwargs.get("mixing_mode", getattr(self, "mixing_mode", "current"))
+        mixing_mode = attention_kwargs.get("mixing_mode", getattr(self, "mixing_mode", "inference_emulation"))
+        if self.training and self.enable_training_inference_state_emulation:
+            mixing_mode = "inference_emulation"
+        if mixing_mode in {"spatial_temporal", "temporal_spatial"}:
+            raise ValueError(
+                f"mixing_mode={mixing_mode!r} has been removed. Use "
+                "'inference_emulation' for role-preserving axial mixing or 'joint' "
+                "for full frame-part attention."
+            )
         mixing_layout = attention_kwargs.get("layout", "frame_major")
         mixing_active = (
-            mixing_mode in {"spatial_temporal", "temporal_spatial", "joint", "inference_emulation"}
+            mixing_mode in {"joint", "inference_emulation"}
             and self._is_mixing_count(num_frames_kw)
             and self._is_mixing_count(num_parts_kw)
         )
@@ -1449,15 +1472,20 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     frame_counts = self._as_count_list(num_frames_kw)
                     part_counts = self._as_count_list(num_parts_kw, len(frame_counts))
                     if len(part_counts) == 1 and len(frame_counts) > 1:
-                        part_counts = part_counts * len(frame_counts)
-                    input_attention_kwargs = {
+                        part_counts *= len(frame_counts)
+                    input_attention_kwargs = dict(attention_kwargs)
+                    input_attention_kwargs.update({
                         "num_parts": torch.tensor(
-                            [f * p for f, p in zip(frame_counts, part_counts)],
+                            [frames * parts for frames, parts in zip(frame_counts, part_counts)],
                             device=hidden_states.device,
-                            dtype=torch.long,
                         ),
-                        "num_frames": 1,
-                    }
+                        "num_frames": None,
+                    })
+                    if self.enable_joint_relation_bias:
+                        input_attention_kwargs.update({
+                            "relation_grid_shapes": list(zip(frame_counts, part_counts)),
+                            "relation_bias_values": self.joint_relation_bias[layer],
+                        })
             else:
                 input_attention_kwargs = None
 
@@ -1469,19 +1497,18 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 dynamic_embed = self.dynamic_embedding_per_block(torch.tensor([layer] * hidden_states.shape[0], device=hidden_states.device))
                 hidden_states = hidden_states + dynamic_embed.unsqueeze(dim=1)
 
-            if mixing_active and mixing_mode == "inference_emulation" and (layer in self.global_attn_block_ids):
+            if (
+                mixing_active
+                and mixing_mode == "inference_emulation"
+                and (layer in self.global_attn_block_ids)
+            ):
                 trace_sequence_parallel_event(
                     "transformer.inference_emulation_enter",
                     hidden_states,
                     layer=layer,
                     has_attention_kwargs=input_attention_kwargs is not None,
                 )
-                if layer in self.spatial_global_attn_block_ids:
-                    emulation_phase = "spatial"
-                elif layer in self.temporal_global_attn_block_ids:
-                    emulation_phase = "temporal"
-                else:
-                    emulation_phase = None
+                emulation_phase = self._mixing_phase_for_layer(layer, mixing_mode)
 
                 if emulation_phase is None:
                     hidden_states = block(
@@ -1549,62 +1576,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         layout=mixing_layout,
                         phase=emulation_phase,
                         attention_kwargs=input_attention_kwargs,
-                    )
-            elif mixing_active and mixing_mode in {"spatial_temporal", "temporal_spatial"} and (layer in self.global_attn_block_ids):
-                if self.training and self.gradient_checkpointing:
-                    skip_is_none = skip is None
-                    skip_input = hidden_states.new_empty(0) if skip_is_none else skip
-
-                    def custom_mixing(
-                        local_hidden_states: torch.Tensor,
-                        local_temb: torch.Tensor,
-                        local_encoder_hidden_states: Optional[torch.Tensor],
-                        local_skip: torch.Tensor,
-                        *,
-                        local_block: DiTBlock = block,
-                        local_image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = image_rotary_emb,
-                        local_num_frames: Union[int, torch.Tensor] = num_frames_kw,
-                        local_num_parts: Union[int, torch.Tensor] = num_parts_kw,
-                        local_layout: str = mixing_layout,
-                        local_order: str = mixing_mode,
-                        local_skip_is_none: bool = skip_is_none,
-                    ) -> torch.Tensor:
-                        return self._apply_spatial_temporal_mixing(
-                            block=local_block,
-                            hidden_states=local_hidden_states,
-                            encoder_hidden_states=local_encoder_hidden_states,
-                            temb=local_temb,
-                            image_rotary_emb=local_image_rotary_emb,
-                            skip=None if local_skip_is_none else local_skip,
-                            num_frames=local_num_frames,
-                            num_parts=local_num_parts,
-                            layout=local_layout,
-                            order=local_order,
-                        )
-
-                    ckpt_kwargs: Dict[str, Any] = (
-                        {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
-                    )
-                    hidden_states = torch.utils.checkpoint.checkpoint(
-                        custom_mixing,
-                        hidden_states,
-                        temb,
-                        input_encoder_hidden_states,
-                        skip_input,
-                        **ckpt_kwargs,
-                    )
-                else:
-                    hidden_states = self._apply_spatial_temporal_mixing(
-                        block=block,
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=input_encoder_hidden_states,
-                        temb=temb,
-                        image_rotary_emb=image_rotary_emb,
-                        skip=skip,
-                        num_frames=num_frames_kw,
-                        num_parts=num_parts_kw,
-                        layout=mixing_layout,
-                        order=mixing_mode,
                     )
             elif self.training and self.gradient_checkpointing:
 
@@ -1934,12 +1905,18 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
         dynamic_count: Optional[int] = None,
         return_dict: bool = True,
         cutoff: Optional[bool] = False,
+        spatial_cutoff: Optional[bool] = None,
+        temporal_cutoff: Optional[bool] = None,
         object_memory: Optional[ObjectMemoryState] = None,
         memory_relative_pose: Optional[torch.Tensor] = None,
     ):
         # M: Spatial dimension, e.g. number of parts
         # N: Temporal dimension, e.g. number of frames
         M, N, T, _ = hidden_states_matrix.shape
+        if spatial_cutoff is None:
+            spatial_cutoff = bool(cutoff)
+        if temporal_cutoff is None:
+            temporal_cutoff = bool(cutoff)
 
         temb = self.time_embed(timestep).to(hidden_states_matrix.dtype)
 
@@ -2000,7 +1977,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                         temb=temb[:, col, :, :],
                         image_rotary_emb=image_rotary_emb,
                         skip=None if layer <= self.config.num_layers // 2 else skips[f"spatial_{col}"].pop(),
-                        attention_kwargs={"num_parts": M if not cutoff else None, "num_frames": None},
+                        attention_kwargs={"num_parts": M if not spatial_cutoff else None, "num_frames": None},
                     )
 
                     if layer < self.config.num_layers // 2:
@@ -2030,7 +2007,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                     temb=temb[row, :, :, :],
                     image_rotary_emb=image_rotary_emb,
                     skip=None if layer <= self.config.num_layers // 2 else skips[f"temporal_{row}"].pop(),
-                    attention_kwargs={"num_parts": None, "num_frames": (None if row < static_count else N)},
+                    attention_kwargs={"num_parts": None, "num_frames": (None if row < static_count or temporal_cutoff else N)},
                 )
 
                 if layer < self.config.num_layers // 2:
@@ -2453,24 +2430,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
 
         def _build_block_kwargs(
             block: DiTBlock,
-            base: Optional[Dict[str, Any]],
-            override: Optional[Dict[str, Any]] = None,
-        ) -> Optional[Dict[str, Any]]:
-            if base is None and override is None:
-                return None
-            merged: Dict[str, Any] = {}
-            if base is not None:
-                merged.update(base)
-            if override is not None:
-                merged.update(override)
-            processor = getattr(block.attn1, "processor", None)
-            if not isinstance(processor, PartFrameCrafterAttnProcessor):
-                merged.pop("num_parts", None)
-                merged.pop("num_frames", None)
-            return merged or None
-
-        def _build_block_kwargs(
-            block: DiTBlock,
             base_kwargs: Optional[Dict[str, Any]],
             override_kwargs: Optional[Dict[str, Any]] = None,
         ) -> Optional[Dict[str, Any]]:
@@ -2504,8 +2463,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             if state.shape[0] == 0:
                 return state
 
-            print("Applying spatial block on branch", branch_idx, "with static_count =", static_count, "and dynamic_count =", dynamic_count, state.shape)
-
             static_enc = spatial_static_branches[branch_idx]
             dynamic_enc = spatial_dynamic_branches[branch_idx]
             num_static = static_count
@@ -2537,13 +2494,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
                 local_kwargs = {"num_parts": max(1, num_static + 1), "num_frames": 1}
                 block_kwargs = _build_block_kwargs(block, block_attention, local_kwargs)
 
-                print("\nSpatial block forward pass:", frame_state.shape, 
-                      "\ntemb.shape", frame_tem.shape,
-                      "\nskip.shape" if frame_skip is not None else "skip=None",
-                      "\nblock_enc.shape" if block_enc is not None else "block_enc=None",
-                      "\nblock_kwargs", block_kwargs,
-                )
-                
                 updated_pair = block(
                     frame_state,
                     encoder_hidden_states=block_enc,
@@ -2602,13 +2552,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             local_temporal_kwargs = {"num_frames": max(1, history_len + dynamic_count)}
 
             block_kwargs = _build_block_kwargs(block, block_attention, local_temporal_kwargs)
-            print("\nTemporal block forward pass:", block_state.shape, 
-                "\ntemb.shape", block_tem.shape,
-                "\nskip.shape" if block_skip is not None else "skip=None",
-                "\nblock_enc.shape" if block_enc is not None else "block_enc=None",
-                "\nblock_kwargs", block_kwargs,
-            )
-
             updated = block(
                 block_state,
                 encoder_hidden_states=block_enc,
@@ -2620,7 +2563,7 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             offset = 0
             if history_len > 0:
                 updated_history = updated[offset : offset + history_len]
-                branch_history_hidden[branch_idx] = updated_history.detach()
+                branch_history_hidden[branch_idx] = updated_history
                 offset += history_len
             else:
                 branch_history_hidden[branch_idx] = None
@@ -2637,8 +2580,6 @@ class PartFrameCrafterDiTModel(ModelMixin, ConfigMixin, PeftAdapterMixin):
             is_temporal = layer in temporal_layers
 
             block_attention = attention_kwargs if (layer in active_global_ids) else None
-
-            print(f"\n=== Layer {layer} === is_spatial: {is_spatial}, is_temporal: {is_temporal}, block_attention: {'yes' if block_attention is not None else 'no'}")
 
             for branch_idx in range(cfg_factor):
                 branch_state = branch_states[branch_idx]

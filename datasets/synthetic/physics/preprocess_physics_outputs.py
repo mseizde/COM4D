@@ -47,7 +47,7 @@ DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "datasets" / "processed" / "two_ball"
 DEFAULT_JSON_OUTPUT = PROJECT_ROOT / "dataset_json" / "two_ball.json"
 
 sys.path.append(str(PROJECT_ROOT))
-from src.utils.data_utils import mesh_to_surface  # noqa: E402
+from src.utils.data_utils import mesh_to_surface, normalize_mesh  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--json-output", type=Path, default=DEFAULT_JSON_OUTPUT)
     parser.add_argument("--sequence-glob", default="*")
+    parser.add_argument(
+        "--sequence",
+        action="append",
+        default=None,
+        help="Exact sequence directory name to include. Can be repeated; applied after --sequence-glob.",
+    )
     parser.add_argument("--num-points", type=int, default=204800)
     parser.add_argument("--sphere-subdivisions", type=int, default=4)
     parser.add_argument("--workers", type=int, default=1)
@@ -99,6 +105,19 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Side length for generated floor plane when --include-static-parts is enabled.",
+    )
+    parser.add_argument(
+        "--normalize-surfaces",
+        action="store_true",
+        help="Center/scale every sampled surface independently to bbox max extent 2 before writing points.npy.",
+    )
+    parser.add_argument(
+        "--sequence-normalize-surfaces",
+        action="store_true",
+        help=(
+            "Apply one shared center/scale transform per sequence before point sampling. "
+            "This keeps motion in coordinates while fitting the sequence in the VAE box."
+        ),
     )
     return parser.parse_args()
 
@@ -282,12 +301,68 @@ def build_frame_meshes(
     ]
 
 
-def surface_dict(mesh: trimesh.Trimesh, num_points: int) -> dict[str, np.ndarray]:
-    data = mesh_to_surface(mesh, num_pc=num_points, return_dict=True)
+def compute_sequence_normalization(
+    metadata: dict,
+    frames: list[dict],
+    subdivisions: int,
+    include_static_parts: bool,
+    floor_size: float,
+) -> tuple[np.ndarray, float]:
+    min_corner = None
+    max_corner = None
+    for frame in frames:
+        named_part_meshes = build_frame_meshes(
+            metadata,
+            frame,
+            subdivisions,
+            include_static_parts=include_static_parts,
+            floor_size=floor_size,
+        )
+        for _, mesh in named_part_meshes:
+            bounds = np.asarray(mesh.bounds, dtype=np.float64)
+            if bounds.shape != (2, 3) or not np.isfinite(bounds).all():
+                continue
+            min_corner = bounds[0] if min_corner is None else np.minimum(min_corner, bounds[0])
+            max_corner = bounds[1] if max_corner is None else np.maximum(max_corner, bounds[1])
+
+    if min_corner is None or max_corner is None:
+        return np.zeros(3, dtype=np.float64), 1.0
+    center = (min_corner + max_corner) * 0.5
+    extent = float(np.max(max_corner - min_corner))
+    scale = 1.9 / max(extent, 1e-8)
+    return center, scale
+
+
+def apply_shared_normalization(mesh: trimesh.Trimesh, center: np.ndarray, scale: float) -> trimesh.Trimesh:
+    transformed = mesh.copy()
+    transformed.apply_translation(-center)
+    transformed.apply_scale(float(scale))
+    return transformed
+
+
+def mesh_normalization_metadata(mesh: trimesh.Trimesh) -> dict[str, object]:
+    bbox = mesh.bounding_box
+    center = np.asarray(bbox.centroid, dtype=np.float32)
+    extent = float(np.asarray(bbox.primitive.extents, dtype=np.float64).max())
     return {
+        "center": center.tolist(),
+        "scale": float(2.0 / max(extent, 1e-8)),
+        "extent": extent,
+    }
+
+
+def surface_dict(mesh: trimesh.Trimesh, num_points: int, normalize: bool = False) -> tuple[dict[str, np.ndarray], dict[str, object] | None]:
+    metadata = None
+    sample_mesh = mesh
+    if normalize:
+        metadata = mesh_normalization_metadata(mesh)
+        sample_mesh = normalize_mesh(mesh.copy(), scale=2.0)
+    data = mesh_to_surface(sample_mesh, num_pc=num_points, return_dict=True)
+    surface = {
         "surface_points": np.asarray(data["surface_points"], dtype=np.float32),
         "surface_normals": np.asarray(data["surface_normals"], dtype=np.float32),
     }
+    return surface, metadata
 
 
 def write_points(
@@ -296,13 +371,26 @@ def write_points(
     part_meshes: list[trimesh.Trimesh],
     num_points: int,
     include_parts: bool,
+    normalize_surfaces: bool,
 ) -> None:
+    object_surface, object_norm = surface_dict(object_mesh, num_points, normalize=normalize_surfaces)
     data = {
-        "object": surface_dict(object_mesh, num_points),
+        "object": object_surface,
         "parts": [],
     }
+    normalization = {"object": object_norm, "parts": []} if normalize_surfaces else None
     if include_parts:
-        data["parts"] = [surface_dict(part, num_points) for part in part_meshes]
+        part_surfaces = []
+        part_norms = []
+        for part in part_meshes:
+            part_surface, part_norm = surface_dict(part, num_points, normalize=normalize_surfaces)
+            part_surfaces.append(part_surface)
+            part_norms.append(part_norm)
+        data["parts"] = part_surfaces
+        if normalize_surfaces:
+            normalization["parts"] = part_norms
+    if normalize_surfaces:
+        data["normalization"] = normalization
     np.save(output_path, data)
 
 
@@ -320,6 +408,8 @@ def process_sequence(
     include_parts: bool,
     include_static_parts: bool,
     floor_size: float,
+    normalize_surfaces: bool,
+    sequence_normalize_surfaces: bool,
 ) -> tuple[str, list[dict]]:
     sequence_name = sequence_dir.name
     metadata_path = sequence_dir / "physics_metadata.json"
@@ -336,6 +426,17 @@ def process_sequence(
     frames = metadata["frames"]
     if frame_limit is not None:
         frames = frames[:frame_limit]
+
+    sequence_center = np.zeros(3, dtype=np.float64)
+    sequence_scale = 1.0
+    if sequence_normalize_surfaces:
+        sequence_center, sequence_scale = compute_sequence_normalization(
+            metadata,
+            frames,
+            sphere_subdivisions,
+            include_static_parts=include_static_parts,
+            floor_size=floor_size,
+        )
 
     glb_dir = output_root / "glb" / sequence_name
     preproc_root = output_root / "preprocessed"
@@ -365,6 +466,11 @@ def process_sequence(
                 include_static_parts=include_static_parts,
                 floor_size=floor_size,
             )
+            if sequence_normalize_surfaces:
+                named_part_meshes = [
+                    (part_name, apply_shared_normalization(mesh, sequence_center, sequence_scale))
+                    for part_name, mesh in named_part_meshes
+                ]
             part_meshes = [mesh for _, mesh in named_part_meshes]
             object_mesh = trimesh.util.concatenate(part_meshes) if len(part_meshes) > 1 else part_meshes[0].copy()
             write_points(
@@ -373,6 +479,7 @@ def process_sequence(
                 part_meshes=part_meshes,
                 num_points=num_points,
                 include_parts=include_parts,
+                normalize_surfaces=normalize_surfaces,
             )
 
             with num_parts_path.open("w") as f:
@@ -382,6 +489,11 @@ def process_sequence(
                         "part_names": [part_name for part_name, _ in named_part_meshes],
                         "mesh_path": str((glb_dir / f"{name}.glb").resolve()) if write_glb else None,
                         "source_metadata": str(processed_metadata_path.resolve()),
+                        "sequence_normalization": {
+                            "center": sequence_center.tolist(),
+                            "scale": float(sequence_scale),
+                            "enabled": bool(sequence_normalize_surfaces),
+                        },
                     },
                     f,
                     separators=(",", ":"),
@@ -404,11 +516,14 @@ def process_sequence(
             quaternion_array = np.asarray(quaternion, dtype=np.float64)
             quaternion_array /= max(float(np.linalg.norm(quaternion_array)), 1e-8)
             state = frame_objects.get(part_name, {}) if isinstance(frame_objects, dict) else {}
+            if sequence_normalize_surfaces:
+                position = (np.asarray(position, dtype=np.float64) - sequence_center) * sequence_scale
             object_translation.append([float(value) for value in position])
             object_quaternion.append(quaternion_array.tolist())
-            object_linear_velocity.append(
-                [float(value) for value in state.get("linear_velocity", [0.0, 0.0, 0.0])]
-            )
+            linear_velocity = np.asarray(state.get("linear_velocity", [0.0, 0.0, 0.0]), dtype=np.float64)
+            if sequence_normalize_surfaces:
+                linear_velocity = linear_velocity * sequence_scale
+            object_linear_velocity.append([float(value) for value in linear_velocity])
             object_angular_velocity.append(
                 [float(value) for value in state.get("angular_velocity", [0.0, 0.0, 0.0])]
             )
@@ -479,8 +594,16 @@ def main() -> None:
     input_root = args.input_root.expanduser().resolve()
     output_root = args.output_root.expanduser().resolve()
     json_output = args.json_output.expanduser().resolve()
+    if args.normalize_surfaces and args.sequence_normalize_surfaces:
+        raise ValueError("Use either --normalize-surfaces or --sequence-normalize-surfaces, not both.")
 
     sequence_dirs = find_sequence_dirs(input_root, args.sequence_glob)
+    if args.sequence:
+        wanted = set(args.sequence)
+        sequence_dirs = [path for path in sequence_dirs if path.name in wanted]
+        missing = sorted(wanted - {path.name for path in sequence_dirs})
+        if missing:
+            raise FileNotFoundError(f"Requested sequence(s) not found under {input_root}: {', '.join(missing)}")
     if not sequence_dirs:
         raise FileNotFoundError(f"No synthetic physics sequences found under {input_root}")
 
@@ -502,6 +625,8 @@ def main() -> None:
                 include_parts=args.include_parts,
                 include_static_parts=args.include_static_parts,
                 floor_size=args.floor_size,
+                normalize_surfaces=args.normalize_surfaces,
+                sequence_normalize_surfaces=args.sequence_normalize_surfaces,
             )
             for sequence_dir in tqdm(sequence_dirs, desc="Preprocessing synthetic physics sequences")
         ]
@@ -524,6 +649,8 @@ def main() -> None:
                     args.include_parts,
                     args.include_static_parts,
                     args.floor_size,
+                    args.normalize_surfaces,
+                    args.sequence_normalize_surfaces,
                 )
                 for sequence_dir in sequence_dirs
             ]

@@ -911,7 +911,7 @@ class PartCrafterAttnProcessor:
         return hidden_states
 
 # Combined processor: supports both num_parts (3D spatial) and num_frames (4D temporal)
-class PartFrameCrafterAttnProcessor:
+class PartFrameCrafterAttnProcessor(nn.Module):
     """
     Multi-instance attention processor that supports either spatial grouping by parts or temporal grouping by frames.
     Accepts either `num_parts` or `num_frames` in kwargs (tensor per-object or int). If both are provided, `num_frames`
@@ -923,6 +923,7 @@ class PartFrameCrafterAttnProcessor:
     """
 
     def __init__(self, sequence_parallel_attention: bool = False, sequence_parallel_group=None):
+        super().__init__()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError(
                 "AttnProcessor2_0 requires PyTorch 2.0, to use it, please upgrade PyTorch to 2.0."
@@ -945,6 +946,8 @@ class PartFrameCrafterAttnProcessor:
         sequence_parallel_sharded: bool = False,
         sequence_parallel_replicated_batch: bool = False,
         sequence_parallel_validate_replicated: bool = True,
+        relation_grid_shapes: Optional[List[Tuple[int, int]]] = None,
+        relation_bias_values: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from diffusers.models.embeddings import apply_rotary_emb
 
@@ -987,6 +990,33 @@ class PartFrameCrafterAttnProcessor:
         # Choose grouping cardinality prioritising frames when meaningful, otherwise parts.
         # print("num_frames:", num_frames, "num_parts:", num_parts)
         num_instances = num_frames if num_frames is not None else num_parts
+
+        def _relation_mask(object_index: int, instance_count: int, token_count: int):
+            if relation_bias_values is None:
+                return None
+            if relation_grid_shapes is None or object_index >= len(relation_grid_shapes):
+                raise ValueError("relation_grid_shapes must describe every grouped object")
+            frames, parts = relation_grid_shapes[object_index]
+            if frames * parts != instance_count:
+                raise ValueError(
+                    f"relation grid {frames}x{parts} does not match {instance_count} instances"
+                )
+            if (
+                relation_bias_values.ndim != 2
+                or relation_bias_values.shape[0] != attn.heads
+                or relation_bias_values.shape[1] != 3
+            ):
+                raise ValueError("relation_bias_values must have shape [heads, 3]")
+            frame_ids = torch.arange(frames, device=query.device).repeat_interleave(parts)
+            part_ids = torch.arange(parts, device=query.device).repeat(frames)
+            relation = torch.full(
+                (instance_count, instance_count), 2, device=query.device, dtype=torch.long
+            )
+            relation[part_ids[:, None] == part_ids[None, :]] = 1
+            relation[frame_ids[:, None] == frame_ids[None, :]] = 0
+            relation = relation.repeat_interleave(token_count, 0).repeat_interleave(token_count, 1)
+            values = relation_bias_values.to(device=query.device, dtype=query.dtype)
+            return values[:, relation].unsqueeze(0)
 
         if num_instances is None:
             if use_sequence_parallel:
@@ -1070,7 +1100,7 @@ class PartFrameCrafterAttnProcessor:
         if isinstance(num_instances, torch.Tensor):
             idx = 0
             hidden_states_list = []
-            for n_i in num_instances:
+            for object_index, n_i in enumerate(num_instances):
                 n_i = int(n_i.item())
                 k = key[idx : idx + n_i]
                 v = value[idx : idx + n_i]
@@ -1099,7 +1129,10 @@ class PartFrameCrafterAttnProcessor:
                             attention_mask=attention_mask,
                         )
                     else:
-                        h_s = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+                        relation_mask = _relation_mask(object_index, n_i, q.shape[2] // n_i)
+                        h_s = F.scaled_dot_product_attention(
+                            q, k, v, attn_mask=relation_mask, dropout_p=0.0, is_causal=False
+                        )
                     h_s = h_s.transpose(1, 2).reshape(n_i, -1, attn.heads * head_dim)
                 else:
                     # #### HERE CROSS_ATTN BUG START
@@ -1136,8 +1169,9 @@ class PartFrameCrafterAttnProcessor:
                         attention_mask=attention_mask,
                     )
                 else:
+                    relation_mask = _relation_mask(0, num_instances, query.shape[2] // num_instances)
                     hidden_states = F.scaled_dot_product_attention(
-                        query, key, value, dropout_p=0.0, is_causal=False
+                        query, key, value, attn_mask=relation_mask, dropout_p=0.0, is_causal=False
                     )
                 hidden_states = hidden_states.transpose(1, 2).reshape(
                     batch_size, -1, attn.heads * head_dim

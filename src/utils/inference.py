@@ -266,6 +266,13 @@ def build_pipeline(
         scheduler=RectifiedFlowScheduler.from_pretrained(base_dir, subfolder="scheduler"),
         image_encoder_dinov2_multi=image_encoder_dinov2_multi,
     ).to(device, dtype=dtype)
+
+    # Object-memory attention intentionally executes in FP32 for numerical
+    # stability. DiffusionPipeline.to(dtype=...) recursively casts every
+    # submodule, so restore memory parameters after moving the full pipeline.
+    if bool(getattr(pipe.transformer, "enable_object_memory", False)):
+        pipe.transformer.object_memory.to(device=device, dtype=torch.float32)
+        print("Keeping canonical object-memory parameters in FP32 during inference.")
     
 
     return pipe

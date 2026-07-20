@@ -43,6 +43,27 @@ from ..utils.render_utils import export_renderings, render_sequence_fixed_camera
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
+def resolve_mix_cutoff_steps(
+    cutoff: Union[int, float], total_steps: int, *, legacy_inclusive: bool = False
+) -> int:
+    """Return the number of active mixing steps.
+
+    Floats in [0, 1] are normalized schedule fractions. Integers retain the
+    historical step-index semantics; ``legacy_inclusive`` supports callers
+    that previously used ``step_index > cutoff``.
+    """
+    if total_steps < 0:
+        raise ValueError("total_steps must be non-negative")
+    if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)):
+        raise TypeError("mix cutoff must be an int step index or float fraction")
+    if isinstance(cutoff, float):
+        if not 0.0 <= cutoff <= 1.0:
+            raise ValueError("normalized mix cutoff must be in [0, 1]")
+        return min(total_steps, int(math.ceil(cutoff * total_steps)))
+    active_steps = cutoff + (1 if legacy_inclusive else 0)
+    return max(0, min(total_steps, active_steps))
+
+
 def memory_visibility_from_masks(
     visible_masks,
     amodal_masks=None,
@@ -2834,7 +2855,9 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         num_inference_steps: int = 50,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         first_frame_index: int = 0,
-        scene_mix_cutoff: int = 10,
+        scene_mix_cutoff: Union[int, float] = 10,
+        mesh_dense_depth: int = 8,
+        mesh_hierarchical_depth: int = 9,
     ):
         total_parts = num_static + num_dynamic
         if total_parts == 0:
@@ -2903,7 +2926,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
             scheduler, num_inference_steps, device
         )
 
-        matrix_steps = min(scene_mix_cutoff, len(timesteps_ref))
+        matrix_steps = resolve_mix_cutoff_steps(scene_mix_cutoff, len(timesteps_ref))
         remaining_timesteps = timesteps_ref[matrix_steps:]
 
         num_channels_latents = self.transformer.config.in_channels
@@ -3203,8 +3226,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                         device,
                         dtype=latents_all.dtype,
                         bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                        dense_octree_depth=8,
-                        hierarchical_octree_depth=9,
+                        dense_octree_depth=mesh_dense_depth,
+                        hierarchical_octree_depth=mesh_hierarchical_depth,
                         max_num_expanded_coords=1e8,
                     )
                     mesh = trimesh.Trimesh(
@@ -3374,8 +3397,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                         device,
                         dtype=latents.dtype,
                         bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                        dense_octree_depth=8,
-                        hierarchical_octree_depth=9,
+                        dense_octree_depth=mesh_dense_depth,
+                        hierarchical_octree_depth=mesh_hierarchical_depth,
                         max_num_expanded_coords=1e8,
                     )
                     mesh = trimesh.Trimesh(mesh_v_f[0].astype(np.float32), mesh_v_f[1])
@@ -3419,12 +3442,14 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         history_mode: str,
         prevent_collisions: bool = False,
         dynamic_num_parts: Optional[int] = None,
-        dynamic_mix_cutoff: int = 10,
+        dynamic_mix_cutoff: Union[int, float] = 10,
         dynamic_max_memory_frames: int = 6,
         initial_object_memory: Optional[ObjectMemoryState] = None,
         amodal_masks=None,
         trusted_full_mask_areas=None,
         object_relative_poses: Optional[torch.Tensor] = None,
+        mesh_dense_depth: int = 8,
+        mesh_hierarchical_depth: int = 9,
     ):
 
         foreground_frames_per_object: List[List[PipelineImageInput]] = []
@@ -3617,7 +3642,10 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                     print("Using initial dynamic latents as history for first dynamic block")
 
                 for t_index, t in enumerate(timesteps_block):
-                    cutoff = t_index > dynamic_mix_cutoff
+                    active_mix_steps = resolve_mix_cutoff_steps(
+                        dynamic_mix_cutoff, len(timesteps_block), legacy_inclusive=True
+                    )
+                    cutoff = t_index >= active_mix_steps
 
                     static_embed_slices: List[torch.Tensor] = []
                     if use_initial_history and history_static_embed_first_block is not None:
@@ -3804,8 +3832,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                     device,
                     dtype=static_latents_all.dtype,
                     bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                    dense_octree_depth=8,
-                    hierarchical_octree_depth=9,
+                    dense_octree_depth=mesh_dense_depth,
+                    hierarchical_octree_depth=mesh_hierarchical_depth,
                     max_num_expanded_coords=1e8,
                 )
 
@@ -3827,8 +3855,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                         device,
                         dtype=latents.dtype,
                         bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                        dense_octree_depth=8,
-                        hierarchical_octree_depth=9,
+                        dense_octree_depth=mesh_dense_depth,
+                        hierarchical_octree_depth=mesh_hierarchical_depth,
                         max_num_expanded_coords=1e8,
                     )
 
@@ -3848,7 +3876,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                 static_meshes.append(field_to_mesh(
                     static_field,
                     bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                    octree_depth=9,
+                    octree_depth=mesh_hierarchical_depth,
                     device=device,
                 ))
             static_meshes_per_frame = [static_meshes for _ in range(F)]
@@ -3866,7 +3894,7 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                     frame_static_meshes.append(field_to_mesh(
                         current_field,
                         bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                        octree_depth=9,
+                        octree_depth=mesh_hierarchical_depth,
                         device=device,
                     ))
                 static_meshes.append(frame_static_meshes)
@@ -3879,12 +3907,230 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                 frame_dynamic_meshes.append(field_to_mesh(
                     dynamic_fields[obj_idx][frame],
                     bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
-                    octree_depth=9,
+                    octree_depth=mesh_hierarchical_depth,
                     device=device,
                 ))
             dynamic_meshes_per_frame.append(frame_dynamic_meshes)
 
         return static_meshes_per_frame, dynamic_meshes_per_frame, object_memory
+
+
+    def _run_unified_stage(
+        self,
+        frames: List[PipelineImageInput],
+        masks: Optional[List[PipelineImageInput]],
+        masks_static: Optional[List[PipelineImageInput]],
+        scene_num_parts: int,
+        dynamic_num_parts: int,
+        num_tokens: int,
+        num_inference_steps: int,
+        guidance_scale: float,
+        generator,
+        device: torch.device,
+        dynamic_ar_block_size: int,
+        scene_mix_cutoff: Union[int, float] = 10,
+        dynamic_mix_cutoff: Union[int, float] = 10,
+        prevent_collisions: bool = False,
+        mesh_dense_depth: int = 8,
+        mesh_hierarchical_depth: int = 9,
+    ):
+        """Denoise static and dynamic object latents in one spatio-temporal schedule.
+
+        This is an ablation path for inference-emulation training. It bypasses the
+        previous scene-then-dynamic split and runs the matrix transformer on a
+        [static + dynamic objects] x [frames] latent grid. Static objects are
+        still decoded per frame; downstream rendering/export code can therefore
+        compare whether unified denoising improves temporal consistency or hurts
+        static stability.
+        """
+        if len(frames) == 0:
+            raise ValueError("Unified inference requires at least one frame")
+        if dynamic_num_parts and not masks:
+            raise ValueError("Unified inference with dynamic objects requires masks")
+
+        static_count = int(scene_num_parts or 0)
+        dynamic_count = int(dynamic_num_parts or 0)
+        total_parts = static_count + dynamic_count
+        frame_count = len(frames)
+        if total_parts == 0:
+            return [], [], [], torch.empty(0, device=device), torch.empty(0, device=device), None
+
+        print(
+            "Running unified PartCrafter schedule"
+            f"\n  Static parts: {static_count}"
+            f"\n  Dynamic parts: {dynamic_count}"
+            f"\n  Frames: {frame_count}"
+            f"\n  Scene/spatial mix cutoff: {scene_mix_cutoff}"
+            f"\n  Dynamic/temporal mix cutoff: {dynamic_mix_cutoff}"
+        )
+
+        static_embeds = self.encode_image(frames, device, 1)[0]
+        _, _, embed_tokens, embed_dim = static_embeds.shape if static_embeds.ndim == 4 else (1, frame_count, *static_embeds.shape[-2:])
+        if static_embeds.ndim == 3:
+            static_embeds = static_embeds.unsqueeze(0)
+        static_embeds = static_embeds[0]
+
+        dynamic_embeds = None
+        if dynamic_count > 0:
+            foreground_frames_per_object: List[List[PipelineImageInput]] = []
+            for obj_masks in masks[:dynamic_count]:
+                masked_frames = []
+                for frame_idx, mask in enumerate(obj_masks):
+                    masked_frames.append(_apply_mask(frames[frame_idx], mask, keep_foreground=True, dilation_radius=0))
+                foreground_frames_per_object.append(masked_frames)
+            dynamic_embeds_per_object = [
+                self.encode_image(masked_frames, device, 1, use_multi=False)[0]
+                for masked_frames in foreground_frames_per_object
+            ]
+            dynamic_embeds = torch.cat([emb.unsqueeze(0) for emb in dynamic_embeds_per_object], dim=0)
+            if dynamic_embeds.shape[0] != dynamic_count:
+                dynamic_embeds = dynamic_embeds[:dynamic_count]
+
+        dtype = static_embeds.dtype if dynamic_embeds is None else dynamic_embeds.dtype
+        scheduler = self._clone_scheduler()
+        timesteps_ref, num_inference_steps = retrieve_timesteps(scheduler, num_inference_steps, device)
+        num_channels_latents = self.transformer.config.in_channels
+
+        static_latents = (
+            self.prepare_latents(static_count, num_tokens, num_channels_latents, dtype, device, generator, None)
+            if static_count > 0
+            else torch.empty(0, num_tokens, num_channels_latents, device=device, dtype=dtype)
+        )
+        dynamic_latents = (
+            self.prepare_latents(dynamic_count, num_tokens, num_channels_latents, dtype, device, generator, None)
+            if dynamic_count > 0
+            else torch.empty(0, num_tokens, num_channels_latents, device=device, dtype=dtype)
+        )
+        static_latents = static_latents.unsqueeze(1).repeat(1, frame_count, 1, 1)
+        dynamic_latents = dynamic_latents.unsqueeze(1).repeat(1, frame_count, 1, 1)
+        latents = torch.cat([static_latents, dynamic_latents], dim=0)
+
+        block_size = max(1, int(dynamic_ar_block_size))
+        blocks = [list(range(start, min(start + block_size, frame_count))) for start in range(0, frame_count, block_size)]
+        do_cfg = guidance_scale > 1.0
+        progress_disable = (
+            self._progress_bar_config.get("disable", False)
+            if hasattr(self, "_progress_bar_config")
+            else False
+        )
+        self.set_progress_bar_config(desc="Unified 3D4D Denoising", ncols=125, disable=progress_disable)
+
+        with self.progress_bar(total=len(timesteps_ref) * len(blocks)) as progress_bar:
+            for block_indices in blocks:
+                block_scheduler = self._clone_scheduler()
+                timesteps_block, _ = retrieve_timesteps(block_scheduler, num_inference_steps, device)
+                for t_index, t in enumerate(timesteps_block):
+                    active_spatial_steps = resolve_mix_cutoff_steps(scene_mix_cutoff, len(timesteps_block), legacy_inclusive=True)
+                    active_temporal_steps = resolve_mix_cutoff_steps(dynamic_mix_cutoff, len(timesteps_block), legacy_inclusive=True)
+                    spatial_cutoff = t_index >= active_spatial_steps
+                    temporal_cutoff = t_index >= active_temporal_steps
+
+                    block_latents = latents[:, block_indices].clone()
+                    block_frames = len(block_indices)
+                    _, _, token_count, channel_count = block_latents.shape
+                    _, cond_tokens, cond_dim = static_embeds[block_indices].shape
+
+                    encoder_temporal = torch.zeros(
+                        (total_parts, block_frames, cond_tokens, cond_dim),
+                        device=device,
+                        dtype=dtype,
+                    )
+                    encoder_spatial = torch.zeros_like(encoder_temporal)
+                    if static_count > 0:
+                        static_cond = static_embeds[block_indices].unsqueeze(0).repeat(static_count, 1, 1, 1)
+                        encoder_temporal[:static_count] = static_cond
+                        encoder_spatial[:static_count] = static_cond
+                    if dynamic_count > 0:
+                        dyn_cond = dynamic_embeds[:, block_indices]
+                        encoder_temporal[static_count:] = dyn_cond
+                        if temporal_cutoff:
+                            encoder_spatial[static_count:] = dyn_cond
+                        else:
+                            encoder_spatial[static_count:] = static_embeds[block_indices].unsqueeze(0).repeat(dynamic_count, 1, 1, 1)
+
+                    timestep = t.expand(1)
+                    noise_pred = self.transformer.forward_matrix(
+                        block_latents,
+                        timestep,
+                        encoder_temporal,
+                        encoder_spatial,
+                        static_count=static_count,
+                        dynamic_count=block_frames,
+                        return_dict=False,
+                        cutoff=False,
+                        spatial_cutoff=spatial_cutoff,
+                        temporal_cutoff=temporal_cutoff,
+                    )[0]
+                    if do_cfg:
+                        noise_uncond = self.transformer.forward_matrix(
+                            block_latents,
+                            timestep,
+                            torch.zeros_like(encoder_temporal),
+                            torch.zeros_like(encoder_spatial),
+                            static_count=static_count,
+                            dynamic_count=block_frames,
+                            return_dict=False,
+                            cutoff=False,
+                            spatial_cutoff=spatial_cutoff,
+                            temporal_cutoff=temporal_cutoff,
+                        )[0]
+                        noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
+
+                    flat_latents = block_latents.reshape(total_parts * block_frames, token_count, channel_count)
+                    flat_noise = noise_pred.reshape(total_parts * block_frames, token_count, channel_count)
+                    latents_next = block_scheduler.step(flat_noise, t, flat_latents, return_dict=False)[0]
+                    latents[:, block_indices] = latents_next.reshape(total_parts, block_frames, token_count, channel_count).to(latents.dtype)
+                    progress_bar.update()
+
+        self.vae.set_flash_decoder()
+        static_meshes_per_frame: List[List[trimesh.Trimesh]] = [
+            [None for _ in range(static_count)] for _ in range(frame_count)
+        ]
+        dynamic_meshes_per_frame: List[List[trimesh.Trimesh]] = [
+            [None for _ in range(dynamic_count)] for _ in range(frame_count)
+        ]
+        for obj_idx in tqdm(range(total_parts), desc="Extracting unified fields", disable=progress_disable):
+            for frame_idx in range(frame_count):
+                geometric_func = lambda x, oi=obj_idx, fi=frame_idx: self.vae.decode(
+                    latents[oi, fi].unsqueeze(0), sampled_points=x
+                ).sample
+                field = None
+                try:
+                    field = hierarchical_extract_fields(
+                        geometric_func,
+                        device,
+                        dtype=latents.dtype,
+                        bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
+                        dense_octree_depth=mesh_dense_depth,
+                        hierarchical_octree_depth=mesh_hierarchical_depth,
+                        max_num_expanded_coords=1e8,
+                    )
+                    mesh = field_to_mesh(
+                        field,
+                        bounds=(-1.005, -1.005, -1.005, 1.005, 1.005, 1.005),
+                        octree_depth=mesh_hierarchical_depth,
+                        device=device,
+                    )
+                    if obj_idx < static_count:
+                        static_meshes_per_frame[frame_idx][obj_idx] = mesh
+                    else:
+                        dynamic_meshes_per_frame[frame_idx][obj_idx - static_count] = mesh
+                except Exception as exc:
+                    print(f"Warning: unified field extraction failed for object {obj_idx}, frame {frame_idx}: {exc}")
+                finally:
+                    del field
+                    if torch.cuda.is_available() and torch.device(device).type == "cuda":
+                        torch.cuda.empty_cache()
+
+        scene_meshes = list(static_meshes_per_frame[0]) if static_meshes_per_frame else []
+        return (
+            scene_meshes,
+            static_meshes_per_frame,
+            dynamic_meshes_per_frame,
+            latents[:static_count, 0].contiguous(),
+            latents[static_count:, 0].contiguous(),
+            None,
+        )
 
     def _render_views_around_mesh(
         self,
@@ -4169,11 +4415,16 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         return_dict: bool = True,
         prevent_collisions: bool = False,
         first_frame_index: int = 0,
-        scene_mix_cutoff: int = 10,
-        dynamic_mix_cutoff: int = 10,
+        scene_mix_cutoff: Union[int, float] = 10,
+        dynamic_mix_cutoff: Union[int, float] = 10,
         dynamic_max_memory_frames: int = 6,
+        unified_inference_schedule: bool = False,
+        unified_inference_steps: Optional[int] = None,
+        unified_guidance_scale: Optional[float] = None,
         object_memory: Optional[ObjectMemoryState] = None,
         image_size: Optional[int] = None,
+        mesh_dense_depth: int = 8,
+        mesh_hierarchical_depth: int = 9,
 
     ):
         if len(frames) == 0:
@@ -4187,6 +4438,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
               f"\n  Scene mix cutoff: {scene_mix_cutoff}"
               f"\n  Dynamic mix cutoff: {dynamic_mix_cutoff}"
               f"\n  Dynamic max memory frames: {dynamic_max_memory_frames}"
+              f"\n  Unified inference schedule: {unified_inference_schedule}"
+              f"\n  Mesh extraction depth: {mesh_dense_depth}/{mesh_hierarchical_depth}"
               f"\n  Conditioning image size: "
               f"{self._conditioning_image_size if self._conditioning_image_size is not None else 'feature-extractor default'}"
         )
@@ -4202,6 +4455,56 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
         scene_part_count = scene_num_parts
 
         print(f"Running PartCrafter 3D4D with {scene_part_count} scene parts and {len(frames)} frames"  )
+
+        if unified_inference_schedule:
+            self._set_attention_blocks(sorted(set(scene_attention_ids) | set(dynamic_attention_ids)))
+            (
+                scene_meshes,
+                static_meshes_per_frame,
+                dynamic_meshes_per_frame,
+                static_latents,
+                dynamic_latents,
+                object_memory,
+            ) = self._run_unified_stage(
+                frames,
+                masks,
+                masks_static,
+                scene_part_count or 0,
+                dynamic_num_parts or 0,
+                num_tokens,
+                unified_inference_steps or dynamic_inference_steps,
+                unified_guidance_scale if unified_guidance_scale is not None else guidance_scale_dynamic,
+                generator,
+                device,
+                dynamic_ar_block_size,
+                scene_mix_cutoff=scene_mix_cutoff,
+                dynamic_mix_cutoff=dynamic_mix_cutoff,
+                prevent_collisions=prevent_collisions,
+                mesh_dense_depth=mesh_dense_depth,
+                mesh_hierarchical_depth=mesh_hierarchical_depth,
+            )
+            animation_file = self._render_animation(
+                scene_meshes,
+                static_meshes_per_frame,
+                dynamic_meshes_per_frame,
+                animation_path,
+                animation_fps,
+                insert_rotation_every,
+                render_kwargs,
+                frames,
+            )
+            output = PartCrafter3D4DOutput(
+                scene_meshes=scene_meshes,
+                static_meshes_per_frame=static_meshes_per_frame,
+                dynamic_meshes=dynamic_meshes_per_frame,
+                animation_path=animation_file,
+                scene_latents=static_latents,
+                dynamic_latents=dynamic_latents,
+                object_memory=object_memory,
+            )
+            if not return_dict:
+                return output.scene_meshes, output.dynamic_meshes
+            return output
 
         if scene_part_count != 0:
             self._set_attention_blocks(scene_attention_ids)
@@ -4224,6 +4527,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
                 num_tokens=num_tokens,
                 first_frame_index=first_frame_index,
                 scene_mix_cutoff=scene_mix_cutoff,
+                mesh_dense_depth=mesh_dense_depth,
+                mesh_hierarchical_depth=mesh_hierarchical_depth,
             )
 
             merged_scene = (
@@ -4273,6 +4578,8 @@ class PartCrafter3D4DInferencePipeline(DiffusionPipeline, TransformerDiffusionMi
             amodal_masks=amodal_masks,
             trusted_full_mask_areas=trusted_full_mask_areas,
             object_relative_poses=object_relative_poses,
+            mesh_dense_depth=mesh_dense_depth,
+            mesh_hierarchical_depth=mesh_hierarchical_depth,
         )
         animation_file = self._render_animation(
             scene_meshes,

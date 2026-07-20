@@ -472,6 +472,40 @@ def _temporal_grid_pairs(
     return pairs, triples, valid_objects
 
 
+def build_frame_major_history_mask(
+    num_parts: torch.Tensor,
+    num_frames: torch.Tensor,
+    num_spatial_parts: torch.Tensor,
+    history_frames: torch.Tensor,
+) -> torch.Tensor:
+    """Mark complete prefix frames as history in flattened frame-major grids."""
+    tensors = (num_parts, num_frames, num_spatial_parts, history_frames)
+    if any(tensor.ndim != 1 for tensor in tensors):
+        raise ValueError("history grid metadata must contain one-dimensional tensors")
+    object_count = num_parts.shape[0]
+    if any(tensor.shape[0] != object_count for tensor in tensors[1:]):
+        raise ValueError("history grid metadata must have one entry per object")
+
+    mask = torch.zeros(int(num_parts.sum().item()), device=num_parts.device, dtype=torch.bool)
+    offset = 0
+    for count_t, frames_t, spatial_t, history_t in zip(*tensors):
+        count = int(count_t.item())
+        frames = int(frames_t.item())
+        spatial = int(spatial_t.item())
+        history = int(history_t.item())
+        if frames <= 1 or spatial <= 0 or frames * spatial != count:
+            raise ValueError(
+                f"invalid frame-major grid: count={count}, frames={frames}, spatial_parts={spatial}"
+            )
+        if history < 1 or history >= frames:
+            raise ValueError(
+                f"history_frames must be in [1, {frames - 1}], got {history}"
+            )
+        mask[offset : offset + history * spatial] = True
+        offset += count
+    return mask
+
+
 def _sample_bbox_aligned_surface_queries(
     source_surfaces: torch.Tensor,
     target_surfaces: torch.Tensor,
@@ -1738,7 +1772,14 @@ def main():
     enable_camera_time_conditioning = configs["model"]["transformer"].get("enable_camera_time_conditioning", False)
     camera_condition_dim = int(configs["model"]["transformer"].get("camera_condition_dim", 25))
     physics_condition_dim = int(configs["model"]["transformer"].get("physics_condition_dim", 8))
-    mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "current"))
+    mixing_mode = str(configs["model"]["transformer"].get("mixing_mode", "inference_emulation"))
+    explicit_axial_roles_cfg = configs["model"]["transformer"].get("explicit_axial_roles", None)
+    explicit_axial_roles = None
+    if explicit_axial_roles_cfg is not None:
+        explicit_axial_roles = {
+            role: [int(layer) for layer in layers]
+            for role, layers in dict(explicit_axial_roles_cfg).items()
+        }
     enable_object_memory = bool(configs["model"]["transformer"].get("enable_object_memory", False))
     object_memory_block_ids = configs["model"]["transformer"].get("object_memory_block_ids", None)
     if object_memory_block_ids is not None:
@@ -1747,6 +1788,14 @@ def main():
     enable_object_pose_prediction = bool(configs["model"]["transformer"].get("enable_object_pose_prediction", False))
     object_pose_hidden_dim = configs["model"]["transformer"].get("object_pose_hidden_dim", None)
     object_memory_model_kwargs = {
+        "enable_training_inference_state_emulation": bool(
+            configs["model"]["transformer"].get(
+                "enable_training_inference_state_emulation", False
+            )
+        ),
+        "enable_joint_relation_bias": bool(
+            configs["model"]["transformer"].get("enable_joint_relation_bias", False)
+        ),
         "enable_object_memory": enable_object_memory,
         "object_memory_block_ids": object_memory_block_ids,
         "object_memory_num_heads": object_memory_num_heads,
@@ -1801,6 +1850,12 @@ def main():
         spatial_global_attn_block_ids = fallback_global_ids or []
     if temporal_global_attn_block_ids is None:
         temporal_global_attn_block_ids = fallback_global_ids or []
+    if explicit_axial_roles is not None:
+        unknown_roles = set(explicit_axial_roles) - {"spatial", "temporal"}
+        if unknown_roles:
+            raise ValueError(f"Unknown explicit axial roles: {sorted(unknown_roles)}")
+        spatial_global_attn_block_ids = list(explicit_axial_roles.get("spatial", []))
+        temporal_global_attn_block_ids = list(explicit_axial_roles.get("temporal", []))
     transformer_init_source = "unknown"
     if args.from_scratch:
         transformer_init_source = (
@@ -1830,6 +1885,7 @@ def main():
             global_attn_block_ids=spatial_global_attn_block_ids,
             spatial_global_attn_block_ids=spatial_global_attn_block_ids,
             temporal_global_attn_block_ids=temporal_global_attn_block_ids,
+            explicit_axial_roles=explicit_axial_roles,
             global_attn_block_id_range=None,
             mixing_mode=mixing_mode,
             **object_memory_model_kwargs,
@@ -1872,6 +1928,9 @@ def main():
                 enable_local_cross_attn=enable_local_cross_attn,
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
+                spatial_global_attn_block_ids=spatial_global_attn_block_ids,
+                temporal_global_attn_block_ids=temporal_global_attn_block_ids,
+                explicit_axial_roles=explicit_axial_roles,
                 global_attn_block_id_range=None,
                 mixing_mode=mixing_mode,
                 **object_memory_model_kwargs,
@@ -1908,6 +1967,9 @@ def main():
                 enable_local_cross_attn=enable_local_cross_attn,
                 enable_global_cross_attn=enable_global_cross_attn,
                 global_attn_block_ids=spatial_global_attn_block_ids,
+                spatial_global_attn_block_ids=spatial_global_attn_block_ids,
+                temporal_global_attn_block_ids=temporal_global_attn_block_ids,
+                explicit_axial_roles=explicit_axial_roles,
                 global_attn_block_id_range=None,
                 mixing_mode=mixing_mode,
                 **object_memory_model_kwargs,
@@ -1944,6 +2006,9 @@ def main():
             enable_local_cross_attn=enable_local_cross_attn,
             enable_global_cross_attn=enable_global_cross_attn,
             global_attn_block_ids=spatial_global_attn_block_ids,
+            spatial_global_attn_block_ids=spatial_global_attn_block_ids,
+            temporal_global_attn_block_ids=temporal_global_attn_block_ids,
+            explicit_axial_roles=explicit_axial_roles,
             global_attn_block_id_range=None,
             mixing_mode=mixing_mode,
             **object_memory_model_kwargs,
@@ -2321,6 +2386,9 @@ def main():
                             enable_local_cross_attn=enable_local_cross_attn,
                             enable_global_cross_attn=enable_global_cross_attn,
                             global_attn_block_ids=spatial_global_attn_block_ids,
+                            spatial_global_attn_block_ids=spatial_global_attn_block_ids,
+                            temporal_global_attn_block_ids=temporal_global_attn_block_ids,
+                            explicit_axial_roles=explicit_axial_roles,
                             global_attn_block_id_range=None,
                             mixing_mode=mixing_mode,
                             **object_memory_model_kwargs,
@@ -2610,6 +2678,20 @@ def main():
     df_context_mode = configs["train"].get("df_context_mode", "prefix_k")  # ["prefix_k", "bernoulli_p"]
     df_context_k = int(configs["train"].get("df_context_k", 1))              # used if prefix_k
     df_context_p = float(configs["train"].get("df_context_p", 0.5))          # used if bernoulli_p (prob a token is HISTORY)
+
+    history_state_cfg = configs["train"].get("history_state_emulation", {}) or {}
+    history_state_enabled = bool(history_state_cfg.get(
+        "enabled",
+        configs["model"]["transformer"].get("enable_training_inference_state_emulation", False),
+    ))
+    history_state_modes = set(history_state_cfg.get("modes", ["physics"]))
+    history_state_probability = float(history_state_cfg.get("probability", 1.0))
+    history_state_min_frames = max(1, int(history_state_cfg.get("min_history_frames", 1)))
+    history_state_max_frames = history_state_cfg.get("max_history_frames", None)
+    if history_state_enabled and df_enabled:
+        raise ValueError(
+            "history_state_emulation and df_enabled are mutually exclusive context strategies"
+        )
 
     memory_training_cfg = configs["train"].get("object_memory", {}) or {}
     memory_training_modes = set(memory_training_cfg.get("modes", ["4d", "physics"]))
@@ -3067,6 +3149,37 @@ def main():
                 timesteps = timesteps.repeat_interleave(num_parts) # [N, ]
                 context_mask = None
 
+            history_state_active = (
+                history_state_enabled
+                and mode in history_state_modes
+                and "num_frames" in batch
+                and "num_spatial_parts" in batch
+            )
+            if history_state_active:
+                activation = torch.rand(1, device=accelerator.device)
+                activation = _replicate_tensor_from_main_process(
+                    activation, active=sequence_parallel_active
+                )
+                history_state_active = bool(activation.item() < history_state_probability)
+            if history_state_active:
+                frame_counts = batch["num_frames"].to(accelerator.device, dtype=torch.long)
+                spatial_counts = batch["num_spatial_parts"].to(accelerator.device, dtype=torch.long)
+                history_counts = []
+                for frame_count_t in frame_counts:
+                    frame_count = int(frame_count_t.item())
+                    upper = frame_count - 1
+                    if history_state_max_frames is not None:
+                        upper = min(upper, int(history_state_max_frames))
+                    lower = min(history_state_min_frames, upper)
+                    history_counts.append(torch.randint(lower, upper + 1, (1,), device=accelerator.device))
+                history_counts = torch.cat(history_counts)
+                context_mask = build_frame_major_history_mask(
+                    num_parts, frame_counts, spatial_counts, history_counts
+                )
+                context_mask = _replicate_tensor_from_main_process(
+                    context_mask, active=sequence_parallel_active
+                )
+
             # When force_fp32 is enabled, compute sigmas/noisy-latents/target in fp32
             # to avoid fp16 overflow (e.g. 1/sigma → Inf at small sigma values)
             if force_fp32:
@@ -3080,6 +3193,11 @@ def main():
             trace_sequence_parallel_event("train.after_timesteps_broadcast", timesteps, active=sequence_parallel_active)
             sigmas = get_sigmas(timesteps, len(latents.shape), torch.float32 if force_fp32 else weight_dtype)
             noisy_latents = (1. - sigmas) * latents + sigmas * noise
+            if history_state_active:
+                # Match autoregressive inference: prior-frame predictions are
+                # clean latent states, but use the current denoising timestep.
+                noisy_latents = noisy_latents.clone()
+                noisy_latents[context_mask] = latents[context_mask]
             latent_model_input = noisy_latents.to(weight_dtype)
             trace_sequence_parallel_event("train.before_latent_model_input_broadcast", latent_model_input, active=sequence_parallel_active)
             latent_model_input = _replicate_tensor_from_main_process(latent_model_input, active=sequence_parallel_active)
@@ -3474,7 +3592,7 @@ def main():
                 if len(all_pairs) > 0:
                     consistency_loss = torch.cat(all_pairs, dim=0).mean()
 
-            if df_enabled and context_mask is not None:
+            if context_mask is not None:
                 # target-only reduction for diffusion loss
                 target_mask = (~context_mask).to(diff_loss.dtype)
                 denom = target_mask.sum().clamp_min(1.0)

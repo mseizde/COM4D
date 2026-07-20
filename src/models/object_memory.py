@@ -428,17 +428,20 @@ class CanonicalObjectMemory(nn.Module):
                confidence: Optional[torch.Tensor] = None,
                relative_pose: Optional[torch.Tensor] = None) -> Tuple[ObjectMemoryState, torch.Tensor]:
         self._validate(evidence, memory)
-        visible = self._scalar(visibility, evidence, "visibility").clamp(0, 1)
+        # Inference keeps this module in FP32 while VAE evidence remains FP16.
+        working_dtype = next(self.parameters()).dtype
+        evidence_work = evidence.to(dtype=working_dtype)
+        visible = self._scalar(visibility, evidence_work, "visibility").clamp(0, 1)
         reliable = torch.ones_like(visible) if confidence is None else self._scalar(
-            confidence, evidence, "confidence").clamp(0, 1)
+            confidence, evidence_work, "confidence").clamp(0, 1)
         reliability = visible * reliable
-        projected = self.evidence_projection(evidence.mean(-2))
+        projected = self.evidence_projection(evidence_work.mean(-2))
         if relative_pose is not None:
-            pose = self._pose(relative_pose, evidence)
+            pose = self._pose(relative_pose, evidence_work)
             projected = projected + self.pose_conditioner(pose.float()).to(projected.dtype)
         pooled = ((projected * reliability[..., None]).sum(1)
                   / reliability.sum(1).clamp_min(1e-8)[..., None])
-        old = memory.tokens
+        old = memory.tokens.to(dtype=working_dtype)
         expanded = pooled.unsqueeze(-2).expand_as(old)
         candidate = self.write_cell(expanded.reshape(-1, self.channels),
                                     old.reshape(-1, self.channels)).reshape_as(old)
@@ -446,8 +449,9 @@ class CanonicalObjectMemory(nn.Module):
         gate = gate * reliability.amax(1)[..., None, None]
         tokens = old + gate * (candidate - old)
         max_reliability = reliability.amax(1)
-        accumulated = 1 - (1 - memory.confidence.clamp(0, 1)) * (1 - max_reliability)
-        accumulated = torch.where(max_reliability > 0, accumulated, memory.confidence)
+        old_confidence = memory.confidence.to(dtype=max_reliability.dtype)
+        accumulated = 1 - (1 - old_confidence.clamp(0, 1)) * (1 - max_reliability)
+        accumulated = torch.where(max_reliability > 0, accumulated, old_confidence)
         return ObjectMemoryState(tokens, accumulated), gate
 
     def forward(self, frame_state: torch.Tensor, memory: ObjectMemoryState, *,

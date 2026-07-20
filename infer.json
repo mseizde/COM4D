@@ -374,6 +374,118 @@
         "dynamic_max_memory_frames": 8,
         "scene_mix_cutoff": 50,
         "dynamic_mix_cutoff": 20
+    },
+
+    "inf_em_physics_mix_two": {
+        "tag": "inf_em_physics_mix_two",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/mix_inference_emulation_from500_seed123/checkpoints/000500",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "inf_em_physics_sing_two": {
+        "tag": "inf_em_physics_sing_two",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/humoto_only_physics_inference_emulation_from500_seed123/checkpoints/000500",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "inf_em_physics_mix_one": {
+        "tag": "inf_em_physics_mix_one",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/mix_inference_emulation_from500_seed123/checkpoints/000500",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20,
+        "unified_inference_schedule": true
+    },
+
+    "inf_em_physics_sing_one": {
+        "tag": "inf_em_physics_sing_one",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/humoto_only_physics_inference_emulation_from500_seed123/checkpoints/000500",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20,
+        "unified_inference_schedule": true
+    },
+
+    "full_train_test": {
+        "tag": "full_train_test",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/mix_infemu_from500_phys50_10k_seqnorm32768_clean_bs16/checkpoints/010000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20
+    },
+
+    "full_train_cfg5": {
+        "tag": "full_train_cfg5",
+        "data_dir": "assets/teaser",
+        "transformer_dir": "/data/mseizde/com4d/outputs/ckpts/mix_infemu_from500_phys50_10k_seqnorm32768_clean_bs16/checkpoints/010000",
+        "num_tokens": 1024,
+        "first_frame_idx": 5,
+        "frames_start_idx": 0,
+        "frames_end_idx": 100,
+        "frame_stride": 2,
+        "scene_num_parts": 4,
+        "dynamic_num_parts": 2,
+        "scene_block_size": 16,
+        "dynamic_ar_block_size": 6,
+        "dynamic_max_memory_frames": 8,
+        "scene_mix_cutoff": 50,
+        "dynamic_mix_cutoff": 20,
+        "scene_guidance": 5.0,
+        "dynamic_guidance": 5.0
     }
 
 }

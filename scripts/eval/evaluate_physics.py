@@ -84,6 +84,14 @@ def frame_index(path: Path) -> int:
     return int(match.group(1))
 
 
+def path_has_mesh_geometry(path: Path) -> bool:
+    try:
+        scene_to_single_mesh(load_mesh_or_scene(path))
+    except Exception:
+        return False
+    return True
+
+
 def dynamic_object_paths(inference_dir: Path) -> dict[str, list[Path]]:
     dynamic_dir = inference_dir / "dynamic"
     tracks: dict[str, list[Path]] = {}
@@ -91,7 +99,11 @@ def dynamic_object_paths(inference_dir: Path) -> dict[str, list[Path]]:
         return tracks
     for obj_dir in sorted(dynamic_dir.glob("object_*")):
         if obj_dir.is_dir():
-            frames = sorted(obj_dir.glob("frame_*.glb"), key=frame_index)
+            frames = [
+                path
+                for path in sorted(obj_dir.glob("frame_*.glb"), key=frame_index)
+                if path_has_mesh_geometry(path)
+            ]
             if frames:
                 tracks[obj_dir.name] = frames
     return tracks

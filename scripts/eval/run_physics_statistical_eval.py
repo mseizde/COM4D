@@ -40,6 +40,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import trimesh
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROJECT_ROOT = REPO_ROOT.parent
@@ -123,6 +125,16 @@ PHYSICS_SUMMARY_FIELDS = BASIC_PHYSICS_SUMMARY_FIELDS + TRAJECTORY_PHYSICS_SUMMA
 INCLUDE_BASIC_PHYSICS_SUMMARY = True
 
 
+def parse_mix_cutoff(value: str):
+    value = value.strip()
+    if any(marker in value.lower() for marker in (".", "e")):
+        parsed = float(value)
+        if not 0.0 <= parsed <= 1.0:
+            raise argparse.ArgumentTypeError("fractional cutoff must be in [0, 1]")
+        return parsed
+    return int(value)
+
+
 def parse_model(raw: str) -> tuple[str, Path]:
     if "=" not in raw:
         raise argparse.ArgumentTypeError("models must be TAG=TRANSFORMER_PATH")
@@ -192,12 +204,56 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dynamic-ar-block-size", type=int, default=4)
     ap.add_argument("--dynamic-max-memory-frames", type=int, default=8)
     ap.add_argument(
+        "--mesh-dense-depth",
+        type=int,
+        default=8,
+        help="Forwarded to inference_com4d.py --mesh_dense_depth; use 7 with --mesh-hierarchical-depth 8 to match vae_gt_oracle_norm.",
+    )
+    ap.add_argument(
+        "--mesh-hierarchical-depth",
+        type=int,
+        default=9,
+        help="Forwarded to inference_com4d.py --mesh_hierarchical_depth; use 8 with --mesh-dense-depth 7 to match vae_gt_oracle_norm.",
+    )
+    ap.add_argument(
+        "--scene-mix-cutoff",
+        "--scene_mix_cutoff",
+        dest="scene_mix_cutoff",
+        type=parse_mix_cutoff,
+        default=None,
+        help="Forwarded to inference_com4d.py --scene_mix_cutoff; accepts integer steps or a fraction in [0, 1].",
+    )
+    ap.add_argument(
         "--dynamic-mix-cutoff",
         "--dynamic_mix_cutoff",
         dest="dynamic_mix_cutoff",
+        type=parse_mix_cutoff,
+        default=None,
+        help="Forwarded to inference_com4d.py --dynamic_mix_cutoff; accepts integer steps or a fraction in [0, 1].",
+    )
+    ap.add_argument(
+        "--unified-inference-schedule",
+        "--unified_inference_schedule",
+        dest="unified_inference_schedule",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Forward --unified_inference_schedule to inference_com4d.py.",
+    )
+    ap.add_argument(
+        "--unified-steps",
+        "--unified_steps",
+        dest="unified_steps",
         type=int,
         default=None,
-        help="Forwarded to inference_com4d.py --dynamic_mix_cutoff; e.g. 49 keeps dynamic mixing active for 50 denoising steps.",
+        help="Forwarded to inference_com4d.py --unified_steps.",
+    )
+    ap.add_argument(
+        "--unified-guidance",
+        "--unified_guidance",
+        dest="unified_guidance",
+        type=float,
+        default=None,
+        help="Forwarded to inference_com4d.py --unified_guidance.",
     )
     ap.add_argument("--image-size", type=int, default=518)
     ap.add_argument("--device", default="cuda")
@@ -243,6 +299,12 @@ def parse_args() -> argparse.Namespace:
         choices=("fixed", "best"),
         default="best",
         help="Object matching mode for reconstruction metrics.",
+    )
+    ap.add_argument(
+        "--recon-com-method",
+        choices=("vertex_centroid", "volume_center_mass", "bbox_center"),
+        default=None,
+        help="COM method forwarded to reconstruction translation/similarity alignment. Defaults to --physics-com-method.",
     )
     ap.add_argument(
         "--recon-iou-num-grids",
@@ -586,6 +648,10 @@ def run_inference(
         args.dynamic_ar_block_size,
         "--dynamic_max_memory_frames",
         args.dynamic_max_memory_frames,
+        "--mesh_dense_depth",
+        args.mesh_dense_depth,
+        "--mesh_hierarchical_depth",
+        args.mesh_hierarchical_depth,
         "--object_only_condition",
         "--image_size",
         args.image_size,
@@ -596,8 +662,16 @@ def run_inference(
         "--no-render_predicted_room",
         "--no-room_augment_animations",
     ]
+    if args.scene_mix_cutoff is not None:
+        cmd.extend(["--scene_mix_cutoff", args.scene_mix_cutoff])
     if args.dynamic_mix_cutoff is not None:
         cmd.extend(["--dynamic_mix_cutoff", args.dynamic_mix_cutoff])
+    if args.unified_inference_schedule:
+        cmd.append("--unified_inference_schedule")
+    if args.unified_steps is not None:
+        cmd.extend(["--unified_steps", args.unified_steps])
+    if args.unified_guidance is not None:
+        cmd.extend(["--unified_guidance", args.unified_guidance])
     if args.render_animations:
         cmd.append("--animation")
     run(
@@ -625,6 +699,34 @@ def prediction_glb_stats(pred_dir: Path) -> dict[str, Any]:
     largest_idx = max(range(len(paths)), key=lambda idx: paths[idx].stat().st_size) if paths else None
     largest_path = str(paths[largest_idx]) if largest_idx is not None else ""
     largest_size = sizes[largest_idx] if largest_idx is not None else 0
+    nonempty_glbs = 0
+    total_geometries = 0
+    total_vertices = 0
+    geometry_errors: list[str] = []
+    for path in paths:
+        if not path.is_file():
+            continue
+        try:
+            loaded = trimesh.load(str(path), process=False)
+            if isinstance(loaded, trimesh.Trimesh):
+                meshes = [loaded]
+            elif isinstance(loaded, trimesh.Scene):
+                meshes = [
+                    mesh
+                    for mesh in loaded.dump(concatenate=False)
+                    if isinstance(mesh, trimesh.Trimesh)
+                ]
+            else:
+                meshes = []
+            geometry_count = sum(1 for mesh in meshes if len(mesh.vertices) > 0)
+            vertex_count = sum(len(mesh.vertices) for mesh in meshes if len(mesh.vertices) > 0)
+            if geometry_count:
+                nonempty_glbs += 1
+                total_geometries += geometry_count
+                total_vertices += vertex_count
+        except Exception as exc:
+            if len(geometry_errors) < 5:
+                geometry_errors.append(f"{path}: {exc}")
     return {
         "num_pred_glbs": len(sizes),
         "max_pred_glb_bytes": largest_size,
@@ -632,10 +734,18 @@ def prediction_glb_stats(pred_dir: Path) -> dict[str, Any]:
         "max_pred_glb_path": largest_path,
         "total_pred_glb_bytes": sum(sizes),
         "total_pred_glb_gib": sum(sizes) / (1024 * 1024 * 1024),
+        "num_nonempty_pred_glbs": nonempty_glbs,
+        "total_pred_geometries": total_geometries,
+        "total_pred_vertices": total_vertices,
+        "pred_geometry_errors": geometry_errors,
     }
 
 
 def reconstruction_skip_reason(args: argparse.Namespace, stats: dict[str, Any]) -> str | None:
+    if int(stats.get("num_pred_glbs", 0) or 0) == 0:
+        return "no predicted GLB files were written"
+    if int(stats.get("num_nonempty_pred_glbs", 0) or 0) == 0:
+        return "all predicted GLB files contain zero mesh geometry"
     max_mib = float(getattr(args, "max_recon_glb_mb", 0.0) or 0.0)
     if max_mib > 0.0 and float(stats.get("max_pred_glb_mib", 0.0)) > max_mib:
         return (
@@ -688,6 +798,37 @@ def write_skipped_reconstruction_metrics(
     print(f"[warn] skipped reconstruction metrics for {pred_dir}: {reason}", flush=True)
 
 
+def write_skipped_physics_metrics(
+    physics_dir: Path,
+    pred_dir: Path,
+    metadata: Path,
+    args: argparse.Namespace,
+    stats: dict[str, Any],
+    reason: str,
+) -> None:
+    summary: dict[str, Any] = {
+        "inference_dir": str(pred_dir),
+        "metadata": str(metadata),
+        "num_objects": 0,
+        "num_object_frames": 0,
+        "num_pair_frames": 0,
+        "com_method": args.physics_com_method,
+        "physics_skipped": True,
+        "physics_skip_reason": reason,
+    }
+    summary.update(stats)
+    for field in PHYSICS_SUMMARY_FIELDS:
+        summary.setdefault(field, float("nan"))
+    physics_dir.mkdir(parents=True, exist_ok=True)
+    with (physics_dir / "metrics.json").open("w") as f:
+        json.dump({"summary": summary, "objects": [], "pairs": [], "trajectories": []}, f, indent=2, allow_nan=True)
+    (physics_dir / "object_metrics.csv").write_text("")
+    (physics_dir / "pair_metrics.csv").write_text("")
+    (physics_dir / "trajectory_metrics.csv").write_text("")
+    write_csv(physics_dir / "summary.csv", [summary])
+    print(f"[warn] skipped physics metrics for {pred_dir}: {reason}", flush=True)
+
+
 def physics_metrics_stale(physics_json: Path) -> bool:
     if not physics_json.is_file():
         return True
@@ -710,9 +851,9 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
     physics_dir = metrics_dir / sample / model_tag / "physics"
     recon_json = recon_dir / "metrics.json"
     physics_json = physics_dir / "metrics.json"
+    glb_stats = prediction_glb_stats(pred_dir)
+    skip_reason = reconstruction_skip_reason(args, glb_stats)
     if args.force_metrics or not args.skip_existing_metrics or args.force or not recon_json.is_file():
-        glb_stats = prediction_glb_stats(pred_dir)
-        skip_reason = reconstruction_skip_reason(args, glb_stats)
         if skip_reason is not None:
             if args.dry_run:
                 print(f"[dry-run] would skip reconstruction metrics for {pred_dir}: {skip_reason}", flush=True)
@@ -732,6 +873,8 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
                 args.recon_alignment,
                 "--object-assignment",
                 args.recon_object_assignment,
+                "--com-method",
+                args.recon_com_method or args.physics_com_method,
                 "--iou-num-grids",
                 args.recon_iou_num_grids,
                 *(["--skip-object-level"] if args.recon_skip_object_level else []),
@@ -745,22 +888,28 @@ def evaluate_run(args: argparse.Namespace, sample: str, model_tag: str, pred_dir
                 reason = f"reconstruction evaluator exceeded {args.reconstruction_timeout_seconds:.1f} seconds"
                 write_skipped_reconstruction_metrics(recon_dir, pred_dir, raw_dir, args, glb_stats, reason)
     if args.force_metrics or not args.skip_existing_metrics or args.force or physics_metrics_stale(physics_json):
-        run(
-            [
-                sys.executable,
-                EVALUATE_PHYSICS,
-                "--inference-dir",
-                pred_dir,
-                "--metadata",
-                raw_dir / "physics_metadata.json",
-                "--output-dir",
-                physics_dir,
-                "--com-method",
-                args.physics_com_method,
-                *( ["--skip-basic-physics-summary"] if args.skip_basic_physics_summary else [] ),
-            ],
-            dry_run=args.dry_run,
-        )
+        if skip_reason is not None:
+            if args.dry_run:
+                print(f"[dry-run] would skip physics metrics for {pred_dir}: {skip_reason}", flush=True)
+            else:
+                write_skipped_physics_metrics(physics_dir, pred_dir, raw_dir / "physics_metadata.json", args, glb_stats, skip_reason)
+        else:
+            run(
+                [
+                    sys.executable,
+                    EVALUATE_PHYSICS,
+                    "--inference-dir",
+                    pred_dir,
+                    "--metadata",
+                    raw_dir / "physics_metadata.json",
+                    "--output-dir",
+                    physics_dir,
+                    "--com-method",
+                    args.physics_com_method,
+                    *( ["--skip-basic-physics-summary"] if args.skip_basic_physics_summary else [] ),
+                ],
+                dry_run=args.dry_run,
+            )
     if args.dry_run:
         return {}, {}, []
     recon = read_json(recon_json)
@@ -815,7 +964,54 @@ def render_statistical_diagnostic_gifs(
     if not metadata.is_file():
         print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: missing {metadata}", flush=True)
         return
+    try:
+        recon_payload = read_json(recon_json)
+    except Exception as exc:
+        print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: could not read {recon_json}: {exc}", flush=True)
+        return
+    recon_summary = recon_payload.get("summary", {})
+    if isinstance(recon_summary, dict) and recon_summary.get("reconstruction_skipped"):
+        reason = recon_summary.get("reconstruction_skip_reason", "reconstruction metrics were skipped")
+        print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: {reason}", flush=True)
+        return
+    try:
+        metadata_payload = read_json(metadata)
+    except Exception as exc:
+        print(f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: could not read {metadata}: {exc}", flush=True)
+        return
+    camera_payload = metadata_payload.get("camera", metadata_payload)
+    if not isinstance(camera_payload, dict) or "camera_to_world" not in camera_payload:
+        print(
+            f"[warn] skipping diagnostic GIFs for {sample}/{model_tag}: "
+            f"{metadata} has no camera_to_world calibration",
+            flush=True,
+        )
+        return
     frames_dir = args.frames_dir if args.frames_dir is not None else input_dir / "frames"
+    frames_dir = frames_dir.expanduser().resolve()
+    provenance_path = pred_dir / "diagnostic_gif_source.json"
+    expected_provenance = {
+        "sample": sample,
+        "model_tag": model_tag,
+        "source_frames_dir": str(frames_dir),
+        "metadata": str(metadata.expanduser().resolve()),
+        "alignment_metadata": str(recon_json.expanduser().resolve()),
+    }
+    force_gif_overwrite = bool(args.force_diagnostic_gifs or args.force)
+    if not force_gif_overwrite:
+        try:
+            existing_provenance = read_json(provenance_path) if provenance_path.is_file() else None
+        except Exception as exc:
+            print(f"[warn] could not read {provenance_path}; refreshing diagnostic GIFs: {exc}", flush=True)
+            existing_provenance = None
+        if existing_provenance != expected_provenance:
+            force_gif_overwrite = True
+            reason = "missing provenance" if existing_provenance is None else "source provenance changed"
+            print(
+                f"[info] refreshing diagnostic GIFs for {sample}/{model_tag}: {reason}; "
+                f"source={frames_dir}",
+                flush=True,
+            )
     cmd = [
         sys.executable,
         RENDER_PREDICTION_GIFS,
@@ -841,9 +1037,19 @@ def render_statistical_diagnostic_gifs(
     ]
     if args.diagnostic_gif_fps and args.diagnostic_gif_fps > 0:
         cmd.extend(["--fps", args.diagnostic_gif_fps])
-    if args.force_diagnostic_gifs or args.force:
+    if force_gif_overwrite:
         cmd.append("--overwrite")
-    run(cmd, dry_run=args.dry_run)
+    try:
+        run(cmd, dry_run=args.dry_run)
+        if not args.dry_run:
+            with open(provenance_path, "w") as f:
+                json.dump(expected_provenance, f, indent=2, sort_keys=True)
+    except subprocess.CalledProcessError as exc:
+        print(
+            f"[warn] diagnostic GIF rendering failed for {sample}/{model_tag}; "
+            f"metrics were still written. Command exited with {exc.returncode}.",
+            flush=True,
+        )
 
 
 def existing_metric_row(args: argparse.Namespace, sample: str, model_tag: str, transformer: Path | None, dataset_root: Path, eval_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
@@ -1523,6 +1729,12 @@ def main() -> None:
         add_or_replace_model(tag, resolve_transformer(path))
     for tag, path in args.extra_model or []:
         add_or_replace_model(tag, resolve_transformer(path))
+    singlepass_tags = [tag for tag, _ in models if "singlepass" in tag.lower()]
+    if singlepass_tags and not args.unified_inference_schedule and not args.only_aggregate:
+        raise SystemExit(
+            "Model tag(s) look like single-pass runs but --unified-inference-schedule was not enabled: "
+            + ", ".join(singlepass_tags)
+        )
     if args.quick:
         mode = "metrics on quick subset" if args.quick_metrics else "inference-only visual inspection"
         print(f"Quick mode: {mode}; parallel_workers={args.parallel_workers}", flush=True)
@@ -1553,6 +1765,8 @@ def main() -> None:
         jobs = []
         gpu_ids = [gpu.strip() for gpu in args.gpu_ids.split(",") if gpu.strip()] if args.gpu_ids else []
         for sample in samples:
+            current_raw_dir = dataset_root / "gt_raw" / sample
+            current_input_dir = dataset_root / "inference_input" / sample
             for model_idx, (model_tag, transformer) in enumerate(models):
                 existing = None if args.force else existing_metric_row(args, sample, model_tag, transformer, dataset_root, eval_root)
                 if existing is not None and (args.skip_existing_metrics or args.reuse_predictions) and not args.force_metrics:
@@ -1564,8 +1778,8 @@ def main() -> None:
                             sample,
                             model_tag,
                             Path(str(pred_dir_value)),
-                            raw_dir,
-                            input_dir,
+                            current_raw_dir,
+                            current_input_dir,
                             eval_root / "metrics",
                         )
                     model_rows.append(row)

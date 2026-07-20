@@ -80,6 +80,15 @@ def parse_args() -> argparse.Namespace:
         help="Match object tracks by ID or by lowest sequence-level center distance.",
     )
     ap.add_argument(
+        "--com-method",
+        choices=("vertex_centroid", "volume_center_mass", "bbox_center"),
+        default="vertex_centroid",
+        help=(
+            "Predicted/GT mesh center proxy for translation/similarity alignment and best object assignment. "
+            "Matches evaluate_physics.py; bbox_center is retained for old behavior."
+        ),
+    )
+    ap.add_argument(
         "--alignment-samples-per-frame",
         type=int,
         default=1024,
@@ -121,6 +130,21 @@ def frame_index(path: Path) -> int | None:
     return None
 
 
+def path_has_mesh_geometry(path: Path) -> bool:
+    try:
+        loaded = load_mesh_or_scene(path)
+        if isinstance(loaded, trimesh.Trimesh):
+            return len(loaded.vertices) > 0
+        if isinstance(loaded, trimesh.Scene):
+            return any(
+                isinstance(mesh, trimesh.Trimesh) and len(mesh.vertices) > 0
+                for mesh in loaded.dump(concatenate=False)
+            )
+    except Exception:
+        return False
+    return False
+
+
 def dynamic_object_paths(root: Path) -> dict[str, dict[int, Path]]:
     dynamic_dir = root / "dynamic"
     tracks: dict[str, dict[int, Path]] = {}
@@ -132,7 +156,7 @@ def dynamic_object_paths(root: Path) -> dict[str, dict[int, Path]]:
         frame_map = {}
         for path in sorted(obj_dir.glob("frame_*.glb")):
             idx = frame_index(path)
-            if idx is not None:
+            if idx is not None and path_has_mesh_geometry(path):
                 frame_map[idx] = path
         if frame_map:
             tracks[obj_dir.name] = frame_map
@@ -191,13 +215,43 @@ def metadata_gt_tracks(root: Path) -> dict[str, dict[int, tuple[Path, Path, str]
     return {object_id: frames for object_id, frames in tracks.items() if frames}
 
 
+def metadata_gt_position_tracks(root: Path) -> dict[str, dict[int, np.ndarray]]:
+    metadata_path = root / "physics_metadata.json"
+    if not metadata_path.is_file():
+        return {}
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    object_names = dynamic_metadata_names(root)
+    if not object_names:
+        return {}
+    tracks: dict[str, dict[int, np.ndarray]] = {f"object_{idx:03d}": {} for idx, _name in enumerate(object_names)}
+    frames = metadata.get("frames")
+    if not isinstance(frames, list):
+        return {}
+    for frame_data in frames:
+        if not isinstance(frame_data, dict):
+            continue
+        frame = frame_data.get("frame")
+        if not isinstance(frame, int):
+            continue
+        objects = frame_data.get("objects") if isinstance(frame_data.get("objects"), dict) else frame_data
+        for idx, object_name in enumerate(object_names):
+            item = objects.get(object_name) if isinstance(objects, dict) else None
+            if not isinstance(item, dict) or "position" not in item:
+                continue
+            position = np.asarray(item["position"], dtype=np.float64)
+            if position.shape == (3,) and np.isfinite(position).all():
+                tracks[f"object_{idx:03d}"][frame] = position
+    return {object_id: frames for object_id, frames in tracks.items() if frames}
+
+
 def frame_paths(root: Path, pattern: str) -> dict[int, Path]:
     paths = {}
     for path in sorted(root.glob(pattern)):
         if any(parent.name.startswith("object_") for parent in path.parents):
             continue
         idx = frame_index(path)
-        if idx is not None and idx not in paths:
+        if idx is not None and idx not in paths and path_has_mesh_geometry(path):
             paths[idx] = path
     return paths
 
@@ -244,9 +298,21 @@ def load_gt_scene(specs: list[tuple[Path, Path, str]]) -> trimesh.Trimesh:
     return trimesh.util.concatenate(meshes)
 
 
-def mesh_center(mesh: trimesh.Trimesh) -> np.ndarray:
+def mesh_center(mesh: trimesh.Trimesh, method: str = "vertex_centroid") -> np.ndarray:
     bounds = np.asarray(mesh.bounds, dtype=np.float64)
-    return bounds.mean(axis=0)
+    bounds_center = bounds.mean(axis=0)
+    if method == "bbox_center":
+        return bounds_center
+    try:
+        if method == "volume_center_mass":
+            center = np.asarray(mesh.center_mass, dtype=np.float64)
+        else:
+            center = np.asarray(mesh.vertices, dtype=np.float64).mean(axis=0)
+        if center.shape == (3,) and np.isfinite(center).all():
+            return center
+    except Exception:
+        pass
+    return bounds_center
 
 
 def transform_points(points: np.ndarray, transform: np.ndarray) -> np.ndarray:
@@ -362,6 +428,7 @@ def collect_object_center_pairs(
     pred_tracks: dict[str, dict[int, Path]],
     gt_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]],
     assignment: dict[str, str] | None = None,
+    center_method: str = "vertex_centroid",
 ) -> tuple[np.ndarray, np.ndarray]:
     pred_centers = []
     gt_centers = []
@@ -373,8 +440,28 @@ def collect_object_center_pairs(
         for frame in sorted(set(pred_frames).intersection(gt_frames)):
             pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_frames[frame]))
             gt_mesh = gt_track_mesh(gt_frames[frame])
-            pred_centers.append(mesh_center(pred_mesh))
-            gt_centers.append(mesh_center(gt_mesh))
+            pred_centers.append(mesh_center(pred_mesh, center_method))
+            gt_centers.append(mesh_center(gt_mesh, center_method))
+    return np.asarray(pred_centers, dtype=np.float64), np.asarray(gt_centers, dtype=np.float64)
+
+
+def collect_object_center_pairs_from_positions(
+    pred_tracks: dict[str, dict[int, Path]],
+    gt_position_tracks: dict[str, dict[int, np.ndarray]],
+    assignment: dict[str, str] | None = None,
+    center_method: str = "vertex_centroid",
+) -> tuple[np.ndarray, np.ndarray]:
+    pred_centers = []
+    gt_centers = []
+    if assignment is None:
+        assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_position_tracks))}
+    for pred_id, gt_id in sorted(assignment.items()):
+        pred_frames = pred_tracks.get(pred_id, {})
+        gt_frames = gt_position_tracks.get(gt_id, {})
+        for frame in sorted(set(pred_frames).intersection(gt_frames)):
+            pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_frames[frame]))
+            pred_centers.append(mesh_center(pred_mesh, center_method))
+            gt_centers.append(gt_frames[frame])
     return np.asarray(pred_centers, dtype=np.float64), np.asarray(gt_centers, dtype=np.float64)
 
 
@@ -382,19 +469,20 @@ def collect_scene_center_pairs(
     pred_scenes: dict[int, Path],
     gt_scenes: dict[int, Path],
     gt_metadata_scenes: dict[int, list[tuple[Path, Path, str]]],
+    center_method: str = "vertex_centroid",
 ) -> tuple[np.ndarray, np.ndarray]:
     pred_centers = []
     gt_centers = []
     for frame in sorted(set(pred_scenes).intersection(gt_scenes)):
         pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_scenes[frame]))
         gt_mesh = scene_to_single_mesh(load_mesh_or_scene(gt_scenes[frame]))
-        pred_centers.append(mesh_center(pred_mesh))
-        gt_centers.append(mesh_center(gt_mesh))
+        pred_centers.append(mesh_center(pred_mesh, center_method))
+        gt_centers.append(mesh_center(gt_mesh, center_method))
     for frame in sorted(set(pred_scenes).intersection(gt_metadata_scenes)):
         pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_scenes[frame]))
         gt_mesh = load_gt_scene(gt_metadata_scenes[frame])
-        pred_centers.append(mesh_center(pred_mesh))
-        gt_centers.append(mesh_center(gt_mesh))
+        pred_centers.append(mesh_center(pred_mesh, center_method))
+        gt_centers.append(mesh_center(gt_mesh, center_method))
     return np.asarray(pred_centers, dtype=np.float64), np.asarray(gt_centers, dtype=np.float64)
 
 
@@ -416,6 +504,7 @@ def best_object_assignment(
     pred_tracks: dict[str, dict[int, Path]],
     gt_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]],
     pred_to_gt_transform: np.ndarray,
+    center_method: str = "vertex_centroid",
 ) -> dict[str, str]:
     pred_ids = sorted(pred_tracks)
     gt_ids = sorted(gt_tracks)
@@ -433,8 +522,8 @@ def best_object_assignment(
             for frame in sorted(set(pred_frames).intersection(gt_frames)):
                 pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_frames[frame]))
                 gt_mesh = gt_track_mesh(gt_frames[frame])
-                pred_center = transform_points(mesh_center(pred_mesh)[None, :], pred_to_gt_transform)[0]
-                cost += float(np.linalg.norm(pred_center - mesh_center(gt_mesh)))
+                pred_center = transform_points(mesh_center(pred_mesh, center_method)[None, :], pred_to_gt_transform)[0]
+                cost += float(np.linalg.norm(pred_center - mesh_center(gt_mesh, center_method)))
                 count += 1
         if count == 0:
             continue
@@ -445,6 +534,42 @@ def best_object_assignment(
 
     if best_perm is None:
         return {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_tracks))}
+    return dict(zip(pred_ids, best_perm))
+
+
+def best_object_assignment_from_positions(
+    pred_tracks: dict[str, dict[int, Path]],
+    gt_position_tracks: dict[str, dict[int, np.ndarray]],
+    pred_to_gt_transform: np.ndarray,
+    center_method: str = "vertex_centroid",
+) -> dict[str, str]:
+    pred_ids = sorted(pred_tracks)
+    gt_ids = sorted(gt_position_tracks)
+    if not pred_ids or len(gt_ids) < len(pred_ids):
+        return {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_position_tracks))}
+
+    best_perm = None
+    best_cost = float("inf")
+    for perm in permutations(gt_ids, len(pred_ids)):
+        cost = 0.0
+        count = 0
+        for pred_id, gt_id in zip(pred_ids, perm):
+            pred_frames = pred_tracks[pred_id]
+            gt_frames = gt_position_tracks[gt_id]
+            for frame in sorted(set(pred_frames).intersection(gt_frames)):
+                pred_mesh = scene_to_single_mesh(load_mesh_or_scene(pred_frames[frame]))
+                pred_center = transform_points(mesh_center(pred_mesh, center_method)[None, :], pred_to_gt_transform)[0]
+                cost += float(np.linalg.norm(pred_center - gt_frames[frame]))
+                count += 1
+        if count == 0:
+            continue
+        cost /= count
+        if cost < best_cost:
+            best_cost = cost
+            best_perm = perm
+
+    if best_perm is None:
+        return {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_position_tracks))}
     return dict(zip(pred_ids, best_perm))
 
 
@@ -617,8 +742,12 @@ def main() -> None:
     pred_tracks = dynamic_object_paths(pred_dir)
     gt_file_tracks = dynamic_object_paths(gt_dir)
     gt_object_tracks: dict[str, dict[int, Path | tuple[Path, Path, str]]] = gt_file_tracks or metadata_gt_tracks(gt_dir)
+    gt_position_tracks = metadata_gt_position_tracks(gt_dir)
+    alignment_source = "none"
 
     object_assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_object_tracks))}
+    if not object_assignment and gt_position_tracks:
+        object_assignment = {object_id: object_id for object_id in sorted(set(pred_tracks).intersection(gt_position_tracks))}
 
     if args.alignment == "first_frame_similarity":
         alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
@@ -632,13 +761,31 @@ def main() -> None:
         )
         pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
     else:
-        alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks)
+        alignment_pred_points, alignment_gt_points = collect_object_center_pairs_from_positions(
+            pred_tracks, gt_position_tracks, center_method=args.com_method
+        )
+        alignment_source = "metadata_object_positions" if len(alignment_pred_points) else alignment_source
         if len(alignment_pred_points) == 0:
-            alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(pred_scenes, gt_scenes, gt_metadata_scenes)
+            alignment_pred_points, alignment_gt_points = collect_object_center_pairs(
+                pred_tracks, gt_object_tracks, center_method=args.com_method
+            )
+            alignment_source = "object_center_tracks" if len(alignment_pred_points) else alignment_source
+        if len(alignment_pred_points) == 0:
+            alignment_pred_points, alignment_gt_points = collect_scene_center_pairs(
+                pred_scenes, gt_scenes, gt_metadata_scenes, center_method=args.com_method
+            )
+            alignment_source = "scene_centers" if len(alignment_pred_points) else alignment_source
         pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
 
-    if args.object_assignment == "best" and gt_object_tracks:
-        object_assignment = best_object_assignment(pred_tracks, gt_object_tracks, pred_to_gt_transform)
+    if args.object_assignment == "best" and (gt_object_tracks or gt_position_tracks):
+        if gt_position_tracks:
+            object_assignment = best_object_assignment_from_positions(
+                pred_tracks, gt_position_tracks, pred_to_gt_transform, center_method=args.com_method
+            )
+        else:
+            object_assignment = best_object_assignment(
+                pred_tracks, gt_object_tracks, pred_to_gt_transform, center_method=args.com_method
+            )
         if args.alignment == "first_frame_similarity":
             alignment_pred_points, alignment_gt_points = collect_first_frame_point_clouds(
                 pred_scenes,
@@ -651,7 +798,16 @@ def main() -> None:
             )
             pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
         elif args.alignment != "none":
-            alignment_pred_points, alignment_gt_points = collect_object_center_pairs(pred_tracks, gt_object_tracks, object_assignment)
+            if gt_position_tracks:
+                alignment_pred_points, alignment_gt_points = collect_object_center_pairs_from_positions(
+                    pred_tracks, gt_position_tracks, object_assignment, center_method=args.com_method
+                )
+                alignment_source = "metadata_object_positions" if len(alignment_pred_points) else alignment_source
+            else:
+                alignment_pred_points, alignment_gt_points = collect_object_center_pairs(
+                    pred_tracks, gt_object_tracks, object_assignment, center_method=args.com_method
+                )
+                alignment_source = "object_center_tracks" if len(alignment_pred_points) else alignment_source
             pred_to_gt_transform = alignment_transform(args.alignment, alignment_pred_points, alignment_gt_points)
 
     aligned_transform = None if args.alignment == "none" else pred_to_gt_transform
@@ -804,15 +960,17 @@ def main() -> None:
         "max_voxel_cells": args.max_voxel_cells,
         "alignment": args.alignment,
         "object_assignment": args.object_assignment,
+        "com_method": args.com_method,
         "alignment_num_points": int(len(alignment_pred_points)),
         "pred_to_gt_transform": pred_to_gt_transform.tolist(),
         "reconstruction_alignment": args.alignment,
         "reconstruction_alignment_scope": (
             "first_frame_point_cloud" if args.alignment == "first_frame_similarity"
-            else "all_dynamic_object_trajectories_or_scene_centers" if args.alignment != "none"
+            else alignment_source if args.alignment != "none"
             else "none"
         ),
         "reconstruction_alignment_num_points": int(len(alignment_pred_points)),
+        "reconstruction_alignment_center_method": args.com_method,
         "reconstruction_alignment_scale": float(np.cbrt(abs(np.linalg.det(pred_to_gt_transform[:3, :3])))) if args.alignment != "none" else 1.0,
         "reconstruction_alignment_rotation": (
             (pred_to_gt_transform[:3, :3] / float(np.cbrt(abs(np.linalg.det(pred_to_gt_transform[:3, :3]))))).tolist()

@@ -627,10 +627,11 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             image = np.asarray(pil_image, dtype=np.uint8)
             image = torch.from_numpy(image).to(torch.uint8)  # [H, W, 3]
             images = torch.stack([image] * part_surfaces.shape[0], dim=0) # [N, H, W, 3]
-            return {
+            out = {
                 "images": images,
                 "part_surfaces": part_surfaces,
             }
+            return out
         else:
             part_surfaces = []
             for surface_path in data_config['surface_paths']:
@@ -659,10 +660,11 @@ class ObjaversePartDataset(torch.utils.data.Dataset):
             image = np.asarray(pil_image, dtype=np.uint8)
             image = torch.from_numpy(image).to(torch.uint8)  # [H, W, 3]
             images = torch.stack([image] * part_surfaces.shape[0], dim=0) # [N, H, W, 3]
-            return {
+            out = {
                 "images": images,
                 "part_surfaces": part_surfaces,
             }
+            return out
     
     def __getitem__(self, idx: int):
         # The dataset can only support batchsize == 1 training. 

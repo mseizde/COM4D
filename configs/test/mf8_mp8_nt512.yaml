@@ -14,10 +14,11 @@ model:
     enable_instance_type_embedding: false
     enable_object_id_embedding: false
     max_object_ids: 32
-    spatial_global_attn_block_ids: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
-    temporal_global_attn_block_ids: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21]
+    explicit_axial_roles:
+      spatial: [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+      temporal: [1, 3, 5, 7, 9, 11, 13, 15, 17, 19]
     max_num_frames: 8
-    mixing_mode: inference_emulation # current | spatial_temporal | temporal_spatial | joint | inference_emulation; applied when both frame and part axes are >1
+    mixing_mode: inference_emulation # inference_emulation | joint; applied when both frame and part axes are >1
     flash_attention:
       backend: auto # auto | flash | mem_efficient | math; flash forces Flash SDPA and errors on unsupported shapes
       verify_once: false # profile one transformer forward and log whether Flash SDPA was used
@@ -80,9 +81,9 @@ dataset_4d:
   temporal_stride_choices: [1, 2, 3, 4]
 
 dataset_physics:
-  surface_num_points: 8192
+  surface_num_points: 32768
   config:
-    - '/data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static.json'
+    - '/data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static_norm_32768.json'
   min_num_frames: 4
   max_num_frames: 8
   max_num_spatial_parts: 6
@@ -134,12 +135,12 @@ train:
   debug_step_timing: true
   physics_data_prob: 0.25
   physics_dataset_jsons:
-    - /data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static.json
+    - /data/mseizde/com4d/COM4D/dataset_json/physics_train_100_static_norm_32768.json
     - /data/mseizde/com4d/COM4D/dataset_json/humoto.json
   physics_dataset_probs: [0.5, 0.5]
   physics_dataset_spatiotemporal_grid: [true, true]
   physics_dataset_num_spatial_parts: [null, null]
-  physics_dataset_surface_num_points: [8192, 204800]
+  physics_dataset_surface_num_points: [32768, 204800]
   # Ball-only geometry/memory for enriched physics; HUMOTO has no object_names.
   # Full RGB continues to carry floor, wall, and occluder context.
   physics_dataset_include_object_name_prefixes: [[ball_], []]
@@ -212,7 +213,7 @@ train:
     # Ball-only physics has no leading static geometry to skip.
     skip_first_spatial_parts: 0
     latent_weight: 0.0
-    surface_weight: 0.001
+    surface_weight: 0.0 # 0.001
     scale_weight: 0.0
     accel_weight: 0.0
     num_surface_points: 16

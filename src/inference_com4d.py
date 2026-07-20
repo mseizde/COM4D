@@ -664,6 +664,22 @@ def main():
         help="Render resolution (square)",
     )
     parser.add_argument(
+        "--mesh_dense_depth",
+        "--mesh-dense-depth",
+        dest="mesh_dense_depth",
+        type=int,
+        default=8,
+        help="Dense octree depth for exported mesh extraction. Use 7 with --mesh_hierarchical_depth 8 to match vae_gt_oracle_norm.",
+    )
+    parser.add_argument(
+        "--mesh_hierarchical_depth",
+        "--mesh-hierarchical-depth",
+        dest="mesh_hierarchical_depth",
+        type=int,
+        default=9,
+        help="Final octree depth for exported mesh extraction. Use 8 with --mesh_dense_depth 7 to match vae_gt_oracle_norm.",
+    )
+    parser.add_argument(
         "--camera-metadata",
         type=Path,
         default=None,
@@ -778,23 +794,53 @@ def main():
         default=0,
         help="Prevent collisions between dynamic and static objects",
     )
+    def _parse_mix_cutoff(value: str):
+        value = value.strip()
+        if any(marker in value.lower() for marker in (".", "e")):
+            parsed = float(value)
+            if not 0.0 <= parsed <= 1.0:
+                raise argparse.ArgumentTypeError("fractional cutoff must be in [0, 1]")
+            return parsed
+        return int(value)
+
     parser.add_argument(
         "--scene_mix_cutoff",
-        type=int,
+        type=_parse_mix_cutoff,
         default=10,
-        help="Cutoff for mixing static and dynamic scenes",
+        help="Mixing duration as a legacy integer step count or normalized fraction in [0, 1]",
     )
     parser.add_argument(
         "--dynamic_mix_cutoff",
-        type=int,
+        type=_parse_mix_cutoff,
         default=10,
-        help="Cutoff for mixing static and dynamic scenes",
+        help="Mixing duration as a legacy integer cutoff index or normalized fraction in [0, 1]",
     )
     parser.add_argument(
         "--dynamic_max_memory_frames",
         type=int,
         default=10,
         help="Maximum number of frames to keep in memory for dynamic objects",
+    )
+    parser.add_argument(
+        "--unified_inference_schedule",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Run the optional unified 3D4D denoising schedule instead of the "
+            "default scene-then-dynamic pipeline."
+        ),
+    )
+    parser.add_argument(
+        "--unified_steps",
+        type=int,
+        default=None,
+        help="Number of denoising steps for --unified_inference_schedule; defaults to --dynamic_steps.",
+    )
+    parser.add_argument(
+        "--unified_guidance",
+        type=float,
+        default=None,
+        help="Classifier-free guidance for --unified_inference_schedule; defaults to --dynamic_guidance.",
     )
     parser.add_argument(
         "--render_predicted_room",
@@ -895,6 +941,9 @@ def main():
             "scene_mix_cutoff": "scene_mix_cutoff",
             "dynamic_mix_cutoff": "dynamic_mix_cutoff",
             "dynamic_max_memory_frames": "dynamic_max_memory_frames",
+            "unified_inference_schedule": "unified_inference_schedule",
+            "unified_steps": "unified_steps",
+            "unified_guidance": "unified_guidance",
             "history_mode": "history_mode",
             "insert_rotation_every": "insert_rotation_every",
             "use_dino_multi": "use_dino_multi",
@@ -914,6 +963,8 @@ def main():
             "rvrt_tile": "rvrt_tile",
             "rvrt_tile_overlap": "rvrt_tile_overlap",
             "save_super_resolved_frames": "save_super_resolved_frames",
+            "mesh_dense_depth": "mesh_dense_depth",
+            "mesh_hierarchical_depth": "mesh_hierarchical_depth",
             "render_predicted_room": "render_predicted_room",
             "render_predicted_room_gifs": "render_predicted_room_gifs",
             "room_augment_animations": "room_augment_animations",
@@ -1213,7 +1264,12 @@ def main():
         scene_mix_cutoff=args.scene_mix_cutoff,
         dynamic_mix_cutoff=args.dynamic_mix_cutoff,
         dynamic_max_memory_frames=args.dynamic_max_memory_frames,
+        unified_inference_schedule=args.unified_inference_schedule,
+        unified_inference_steps=args.unified_steps,
+        unified_guidance_scale=args.unified_guidance,
         image_size=args.image_size,
+        mesh_dense_depth=args.mesh_dense_depth,
+        mesh_hierarchical_depth=args.mesh_hierarchical_depth,
     )
     scene_dir = export_dir / "scene"
     dynamic_dir = export_dir / "dynamic"

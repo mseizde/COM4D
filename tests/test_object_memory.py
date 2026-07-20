@@ -153,6 +153,22 @@ def test_memory_read_is_finite_for_half_precision_frame_state():
     assert torch.equal(result, frame_state)
 
 
+def test_fp32_memory_update_accepts_half_precision_evidence():
+    module = CanonicalObjectMemory(channels=8, num_heads=2).float()
+    memory = module.initialize(torch.randn(1, 1, 2, 8).half())
+    evidence = torch.randn(1, 2, 1, 3, 8).half()
+
+    updated, gate = module.update(
+        memory,
+        evidence,
+        torch.ones(1, 2, 1, dtype=torch.float16),
+    )
+
+    assert updated.tokens.dtype == torch.float32
+    assert gate.dtype == torch.float32
+    assert torch.isfinite(updated.tokens).all()
+
+
 def test_memory_gate_exposes_nonfinite_readout_without_sanitization():
     module = CanonicalObjectMemory(channels=8, num_heads=2).float()
     memory = module.initialize(torch.randn(1, 1, 2, 8))
